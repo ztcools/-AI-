@@ -212,7 +212,10 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "get_indexing_status",
-                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases.`,
+                        description: `Get the current indexing status of a codebase. Shows progress percentage for actively indexing codebases and completion status for indexed codebases. The codebase is identified by its git remote URL + branch, so status works across different local checkouts of the same repository.
+
+⚠️ **IMPORTANT**:
+- The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace. Defaults to the current workspace if not provided.`,
                         inputSchema: {
                             type: "object",
                             properties: {

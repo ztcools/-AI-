@@ -13,21 +13,36 @@ export function truncateContent(content: string, maxLength: number): string {
 
 /**
  * Detect IDE workspace root by walking up from cwd to find common
- * workspace markers (.git, package.json, .vscode, etc.)
+ * workspace markers. Priority: .git (most reliable, only exists at repo root)
+ * > package.json/pnpm-workspace.yaml/.vscode (fallback).
+ *
+ * Two-pass approach: first walk all the way up to find .git (guaranteed repo root),
+ * if no .git found, walk up again and return the first directory with any other marker.
+ * This prevents stopping prematurely at sub-package package.json in monorepos.
  */
 export function detectWorkspaceRoot(): string | null {
     let current = process.cwd();
     const root = path.parse(current).root;
 
-    while (current !== root) {
-        // Check for common workspace markers
-        const markers = ['.git', 'package.json', 'pnpm-workspace.yaml', '.vscode'];
-        for (const marker of markers) {
-            if (fs.existsSync(path.join(current, marker))) {
-                return current;
+    // Pass 1: Find .git (definitive repo root marker)
+    let cursor = current;
+    while (cursor !== root) {
+        if (fs.existsSync(path.join(cursor, '.git'))) {
+            return cursor;
+        }
+        cursor = path.dirname(cursor);
+    }
+
+    // Pass 2: Fallback to other common workspace markers
+    const fallbackMarkers = ['package.json', 'pnpm-workspace.yaml', '.vscode'];
+    cursor = current;
+    while (cursor !== root) {
+        for (const marker of fallbackMarkers) {
+            if (fs.existsSync(path.join(cursor, marker))) {
+                return cursor;
             }
         }
-        current = path.dirname(current);
+        cursor = path.dirname(cursor);
     }
 
     return null;
