@@ -33,6 +33,8 @@ if command -v pnpm &> /dev/null; then
     echo -e "${GREEN}  ✓ pnpm $(pnpm --version)${NC}" 
 else 
     echo "  正在安装 pnpm..." 
+    NPM_GLOBAL_BIN="$(npm config get prefix)/bin"
+    export PATH="$NPM_GLOBAL_BIN:$PATH"
     npm install -g pnpm 
     echo -e "${GREEN}  ✓ pnpm 安装完成${NC}" 
 fi 
