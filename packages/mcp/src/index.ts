@@ -85,22 +85,23 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase directory to enable semantic search using a configurable code splitter.
+Index a codebase directory to enable semantic search. This is a prerequisite for search_code — without indexing, the search tool cannot find anything.
 
 ⚠️ **IMPORTANT**:
-- You MUST provide an absolute path to the target codebase.
+- You MUST provide the path to the target codebase.
 
 ✨ **Usage Guidance**:
-- This tool is typically used when search fails due to an unindexed codebase.
+- Index the codebase once when first working with it. Subsequent searches will be fast and token-efficient.
+- If the codebase is already indexed (same url+branch), indexing will be skipped automatically unless force=true.
 - If indexing is attempted on an already indexed path, and a conflict is detected, you MUST prompt the user to confirm whether to proceed with a force index (i.e., re-indexing and overwriting the previous index).
 `;
 
 
         const search_description = `
-Search the indexed codebase using natural language queries within a specified absolute path.
+Search the indexed codebase using natural language queries within a specified path.
 
 ⚠️ **IMPORTANT**:
-- You MUST provide an absolute path.
+- You MUST provide the path to the codebase.
 
 🎯 **When to Use**:
 This tool is versatile and can be used before completing various tasks to retrieve relevant context:
@@ -129,7 +130,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the codebase directory to index.`
+                                    description: `Path to the codebase directory to index.`
                                 },
                                 force: {
                                     type: "boolean",
@@ -170,7 +171,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the codebase directory to search in.`
+                                    description: `Path to the codebase directory to search in.`
                                 },
                                 query: {
                                     type: "string",
@@ -181,6 +182,13 @@ This tool is versatile and can be used before completing various tasks to retrie
                                     description: "Maximum number of results to return",
                                     default: 10,
                                     maximum: 50
+                                },
+                                threshold: {
+                                    type: "number",
+                                    description: "Minimum similarity score (0-1). Lower = more results, higher = more precise. Default 0.3 works well for most queries.",
+                                    default: 0.3,
+                                    minimum: 0,
+                                    maximum: 1
                                 },
                                 extensionFilter: {
                                     type: "array",
@@ -196,13 +204,13 @@ This tool is versatile and can be used before completing various tasks to retrie
                     },
                     {
                         name: "clear_index",
-                        description: `Clear the search index. IMPORTANT: You MUST provide an absolute path.`,
+                        description: `Clear the search index. IMPORTANT: You MUST provide the path to the codebase.`,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the codebase directory to clear.`
+                                    description: `Path to the codebase directory to clear.`
                                 }
                             },
                             required: ["path"]
@@ -216,7 +224,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: `ABSOLUTE path to the codebase directory to check status for.`
+                                    description: `Path to the codebase directory to check status for.`
                                 }
                             },
                             required: ["path"]

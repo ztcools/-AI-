@@ -663,7 +663,7 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter } = args;
+        const { path: codebasePath, query, limit = 10, extensionFilter, threshold = 0.3 } = args;
         const resultLimit = limit || 10;
 
         try {
@@ -781,7 +781,7 @@ export class ToolHandlers {
                 searchCodebasePath,
                 query,
                 Math.min(resultLimit, 50),
-                0.3,
+                threshold,
                 filterExpr
             );
 
