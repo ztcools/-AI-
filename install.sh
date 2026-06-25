@@ -50,6 +50,7 @@ echo -e "${YELLOW}[3/5] 克隆仓库...${NC}"
 if [ -d "$INSTALL_DIR" ]; then 
     echo "  目录已存在，正在更新..." 
     cd "$INSTALL_DIR" 
+    rm -rf node_modules packages/*/node_modules
     git fetch origin 
     git reset --hard origin/main 
 else 
@@ -60,6 +61,7 @@ echo -e "${GREEN}  ✓ 仓库就绪${NC}"
 
 echo -e "${YELLOW}[4/5] 安装依赖 (可能需要几分钟)...${NC}" 
 cd "$INSTALL_DIR" 
+export CI=true
 $PNPM_CMD install 
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}" 
 
