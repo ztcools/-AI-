@@ -795,9 +795,9 @@ export class Context {
         const repoIdentity = getRepoIdentity(codebasePath);
 
         if (isHybrid === true) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `repo:${repoIdentity}`);
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${repoIdentity}`);
         } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, `repo:${repoIdentity}`);
+            await this.vectorDatabase.createCollection(collectionName, dimension, `codebasePath:${repoIdentity}`);
         }
 
         console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);

@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError } from "@zilliz/claude-context-core";
+import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
@@ -266,44 +266,58 @@ export class ToolHandlers {
                 return;
             }
 
-            // Get current local codebases
-            const localCodebases = new Set(this.snapshotManager.getIndexedCodebases());
-            console.log(`[SYNC-CLOUD] 📊 Found ${localCodebases.size} local codebases in snapshot`);
+            // Get current local codebases with their identities.
+            // getIndexedCodebases() now returns identities (url:branch).
+            const localIdentities = this.snapshotManager.getIndexedCodebases();
+            const localIdentityMap = new Map<string, string>(); // identity -> localPath
+            for (const identity of localIdentities) {
+                const info = this.snapshotManager.getCodebaseInfo(identity);
+                if (info?.localPath) {
+                    localIdentityMap.set(identity, info.localPath);
+                }
+            }
+            console.log(`[SYNC-CLOUD] 📊 Found ${localIdentities.length} local codebases in snapshot`);
 
             let hasChanges = false;
 
-            // Remove local codebases that don't exist in cloud
-            for (const localCodebase of localCodebases) {
-                if (!cloudCodebases.has(localCodebase)) {
-                    this.snapshotManager.removeCodebaseCompletely(localCodebase);
+            // Remove local codebases whose identity is not in the cloud set.
+            // Compare by identity (url:branch) rather than raw filesystem path,
+            // so team members sharing the same repo+branch are recognized.
+            for (const [identity, localPath] of localIdentityMap) {
+                if (!cloudCodebases.has(identity)) {
+                    this.snapshotManager.removeCodebaseCompletely(localPath);
                     hasChanges = true;
 
                     try {
-                        await FileSynchronizer.deleteSnapshot(localCodebase);
+                        await FileSynchronizer.deleteSnapshot(localPath);
                     } catch (error: any) {
-                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localCodebase}':`, error?.message || error);
+                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localPath}':`, error?.message || error);
                     }
 
-                    console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localCodebase}`);
+                    console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localPath} (identity: ${identity})`);
                 }
             }
 
             // Add cloud codebases that are missing from local snapshot (recovery).
-            // Query Milvus for the real row count — if unknown/empty, skip the write
-            // so we don't persist a poisoning 0/0+completed entry (Issue #295).
-            for (const cloudCodebase of cloudCodebases) {
-                if (!localCodebases.has(cloudCodebase)) {
-                    const stats = await this.queryCollectionStats(cloudCodebase);
-                    if (stats) {
-                        this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
-                            ...stats,
-                            status: 'completed' as const
-                        });
-                        hasChanges = true;
-                        console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${cloudCodebase} (rows=${stats.totalChunks})`);
-                    } else {
-                        console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (row count unknown or zero)`);
-                    }
+            // We can only recover if the cloud identity maps to a local checkout.
+            // Otherwise we rely on the Milvus fallback in search/status handlers.
+            for (const cloudIdentity of cloudCodebases) {
+                if (!localIdentityMap.has(cloudIdentity)) {
+                    console.log(`[SYNC-CLOUD] ⏭️  Cloud codebase '${cloudIdentity}' has no local checkout — will be resolved via Milvus fallback on demand`);
+                    continue;
+                }
+
+                const localPath = localIdentityMap.get(cloudIdentity)!;
+                const stats = await this.queryCollectionStats(localPath);
+                if (stats) {
+                    this.snapshotManager.setCodebaseIndexed(localPath, {
+                        ...stats,
+                        status: 'completed' as const
+                    });
+                    hasChanges = true;
+                    console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${localPath} (identity: ${cloudIdentity}, rows=${stats.totalChunks})`);
+                } else {
+                    console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${localPath} (row count unknown or zero)`);
                 }
             }
 
@@ -351,6 +365,10 @@ export class ToolHandlers {
             // Force absolute path resolution - warn if relative path provided
             const absolutePath = ensureAbsolutePath(codebasePath);
 
+            // Compute identity (url:branch) for comparison with snapshot lists
+            const codebaseIdentity = getRepoIdentity(absolutePath);
+            console.log(`[IDENTITY] Codebase identity: ${codebaseIdentity} (path: ${absolutePath})`);
+
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
                 return {
@@ -374,8 +392,8 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if already indexing
-            if (this.snapshotManager.getIndexingCodebases().includes(absolutePath)) {
+            // Check if already indexing (compare by identity: url:branch)
+            if (this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity)) {
                 if (forceReindex) {
                     console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
                     this.snapshotManager.removeCodebaseCompletely(absolutePath);
@@ -391,8 +409,8 @@ export class ToolHandlers {
                 }
             }
 
-            //Check if the snapshot and cloud index are in sync
-            const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
+            //Check if the snapshot and cloud index are in sync (compare by identity)
+            const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
             const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
             if (snapshotHasIndex !== vectorDbHasIndex) {
                 if (vectorDbHasIndex && !snapshotHasIndex) {
@@ -414,8 +432,8 @@ export class ToolHandlers {
                 }
             }
 
-            // Check if already indexed (unless force is true)
-            if (!forceReindex && this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
+            // Check if already indexed (compare by identity, unless force is true)
+            if (!forceReindex && this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity)) {
                 return {
                     content: [{
                         type: "text",
