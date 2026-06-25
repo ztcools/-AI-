@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -61,6 +61,55 @@ test("get_indexing_status syncs cloud state before reading the snapshot", async 
         assert.equal(result.isError, undefined);
         assert.match(result.content[0].text, /fully indexed and ready for search/);
         assert.match(result.content[0].text, /3 files, 5 chunks/);
+        assert.equal(snapshotManager.getCodebaseStatus(codebasePath), "indexed");
+    });
+});
+
+test("get_indexing_status reports indexed when only the on-disk snapshot knows the codebase", async () => {
+    await withTempHome(async (tempRoot) => {
+        const codebasePath = path.join(tempRoot, "repo");
+        await mkdir(codebasePath, { recursive: true });
+
+        // Simulate the real-world drift: the JSON snapshot on disk already has the
+        // codebase as indexed (written by another process / MCP client, or by a
+        // background index after this process loaded its map), but the in-memory
+        // codebaseInfoMap never learned about it. Search reads disk and works;
+        // status used to read only memory and falsely reported "not indexed".
+        const snapshotDir = path.join(tempRoot, "home", ".context");
+        await mkdir(snapshotDir, { recursive: true });
+        await writeFile(
+            path.join(snapshotDir, "mcp-codebase-snapshot.json"),
+            JSON.stringify({
+                formatVersion: "v2",
+                codebases: {
+                    [codebasePath]: {
+                        status: "indexed",
+                        indexedFiles: 348,
+                        totalChunks: 348,
+                        indexStatus: "completed",
+                        lastUpdated: "2026-06-25T02:16:52.711Z",
+                    },
+                },
+                lastUpdated: "2026-06-25T02:16:52.711Z",
+            }),
+            "utf8"
+        );
+
+        // Fresh manager => empty in-memory map; it has NOT loaded the snapshot.
+        const snapshotManager = new SnapshotManager();
+        assert.equal(snapshotManager.getCodebaseStatus(codebasePath), "not_found");
+
+        const handlers = new ToolHandlers({} as any, snapshotManager);
+        // No-op the cloud sync so the VectorDB fallback (which needs a real context)
+        // is never reached — disk-healing must resolve the status on its own.
+        (handlers as any).syncIndexedCodebasesFromCloud = async () => {};
+
+        const result = await handlers.handleGetIndexingStatus({ path: codebasePath });
+
+        assert.equal(result.isError, undefined);
+        assert.match(result.content[0].text, /fully indexed and ready for search/);
+        assert.match(result.content[0].text, /348 files, 348 chunks/);
+        // Memory should have been healed from disk as a side effect.
         assert.equal(snapshotManager.getCodebaseStatus(codebasePath), "indexed");
     });
 });

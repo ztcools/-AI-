@@ -44,6 +44,7 @@ export interface CodebaseIndexOptions {
 
 // Base interface for common fields
 interface CodebaseInfoBase extends CodebaseIndexOptions {
+    localPath: string;           // Filesystem path where the codebase is checked out
     lastUpdated: string;
 }
 
