@@ -5,7 +5,7 @@ import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, g
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
-import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -336,7 +336,7 @@ export class ToolHandlers {
     }
 
     public async handleIndexCodebase(args: any) {
-        const { path: codebasePath, force, splitter, customExtensions, ignorePatterns } = args;
+        const { path: codebasePath = ".", force, splitter, customExtensions, ignorePatterns } = args;
         const forceReindex = force || false;
         const requestedSplitter = splitter || 'ast'; // Default to AST
         const customFileExtensions = customExtensions || [];
@@ -362,10 +362,10 @@ export class ToolHandlers {
                 requestCustomExtensions: customFileExtensions,
                 requestIgnorePatterns: customIgnorePatterns
             };
-            // Force absolute path resolution - warn if relative path provided
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            // Resolve path: supports absolute, relative, and "." for workspace auto-detection
+            const absolutePath = resolveCodebasePath(codebasePath);
 
-            // Compute identity (url:branch) for comparison with snapshot lists
+            // Compute identity (url:branch) for comparison with snapshot lists and vector DB
             const codebaseIdentity = getRepoIdentity(absolutePath);
             console.log(`[IDENTITY] Codebase identity: ${codebaseIdentity} (path: ${absolutePath})`);
 
@@ -390,6 +390,49 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            // === CRITICAL: Pre-check identity in vector database ===
+            // The index is isolated by url+branch, not by filesystem path.
+            // Check if this identity already has a collection in Milvus before
+            // proceeding. If it does, recover the local snapshot and inform the user.
+            if (!forceReindex) {
+                const identityAlreadyIndexed = await this.context.hasIndex(absolutePath);
+                if (identityAlreadyIndexed) {
+                    // The identity-based collection exists in Milvus.
+                    // Check if the local snapshot knows about it.
+                    const snapshotHasIdentity = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
+                    if (!snapshotHasIdentity) {
+                        // Recover snapshot from Milvus
+                        const stats = await this.queryCollectionStats(absolutePath);
+                        if (stats) {
+                            console.warn(`[IDENTITY-CHECK] Identity '${codebaseIdentity}' already indexed in Milvus but missing from local snapshot. Recovering snapshot.`);
+                            this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                            this.snapshotManager.saveCodebaseSnapshot();
+                        }
+                    }
+
+                    // Check if this is a different local path for the same identity
+                    const existingInfo = this.snapshotManager.getCodebaseInfo(codebaseIdentity);
+                    const existingLocalPath = existingInfo?.localPath;
+                    const isSameLocalPath = existingLocalPath && path.resolve(existingLocalPath) === path.resolve(absolutePath);
+
+                    let alreadyMessage = `Repository '${codebaseIdentity}' is already indexed.`;
+                    if (!isSameLocalPath && existingLocalPath) {
+                        alreadyMessage += `\nExisting index is for local checkout at: ${existingLocalPath}`;
+                        alreadyMessage += `\nCurrent path: ${absolutePath}`;
+                        alreadyMessage += `\n\nBoth paths map to the same repository (url+branch), so the index is shared. Use force=true to re-index.`;
+                    } else {
+                        alreadyMessage += ` Use force=true to re-index.`;
+                    }
+                    return {
+                        content: [{
+                            type: "text",
+                            text: alreadyMessage
+                        }],
+                        isError: true
+                    };
+                }
             }
 
             // Check if already indexing (compare by identity: url:branch)
@@ -663,15 +706,15 @@ export class ToolHandlers {
     }
 
     public async handleSearchCode(args: any) {
-        const { path: codebasePath, query, limit = 10, extensionFilter, threshold = 0.3 } = args;
+        const { path: codebasePath = ".", query, limit = 10, extensionFilter } = args;
         const resultLimit = limit || 10;
 
         try {
             // Sync indexed codebases from cloud first
             await this.syncIndexedCodebasesFromCloud();
 
-            // Force absolute path resolution - warn if relative path provided
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            // Resolve path: supports absolute, relative, and "." for workspace auto-detection
+            const absolutePath = resolveCodebasePath(codebasePath);
 
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
@@ -781,7 +824,7 @@ export class ToolHandlers {
                 searchCodebasePath,
                 query,
                 Math.min(resultLimit, 50),
-                threshold,
+                0.3,
                 filterExpr
             );
 
@@ -870,7 +913,7 @@ export class ToolHandlers {
     }
 
     public async handleClearIndex(args: any) {
-        const { path: codebasePath } = args;
+        const { path: codebasePath = "." } = args;
 
         if (this.snapshotManager.getIndexedCodebases().length === 0 && this.snapshotManager.getIndexingCodebases().length === 0) {
             return {
@@ -882,8 +925,8 @@ export class ToolHandlers {
         }
 
         try {
-            // Force absolute path resolution - warn if relative path provided
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            // Resolve path: supports absolute, relative, and "." for workspace auto-detection
+            const absolutePath = resolveCodebasePath(codebasePath);
 
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
@@ -908,15 +951,16 @@ export class ToolHandlers {
                 };
             }
 
-            // Check if this codebase is indexed or being indexed
-            const isIndexed = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
-            const isIndexing = this.snapshotManager.getIndexingCodebases().includes(absolutePath);
+            // Compare by identity (url:branch), not by absolute path
+            const codebaseIdentity = getRepoIdentity(absolutePath);
+            const isIndexed = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
+            const isIndexing = this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity);
 
             if (!isIndexed && !isIndexing) {
                 return {
                     content: [{
                         type: "text",
-                        text: `Error: Codebase '${absolutePath}' is not indexed or being indexed.`
+                        text: `Error: Codebase '${absolutePath}' (identity: ${codebaseIdentity}) is not indexed or being indexed.`
                     }],
                     isError: true
                 };
@@ -1008,11 +1052,11 @@ export class ToolHandlers {
     }
 
     public async handleGetIndexingStatus(args: any) {
-        const { path: codebasePath } = args;
+        const { path: codebasePath = "." } = args;
 
         try {
-            // Force absolute path resolution
-            const absolutePath = ensureAbsolutePath(codebasePath);
+            // Resolve path: supports absolute, relative, and "." for workspace auto-detection
+            const absolutePath = resolveCodebasePath(codebasePath);
 
             // Validate path exists
             if (!fs.existsSync(absolutePath)) {
