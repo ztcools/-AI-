@@ -25,25 +25,19 @@ if command -v node &> /dev/null; then
     fi 
 else 
     echo -e "${RED}  未检测到 Node.js${NC}" 
+    echo "  请先执行教程前两步安装 Node.js 22:"
+    echo "  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
+    echo "  sudo apt-get install -y nodejs"
     exit 1 
 fi 
 
 echo -e "${YELLOW}[2/5] 检查 pnpm...${NC}" 
 if command -v pnpm &> /dev/null; then 
     echo -e "${GREEN}  ✓ pnpm $(pnpm --version)${NC}" 
-    PNPM_CMD="pnpm"
 else 
-    echo "  正在安装 pnpm..." 
-    curl -fsSL https://get.pnpm.io/install.sh | env PNPM_VERSION=10.12.1 sh -
-    export PNPM_HOME="$HOME/.local/share/pnpm"
-    export PATH="$PNPM_HOME:$PATH"
-    if command -v pnpm &> /dev/null; then
-        echo -e "${GREEN}  ✓ pnpm 安装完成${NC}"
-        PNPM_CMD="pnpm"
-    else
-        echo "  官方脚本安装失败，使用 npx 模式运行 pnpm..."
-        PNPM_CMD="npx pnpm"
-    fi
+    echo "  正在安装 pnpm（需要 sudo 权限）..." 
+    sudo npm install -g pnpm 
+    echo -e "${GREEN}  ✓ pnpm 安装完成${NC}" 
 fi 
 
 echo -e "${YELLOW}[3/5] 克隆仓库...${NC}" 
@@ -61,12 +55,11 @@ echo -e "${GREEN}  ✓ 仓库就绪${NC}"
 
 echo -e "${YELLOW}[4/5] 安装依赖 (可能需要几分钟)...${NC}" 
 cd "$INSTALL_DIR" 
-export CI=true
-$PNPM_CMD install 
+pnpm install --force
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}" 
 
 echo -e "${YELLOW}[5/5] 构建项目...${NC}" 
-$PNPM_CMD build 
+pnpm build 
 echo -e "${GREEN}  ✓ 构建完成${NC}" 
 
 echo "" 
