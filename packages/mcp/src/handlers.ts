@@ -948,35 +948,15 @@ export class ToolHandlers {
             }
             resultMessage += `\n\n${formattedResults}`;
 
-            // ── Graph Context Enrichment ─────────────────────────────
+            // ── Graph Context Enrichment (enhanced) ──────────────────
             if (this.graphToolHandlers) {
                 try {
-                    const project = getRepoIdentity(searchCodebasePath);
-                    const graphLines: string[] = [];
-                    const seenFiles = new Set<string>();
-
-                    for (const result of searchResults.slice(0, 3)) {
-                        if (seenFiles.has(result.relativePath)) continue;
-                        seenFiles.add(result.relativePath);
-
-                        const nodeResult = this.graphToolHandlers.getStore().findNodes({
-                            project,
-                            exactFilePath: result.relativePath,
-                            limit: 5,
-                        });
-
-                        for (const r of nodeResult.results) {
-                            const n = r.node;
-                            graphLines.push(`  ${n.label} \`${n.name}\` (${n.filePath}:${n.startLine}-${n.endLine})`);
-                        }
-                    }
-
-                    if (graphLines.length > 0) {
-                        resultMessage += `\n\n## Related Graph Context\n`;
-                        resultMessage += graphLines.join('\n');
-                    }
+                    resultMessage += this.enrichWithGraphContext(
+                        searchResults,
+                        searchCodebasePath,
+                        resultMessage,
+                    );
                 } catch (graphErr: any) {
-                    // Non-fatal: graph enrichment is best-effort
                     console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
                 }
             }
@@ -1365,5 +1345,83 @@ export class ToolHandlers {
                 isError: true
             };
         }
+    }
+
+    // ── Graph Context Enrichment ──────────────────────────────────
+    /**
+     * Enrich vector search results with knowledge graph context:
+     * callers, callees, architectural position, and dead code detection.
+     * Returns a formatted string to append to the result message.
+     */
+    private enrichWithGraphContext(
+        searchResults: any[],
+        codebasePath: string,
+        _existingMessage: string,
+    ): string {
+        const store = this.graphToolHandlers!.getStore();
+        const project = getRepoIdentity(codebasePath);
+        const lines: string[] = [];
+        const seenSymbols = new Set<string>();
+
+        // Collect all unique file paths from search results
+        const seenFiles = new Set<string>();
+        for (const result of searchResults.slice(0, 5)) {
+            seenFiles.add(result.relativePath);
+        }
+
+        // For each file, find containing functions and enrich
+        for (const filePath of seenFiles) {
+            const nodeResult = store.findNodes({
+                project,
+                exactFilePath: filePath,
+                limit: 20,
+            });
+
+            if (nodeResult.results.length === 0) continue;
+
+            for (const r of nodeResult.results) {
+                const n = r.node;
+                const key = n.qualifiedName;
+                if (seenSymbols.has(key)) continue;
+                seenSymbols.add(key);
+
+                // Get callers and callees
+                const callerEdges = store.getEdgesByTarget(n.id, 'CALLS');
+                const calleeEdges = store.getEdgesBySource(n.id, 'CALLS');
+
+                const callerNames = callerEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const caller = store.getNodeById(e.sourceId);
+                    return caller ? caller.name : '?';
+                });
+                const calleeNames = calleeEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
+                    const callee = store.getNodeById(e.targetId);
+                    return callee ? callee.name : '?';
+                });
+
+                // Build a compact line
+                let line = `${n.label} \`${n.name}\``;
+                if (callerNames.length > 0) {
+                    line += ` ← ${callerNames.join(', ')}`;
+                    if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
+                }
+                if (calleeNames.length > 0) {
+                    line += ` → ${calleeNames.join(', ')}`;
+                    if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
+                }
+                // Dead code detection
+                if (callerEdges.length === 0 && calleeEdges.length === 0) {
+                    line += ` [unused]`;
+                } else if (callerEdges.length === 0 && n.label === 'Function') {
+                    line += ` [entry]`;
+                }
+                line += ` (${n.filePath}:${n.startLine})`;
+
+                lines.push(line);
+            }
+        }
+
+        if (lines.length === 0) return '';
+
+        return `\n\n## Related Graph Context\n` + lines.map(l => `  - ${l}`).join('\n');
     }
 } 
