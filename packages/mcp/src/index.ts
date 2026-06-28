@@ -91,16 +91,25 @@ class ContextMcpServer {
 Index a codebase to enable intelligent code search. One call handles both vector indexing (Milvus) and knowledge graph construction (SQLite). The codebase is identified by its git remote URL + branch name, so team members sharing the same repo+branch can reuse each other's indexes.
 
 ⚠️ **IMPORTANT**:
-- The 'path' parameter accepts paths, relative paths, or "." for the IDE workspace.
+- The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace.
 - Before indexing, the system checks if the repository is already indexed. If already indexed, indexing is skipped unless force=true.
+- **First-time setup**: User MUST call this manually once per project. After that, the system handles incremental updates automatically.
 
 ✨ **Usage**: Just call this once when starting work on a project. The system handles everything internally — vector search, code graph, call tracing — all automatically available.
 `;
 
         const search_description = `
-Search the indexed codebase using natural language. Returns code snippets enriched with graph context (related functions, classes, call relationships). The system automatically combines vector search and knowledge graph analysis internally.
+Search the indexed codebase using natural language. Returns matched code snippets enriched with graph context (callers, callees, call chains, architecture, dead code detection).
 
-✨ **Usage**: Just search with a natural language query. The system automatically chooses the best search strategy and enriches results with structural context.
+🎯 **When to call this tool** (call it BEFORE reading files):
+- User asks how something works or where something is implemented
+- Before modifying or writing code — understand existing patterns first
+- Debugging or locating the source of a bug
+- Code review or understanding unfamiliar code
+- Refactoring — find all related code and callers
+- Built-in fallback: if vector search finds nothing, graph search runs automatically
+
+💡 This is the PRIMARY way to understand code. Prefer search over reading files directly — one call gives you the code, its call chain, and its architectural context.
 `;
 
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
