@@ -83,6 +83,8 @@ export class GraphToolHandlers {
             } else {
                 // Full scan
                 files = this.scanFiles(repoPath, supportedExts);
+                // Also scan for infrastructure-as-code files
+                files.push(...this.scanIaCFiles(repoPath));
                 console.log(`[GraphIndex] Full indexing ${files.length} files for '${project}'`);
             }
 
@@ -934,5 +936,50 @@ export class GraphToolHandlers {
         }
 
         return results;
+    }
+
+    /**
+     * Scan for infrastructure-as-code files: Dockerfiles and K8s manifests.
+     */
+    private scanIaCFiles(dir: string): string[] {
+        const results: string[] = [];
+        const ignoreSet = new Set([
+            'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
+            '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
+        ]);
+
+        const stack: string[] = [dir];
+        while (stack.length > 0) {
+            const current = stack.pop()!;
+            const entries = fs.readdirSync(current, { withFileTypes: true });
+            for (const entry of entries) {
+                if (ignoreSet.has(entry.name)) continue;
+                const fullPath = path.join(current, entry.name);
+                if (entry.isDirectory()) {
+                    stack.push(fullPath);
+                } else if (entry.isFile()) {
+                    // Dockerfile detection
+                    if (GraphExtractor.isDockerfile(entry.name)) {
+                        results.push(fullPath);
+                    }
+                    // K8s YAML: only in k8s/deploy/infra directories with .yaml/.yml
+                    const ext = path.extname(entry.name);
+                    if ((ext === '.yaml' || ext === '.yml') && this.isK8sPath(current)) {
+                        results.push(fullPath);
+                    }
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Check if a directory path is likely to contain K8s manifests.
+     */
+    private isK8sPath(dirPath: string): boolean {
+        const k8sKeywords = ['k8s', 'kubernetes', 'deploy', 'deployment', 'infra', 'manifests', 'helm', 'charts'];
+        const lower = dirPath.toLowerCase();
+        return k8sKeywords.some(kw => lower.includes(kw));
     }
 }

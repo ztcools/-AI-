@@ -206,8 +206,17 @@ export class GraphExtractor {
     /**
      * Extract graph nodes and edges from source code.
      * Two-pass: collect definitions, then resolve calls.
+     * Supports 8 tree-sitter languages + Dockerfile/K8s YAML.
      */
     extract(source: string, ctx: ExtractionContext): ExtractionResult {
+        // Infrastructure-as-code: Dockerfile and K8s manifests
+        if (ctx.language === 'dockerfile') {
+            return this.extractDockerfile(source, ctx);
+        }
+        if (ctx.language === 'yaml') {
+            return this.extractK8sManifest(source, ctx);
+        }
+
         const config = this.getLanguageConfig(ctx.language);
         if (!config) {
             return { nodes: [], edges: [] };
@@ -269,8 +278,18 @@ export class GraphExtractor {
             '.go': 'go',
             '.rs': 'rust',
             '.cs': 'csharp',
+            '.yaml': 'yaml', '.yml': 'yaml',
         };
+        // Dockerfile has no extension, detected by filename
         return map[ext] || '';
+    }
+
+    /**
+     * Check if a filename is a Dockerfile (case-insensitive).
+     */
+    static isDockerfile(filename: string): boolean {
+        const base = filename.split('/').pop()?.toLowerCase() || '';
+        return base === 'dockerfile' || base.startsWith('dockerfile.');
     }
 
     // ── Private: Pass 1 - Collect definitions ─────────────────────
@@ -592,6 +611,146 @@ export class GraphExtractor {
             return raw.replace(/^['"]|['"]$/g, '');
         }
         return null;
+    }
+
+    // ── Infrastructure-as-code extraction ────────────────────────────
+
+    /**
+     * Extract Dockerfile instructions as graph nodes.
+     * FROM, RUN, COPY, ENV, EXPOSE, CMD, ENTRYPOINT, etc.
+     */
+    private extractDockerfile(source: string, ctx: ExtractionContext): ExtractionResult {
+        const nodes: Omit<GraphNode, 'id'>[] = [];
+        const edges: Omit<GraphEdge, 'id'>[] = [];
+        const lines = source.split('\n');
+        let prevNodeIdx = -1;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!.trim();
+            if (!line || line.startsWith('#')) continue;
+
+            const match = line.match(/^(\w+)\s+(.+)/);
+            if (!match) continue;
+
+            const [, instruction, args] = match;
+            const instr = instruction!.toUpperCase();
+            const nodeIdx = nodes.length;
+
+            nodes.push({
+                project: ctx.project,
+                label: 'Resource',
+                name: `${instr} ${args!.substring(0, 60)}`,
+                qualifiedName: `${ctx.project}.dockerfile.${ctx.filePath}.L${i + 1}.${instr}`,
+                filePath: ctx.filePath,
+                startLine: i + 1,
+                endLine: i + 1,
+                properties: {
+                    instruction: instr,
+                    args: args,
+                    language: 'dockerfile',
+                    baseImage: instr === 'FROM' ? args!.split(':')[0] : undefined,
+                    port: instr === 'EXPOSE' ? args : undefined,
+                    envVar: instr === 'ENV' ? args!.split('=')[0] : undefined,
+                },
+            });
+
+            // Link sequential instructions
+            if (prevNodeIdx >= 0) {
+                edges.push({
+                    project: ctx.project,
+                    sourceId: prevNodeIdx,
+                    targetId: nodeIdx,
+                    type: 'CONFIGURES',
+                    properties: { order: i },
+                });
+            }
+            prevNodeIdx = nodeIdx;
+        }
+
+        return { nodes, edges };
+    }
+
+    /**
+     * Extract Kubernetes manifest resources as graph nodes.
+     * Detects Deployments, Services, ConfigMaps, etc.
+     */
+    private extractK8sManifest(source: string, ctx: ExtractionContext): ExtractionResult {
+        const nodes: Omit<GraphNode, 'id'>[] = [];
+        const edges: Omit<GraphEdge, 'id'>[] = [];
+
+        // Simple line-based K8s manifest parser
+        const lines = source.split('\n');
+        let currentKind = '';
+        let currentName = '';
+        let currentNamespace = '';
+        let inMetadata = false;
+        let kindStartLine = 0;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i]!;
+            const trimmed = line.trim();
+
+            // Detect kind
+            const kindMatch = trimmed.match(/^kind:\s+(.+)/i);
+            if (kindMatch) {
+                currentKind = kindMatch[1]!.trim();
+                kindStartLine = i + 1;
+                inMetadata = false;
+                currentName = '';
+                currentNamespace = 'default';
+                continue;
+            }
+
+            // Detect metadata section
+            if (trimmed === 'metadata:' && currentKind) {
+                inMetadata = true;
+                continue;
+            }
+
+            // In metadata: extract name
+            if (inMetadata && trimmed.startsWith('name:')) {
+                currentName = trimmed.replace(/^name:\s*/, '').trim();
+                // Remove quotes
+                currentName = currentName.replace(/^['"]|['"]$/g, '');
+            }
+
+            // In metadata: extract namespace
+            if (inMetadata && trimmed.startsWith('namespace:')) {
+                currentNamespace = trimmed.replace(/^namespace:\s*/, '').trim();
+                currentNamespace = currentNamespace.replace(/^['"]|['"]$/g, '');
+            }
+
+            // End of metadata section
+            if (inMetadata && !trimmed.startsWith(' ') && !trimmed.startsWith('name:') && !trimmed.startsWith('namespace:') && !trimmed.startsWith('labels:') && !trimmed.startsWith('annotations:')) {
+                inMetadata = false;
+            }
+
+            // End of a resource (--- or next document)
+            if ((trimmed === '---' || i === lines.length - 1) && currentKind && currentName) {
+                const qn = `${ctx.project}.k8s.${currentNamespace}.${currentKind}.${currentName}`;
+                nodes.push({
+                    project: ctx.project,
+                    label: 'Resource',
+                    name: `${currentKind}/${currentName}`,
+                    qualifiedName: qn,
+                    filePath: ctx.filePath,
+                    startLine: kindStartLine,
+                    endLine: i + 1,
+                    properties: {
+                        kind: currentKind,
+                        name: currentName,
+                        namespace: currentNamespace,
+                        language: 'yaml',
+                        manifestType: 'kubernetes',
+                    },
+                });
+
+                currentKind = '';
+                currentName = '';
+            }
+        }
+
+        return { nodes, edges };
     }
 
     // ── Private: Route extraction ───────────────────────────────────
