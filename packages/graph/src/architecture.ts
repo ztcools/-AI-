@@ -46,10 +46,9 @@ export class ArchitectureAnalyzer {
         // Count edge types
         const schema = this.store.getSchema();
         const edgeTypes: Record<string, number> = {};
+        const allEdges = this.store.findEdges(project);
         for (const etype of schema.edgeTypes) {
-            // Count edges of each type for this project
-            const edges = this.store.getEdgesBySource(0); // Placeholder
-            edgeTypes[etype] = 0;
+            edgeTypes[etype] = allEdges.filter((e: { type: string }) => e.type === etype).length;
         }
 
         // Find entry points: high out-degree, low in-degree nodes

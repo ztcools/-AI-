@@ -1,12 +1,13 @@
 /**
  * Graph MCP tool handlers. Extends claude-context with knowledge graph
  * capabilities: search_graph, trace_path, query_graph, get_code_snippet,
- * get_graph_schema, get_architecture, search_code, detect_changes,
+ * get_graph_schema, get_architecture, search_code_graph, detect_changes,
  * list_projects, delete_project, index_status, manage_adr.
  */
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import { execSync } from 'child_process';
 import {
     SqliteGraphStore,
     GraphExtractor,
@@ -17,6 +18,7 @@ import {
     GraphSearchOptions,
     GraphSearchResponse,
     TraceOptions,
+    escapeRegex,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
 
@@ -415,7 +417,6 @@ export class GraphToolHandlers {
             }
 
             // Run git diff to find changed files
-            const { execSync } = require('child_process');
             let diffOutput: string;
             try {
                 diffOutput = execSync(`git diff --name-only ${baseBranch}...HEAD`, {
@@ -448,7 +449,7 @@ export class GraphToolHandlers {
             // Find impacted nodes
             const result = this.store.findNodes({
                 project,
-                filePattern: changedFiles.map(f => this.escapeRegex(f)).join('|'),
+                filePattern: changedFiles.map(f => escapeRegex(f)).join('|'),
                 limit: 1000,
             });
 
@@ -801,14 +802,9 @@ export class GraphToolHandlers {
         return null;
     }
 
-    private escapeRegex(str: string): string {
-        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    }
-
     private detectChangedFiles(repoPath: string, extensions: string[]): string[] {
         const extSet = new Set(extensions);
         try {
-            const { execSync } = require('child_process');
             const diffOutput = execSync('git diff --name-only HEAD', {
                 cwd: repoPath,
                 encoding: 'utf-8',

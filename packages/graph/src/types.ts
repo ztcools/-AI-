@@ -162,6 +162,7 @@ export interface GraphStore {
     upsertEdge(edge: Omit<GraphEdge, 'id'>): number;
     getEdgesBySource(sourceId: number, type?: GraphEdgeType): GraphEdge[];
     getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[];
+    findEdges(project: string, types?: GraphEdgeType[], limit?: number): GraphEdge[];
 
     // Project operations
     listProjects(): string[];

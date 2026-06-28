@@ -9,3 +9,4 @@ export * from './extractor';
 export * from './tracer';
 export * from './searcher';
 export * from './architecture';
+export * from './utils';

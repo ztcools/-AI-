@@ -3,6 +3,7 @@
  */
 import * as fs from 'fs';
 import { GraphStore, GraphNode, GraphSearchOptions, GraphSearchResponse } from './types';
+import { escapeRegex } from './utils';
 
 export interface SearchCodeOptions {
     project: string;
@@ -74,7 +75,7 @@ export class GraphSearcher {
             try {
                 const content = fs.readFileSync(filePath, 'utf-8');
                 const lines = content.split('\n');
-                const searchRegex = regex ? new RegExp(pattern, 'g') : new RegExp(this.escapeRegex(pattern), 'gi');
+                const searchRegex = regex ? new RegExp(pattern, 'g') : new RegExp(escapeRegex(pattern), 'gi');
 
                 for (let i = 0; i < lines.length; i++) {
                     if (searchRegex.test(lines[i])) {
@@ -162,7 +163,7 @@ export class GraphSearcher {
             // Find containing function/class for this match
             const nodeResult = this.store.findNodes({
                 project,
-                filePattern: this.escapeRegex(match.filePath),
+                filePattern: escapeRegex(match.filePath),
                 limit: 100,
             });
 
@@ -210,9 +211,5 @@ export class GraphSearcher {
         }
 
         return results;
-    }
-
-    private escapeRegex(str: string): string {
-        return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     }
 }

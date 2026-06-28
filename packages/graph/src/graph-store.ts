@@ -6,7 +6,6 @@ import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as crypto from 'crypto';
 import {
     GraphStore,
     GraphNode,
@@ -232,7 +231,7 @@ export class SqliteGraphStore implements GraphStore {
         if (options.query && options.query.trim().length > 0) {
             countParams.push(this.buildFtsQuery(options.query));
         }
-        countParams.push(options.project);
+        if (options.project) countParams.push(options.project);
         if (options.label) countParams.push(options.label);
         if (options.namePattern) countParams.push(this.regexToLike(options.namePattern));
         if (options.qnPattern) countParams.push(this.regexToLike(options.qnPattern));
