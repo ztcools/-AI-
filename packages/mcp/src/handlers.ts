@@ -6,6 +6,7 @@ import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
+import type { GraphToolHandlers } from "./graph-handlers.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -19,11 +20,13 @@ export class ToolHandlers {
      * the background task keeps embedding chunks and writing them into the
      * just-cleared collection (issue #199).
      */
+    private graphToolHandlers: GraphToolHandlers | null = null;
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
         this.snapshotManager = snapshotManager;
+        this.graphToolHandlers = graphToolHandlers || null;
         this.currentWorkspace = process.cwd();
         console.log(`[WORKSPACE] Current workspace: ${this.currentWorkspace}`);
     }
@@ -1003,7 +1006,7 @@ export class ToolHandlers {
 
             try {
                 await this.context.clearIndex(absolutePath);
-                console.log(`[CLEAR] Successfully cleared index for: ${absolutePath}`);
+                console.log(`[CLEAR] Successfully cleared vector index for: ${absolutePath}`);
             } catch (error: any) {
                 const errorMsg = `Failed to clear ${absolutePath}: ${error.message}`;
                 console.error(`[CLEAR] ${errorMsg}`);
@@ -1014,6 +1017,19 @@ export class ToolHandlers {
                     }],
                     isError: true
                 };
+            }
+
+            // Also clear the graph index to keep vector + graph in sync
+            if (this.graphToolHandlers) {
+                try {
+                    this.graphToolHandlers.getStore().beginTransaction();
+                    this.graphToolHandlers.getStore().deleteProject(codebaseIdentity);
+                    this.graphToolHandlers.getStore().commitTransaction();
+                    console.log(`[CLEAR] Successfully cleared graph index for: ${codebaseIdentity}`);
+                } catch (graphError: any) {
+                    console.warn(`[CLEAR] Failed to clear graph index for '${codebaseIdentity}': ${graphError.message}`);
+                    // Non-fatal: vector index is already cleared, graph data can be cleaned up later
+                }
             }
 
             // Completely remove the cleared codebase from snapshot

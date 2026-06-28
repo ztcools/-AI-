@@ -11,7 +11,7 @@ export interface SearchCodeOptions {
     filePattern?: string;
     pathFilter?: string;
     mode?: 'compact' | 'full' | 'files';
-    context?: number;
+    context?: number; // Reserved for future use, not yet implemented
     regex?: boolean;
     limit?: number;
 }
