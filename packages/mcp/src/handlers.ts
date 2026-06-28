@@ -400,10 +400,19 @@ export class ToolHandlers {
                         };
                     } catch (e: any) {
                         console.warn(`[INDEX] Incremental graph indexing failed: ${e.message}`);
+                        const vectorText = vectorResult.content[0]?.text || '';
+                        return {
+                            ...vectorResult,
+                            content: [{
+                                type: 'text', text: vectorText +
+                                    `\n\n⚠️ Graph incremental indexing failed: ${e.message}` +
+                                    `\n  Use force=true to re-index fully.`
+                            }],
+                        };
                     }
                 }
 
-                // No changes or incremental failed — skip
+                // No changes — skip
                 console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
                 const vectorText = vectorResult.content[0]?.text || '';
                 return {
