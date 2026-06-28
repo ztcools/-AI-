@@ -2,7 +2,7 @@
  * Architecture analyzer. Provides high-level architecture overview
  * including package structure, entry points, and simple clustering.
  */
-import { GraphStore, GraphNode, ArchitectureOverview, ArchitectureCluster, PackageTreeNode, GraphEdgeType } from './types';
+import { GraphStore, GraphNode, GraphEdge, ArchitectureOverview, ArchitectureCluster, PackageTreeNode, GraphEdgeType } from './types';
 
 export class ArchitectureAnalyzer {
     private store: GraphStore;
@@ -162,7 +162,7 @@ export class ArchitectureAnalyzer {
             clusters.push({
                 label: dir,
                 memberCount: dirNodes.length,
-                cohesionScore: this.calculateCohesion(dirNodes),
+                cohesionScore: this.calculateCohesion(dirNodes, edgesBatch),
                 topNodes: dirNodes.slice(0, 5),
                 dominantPackages: [dir],
                 dominantEdgeTypes: Array.from(edgeTypes),
@@ -173,7 +173,7 @@ export class ArchitectureAnalyzer {
         return clusters.slice(0, 20);
     }
 
-    private calculateCohesion(nodes: GraphNode[]): number {
+    private calculateCohesion(nodes: GraphNode[], edgesBatch: Map<number, GraphEdge[]>): number {
         if (nodes.length <= 1) return 1.0;
 
         const nodeIds = new Set(nodes.map(n => n.id));
@@ -181,7 +181,7 @@ export class ArchitectureAnalyzer {
         let totalEdges = 0;
 
         for (const node of nodes) {
-            const outEdges = this.store.getEdgesBySource(node.id);
+            const outEdges = edgesBatch.get(node.id) || [];
             for (const edge of outEdges) {
                 totalEdges++;
                 if (nodeIds.has(edge.targetId)) {

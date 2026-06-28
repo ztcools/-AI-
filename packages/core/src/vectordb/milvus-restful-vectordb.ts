@@ -153,7 +153,8 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
         if (this.config.token) {
             headers['Authorization'] = `Bearer ${this.config.token}`;
         } else if (this.config.username && this.config.password) {
-            headers['Authorization'] = `Bearer ${this.config.username}:${this.config.password}`;
+            const credentials = Buffer.from(`${this.config.username}:${this.config.password}`).toString('base64');
+            headers['Authorization'] = `Basic ${credentials}`;
         }
 
         const requestOptions: RequestInit = {
