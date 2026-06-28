@@ -1164,10 +1164,50 @@ export class ToolHandlers {
             try {
                 const absolutePath = resolveCodebasePath(codebasePath);
                 const project = getRepoIdentity(absolutePath);
-                const graphResult = this.graphToolHandlers.handleIndexStatus({ project });
-                const graphText = graphResult.content[0]?.text || '';
+                const store = this.graphToolHandlers.getStore();
+                const stats = store.getProjectStats(project);
+                const schema = store.getSchema();
+
                 lines.push('## Graph Index (SQLite)');
-                lines.push(graphText);
+                lines.push(`  Nodes: ${stats.nodes} | Edges: ${stats.edges}`);
+
+                // Node type breakdown
+                if (schema.nodeLabels.length > 0) {
+                    const nodeTypeCounts: string[] = [];
+                    for (const label of schema.nodeLabels) {
+                        const result = store.findNodes({ project, label: label as any, limit: 1 });
+                        if (result.total > 0) {
+                            nodeTypeCounts.push(`${label}: ${result.total}`);
+                        }
+                    }
+                    if (nodeTypeCounts.length > 0) {
+                        lines.push(`  Types: ${nodeTypeCounts.join(', ')}`);
+                    }
+                }
+
+                // Edge type breakdown
+                if (schema.edgeTypes.length > 0) {
+                    const edgeTypeCounts: string[] = [];
+                    for (const etype of schema.edgeTypes) {
+                        const edges = store.findEdges(project, [etype as any], 1);
+                        if (edges.length > 0) {
+                            edgeTypeCounts.push(`${etype}: ${edges.length}`);
+                        }
+                    }
+                    if (edgeTypeCounts.length > 0) {
+                        lines.push(`  Relationships: ${edgeTypeCounts.join(', ')}`);
+                    }
+                }
+
+                // Routes summary
+                const routeResult = store.findNodes({ project, label: 'Route' as any, limit: 100 });
+                if (routeResult.total > 0) {
+                    lines.push(`  Routes: ${routeResult.total}`);
+                    for (const r of routeResult.results.slice(0, 5)) {
+                        lines.push(`    ${r.node.name} (${r.node.filePath}:${r.node.startLine})`);
+                    }
+                    if (routeResult.total > 5) lines.push(`    ... +${routeResult.total - 5} more`);
+                }
             } catch (e: any) {
                 lines.push('## Graph Index (SQLite)');
                 lines.push(`Error: ${e.message}`);
