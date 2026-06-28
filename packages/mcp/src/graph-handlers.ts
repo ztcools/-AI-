@@ -468,6 +468,7 @@ export class GraphToolHandlers {
 
             // Run git diff to find changed files
             let diffOutput: string;
+            let diffBranchUsed = getDiffBranch;
             try {
                 diffOutput = execSync(`git diff --name-only ${getDiffBranch}...HEAD`, {
                     cwd: repoPath,
@@ -476,12 +477,15 @@ export class GraphToolHandlers {
                 });
             } catch (err: any) {
                 console.warn(`[Graph] git diff failed for branch '${getDiffBranch}': ${err.message}`);
-                // Try diff against working tree
+                // Try diff against working tree as fallback
                 diffOutput = execSync('git diff --name-only HEAD', {
                     cwd: repoPath,
                     encoding: 'utf-8',
                     timeout: 10000,
                 });
+                diffBranchUsed = 'HEAD';
+                lines.push(`Warning: Could not diff against '${getDiffBranch}', falling back to uncommitted changes only.`);
+                lines.push('');
             }
 
             const changedFiles = diffOutput.trim().split('\n').filter(Boolean);
@@ -549,8 +553,15 @@ export class GraphToolHandlers {
             return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
         }
 
-        this.store.deleteProject(project);
-        return { content: [{ type: 'text', text: `Project '${project}' deleted.` }] };
+        try {
+            this.store.beginTransaction();
+            this.store.deleteProject(project);
+            this.store.commitTransaction();
+            return { content: [{ type: 'text', text: `Project '${project}' deleted.` }] };
+        } catch (error: any) {
+            this.store.rollbackTransaction();
+            return { content: [{ type: 'text', text: `Error deleting project '${project}': ${error.message}` }] };
+        }
     }
 
     // ── Tool: index_status ───────────────────────────────────────

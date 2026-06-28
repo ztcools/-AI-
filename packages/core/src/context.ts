@@ -90,6 +90,15 @@ const DEFAULT_IGNORE_PATTERNS = [
     '.cache/**',
     '__pycache__/**',
     '.pytest_cache/**',
+    '.next/**',
+    '.nuxt/**',
+    '.turbo/**',
+    '.parcel-cache/**',
+    '.terraform/**',
+
+    // Dependency directories
+    'vendor/**',
+    'bower_components/**',
 
     // Logs and temporary files
     'logs/**',
