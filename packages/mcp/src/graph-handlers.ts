@@ -74,7 +74,13 @@ export class GraphToolHandlers {
 
             if (specificFiles && specificFiles.length > 0) {
                 // Incremental: re-index only specified files
-                files = specificFiles.map(f => path.resolve(repoPath, f)).filter(f => fs.existsSync(f));
+                const resolvedFiles = specificFiles.map(f => path.resolve(repoPath, f));
+                const existingFiles = resolvedFiles.filter(f => fs.existsSync(f));
+                const skippedCount = resolvedFiles.length - existingFiles.length;
+                if (skippedCount > 0) {
+                    console.warn(`[GraphIndex] ${skippedCount} specified file(s) not found on disk, skipping`);
+                }
+                files = existingFiles;
                 console.log(`[GraphIndex] Incremental indexing ${files.length} specified files for '${project}'`);
             } else if (mode === 'incremental') {
                 // Auto-detect changed files via git diff
@@ -693,63 +699,70 @@ export class GraphToolHandlers {
         const lines: string[] = [];
         lines.push(`Ingesting ${traces.length} traces for project '${project}':`);
 
-        for (const trace of traces) {
-            const sourceService = trace.source_service as string;
-            const targetService = trace.target_service as string;
-            const method = (trace.method as string) || 'HTTP';
-            const path = (trace.path as string) || '/';
-            const statusCode = trace.status_code as number;
-            const durationMs = trace.duration_ms as number;
+        this.store.beginTransaction();
+        try {
+            for (const trace of traces) {
+                const sourceService = trace.source_service as string;
+                const targetService = trace.target_service as string;
+                const method = (trace.method as string) || 'HTTP';
+                const path = (trace.path as string) || '/';
+                const statusCode = trace.status_code as number;
+                const durationMs = trace.duration_ms as number;
 
-            if (!sourceService || !targetService) continue;
+                if (!sourceService || !targetService) continue;
 
-            // Create service nodes
-            const sourceQN = `${project}.${sourceService}`;
-            const targetQN = `${project}.${targetService}`;
+                // Create service nodes
+                const sourceQN = `${project}.${sourceService}`;
+                const targetQN = `${project}.${targetService}`;
 
-            const sourceId = this.store.upsertNode({
-                project,
-                label: 'Resource',
-                name: sourceService,
-                qualifiedName: sourceQN,
-                filePath: `service://${sourceService}`,
-                startLine: 0,
-                endLine: 0,
-                properties: { type: 'service' },
-            });
+                const sourceId = this.store.upsertNode({
+                    project,
+                    label: 'Resource',
+                    name: sourceService,
+                    qualifiedName: sourceQN,
+                    filePath: `service://${sourceService}`,
+                    startLine: 0,
+                    endLine: 0,
+                    properties: { type: 'service' },
+                });
 
-            const targetId = this.store.upsertNode({
-                project,
-                label: 'Resource',
-                name: targetService,
-                qualifiedName: targetQN,
-                filePath: `service://${targetService}`,
-                startLine: 0,
-                endLine: 0,
-                properties: { type: 'service' },
-            });
+                const targetId = this.store.upsertNode({
+                    project,
+                    label: 'Resource',
+                    name: targetService,
+                    qualifiedName: targetQN,
+                    filePath: `service://${targetService}`,
+                    startLine: 0,
+                    endLine: 0,
+                    properties: { type: 'service' },
+                });
 
-            // Create CROSS_HTTP_CALLS edge
-            const edgeType = method === 'GRPC' ? 'CROSS_CHANNEL' as const
-                : method === 'MESSAGE' || method === 'EVENT' ? 'CROSS_ASYNC_CALLS' as const
-                    : 'CROSS_HTTP_CALLS' as const;
+                // Create CROSS_HTTP_CALLS edge
+                const edgeType = method === 'GRPC' ? 'CROSS_CHANNEL' as const
+                    : method === 'MESSAGE' || method === 'EVENT' ? 'CROSS_ASYNC_CALLS' as const
+                        : 'CROSS_HTTP_CALLS' as const;
 
-            this.store.upsertEdge({
-                project,
-                sourceId,
-                targetId,
-                type: edgeType,
-                properties: {
-                    method,
-                    path,
-                    statusCode,
-                    durationMs,
-                    timestamp: trace.timestamp,
-                },
-            });
+                this.store.upsertEdge({
+                    project,
+                    sourceId,
+                    targetId,
+                    type: edgeType,
+                    properties: {
+                        method,
+                        path,
+                        statusCode,
+                        durationMs,
+                        timestamp: trace.timestamp,
+                    },
+                });
 
-            count++;
-            lines.push(`  ${sourceService} --> ${method} ${path} --> ${targetService} (${statusCode || 'n/a'})`);
+                count++;
+                lines.push(`  ${sourceService} --> ${method} ${path} --> ${targetService} (${statusCode || 'n/a'})`);
+            }
+            this.store.commitTransaction();
+        } catch (e: any) {
+            this.store.rollbackTransaction();
+            throw e;
         }
 
         lines.push('');
@@ -860,6 +873,11 @@ export class GraphToolHandlers {
     }
 
     private findRepoPath(project: string): string | null {
+        // Cache by project identity to avoid repeated O(n) scans
+        if (this._repoPathCache.has(project)) {
+            return this._repoPathCache.get(project)!;
+        }
+
         // Try to find the repo on disk by scanning common locations
         const homeDir = os.homedir();
         const searchPaths = [
@@ -881,6 +899,7 @@ export class GraphToolHandlers {
                     // Check if this repo's identity matches the project
                     const identity = getRepoIdentity(fullPath);
                     if (identity === project) {
+                        this._repoPathCache.set(project, fullPath);
                         return fullPath;
                     }
                 }
@@ -890,6 +909,8 @@ export class GraphToolHandlers {
         }
         return null;
     }
+
+    private _repoPathCache: Map<string, string> = new Map();
 
     private detectChangedFiles(repoPath: string, extensions: string[]): string[] {
         const extSet = new Set(extensions);

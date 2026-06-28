@@ -30,6 +30,7 @@ export class SnapshotManager {
     /**
      * Resolve identity from codebase path. All internal state is keyed by identity.
      * Results are cached per path to avoid repeated git calls.
+     * Cache is cleared on each snapshot load to prevent stale identities.
      */
     private toIdentity(codebasePath: string): string {
         // If the input already looks like an identity (contains URI scheme or git@),
@@ -42,6 +43,14 @@ export class SnapshotManager {
             this.identityCache.set(resolved, getRepoIdentity(resolved));
         }
         return this.identityCache.get(resolved)!;
+    }
+
+    /**
+     * Clear the identity cache. Should be called before snapshot load to ensure
+     * fresh identities are resolved (e.g., after remote URL or branch changes).
+     */
+    clearIdentityCache(): void {
+        this.identityCache.clear();
     }
 
     /**

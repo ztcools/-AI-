@@ -445,6 +445,28 @@ export class SqliteGraphStore implements GraphStore {
         };
     }
 
+    getNodeTypeCounts(project: string): Record<string, number> {
+        const rows = this.db.prepare(
+            'SELECT label, COUNT(*) as cnt FROM nodes WHERE project = ? GROUP BY label'
+        ).all(project) as Array<{ label: string; cnt: number }>;
+        const result: Record<string, number> = {};
+        for (const row of rows) {
+            result[row.label] = row.cnt;
+        }
+        return result;
+    }
+
+    getEdgeTypeCounts(project: string): Record<string, number> {
+        const rows = this.db.prepare(
+            'SELECT type, COUNT(*) as cnt FROM edges WHERE project = ? GROUP BY type'
+        ).all(project) as Array<{ type: string; cnt: number }>;
+        const result: Record<string, number> = {};
+        for (const row of rows) {
+            result[row.type] = row.cnt;
+        }
+        return result;
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
 
     private rowToNode(row: Record<string, unknown>): GraphNode {

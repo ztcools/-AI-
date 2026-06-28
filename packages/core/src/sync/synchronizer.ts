@@ -25,7 +25,15 @@ export class FileSynchronizer {
     private getSnapshotPath(codebasePath: string): string {
         const homeDir = os.homedir();
         const merkleDir = path.join(homeDir, '.context', 'merkle');
-        const identity = getRepoIdentity(codebasePath);
+        let identity: string;
+        try {
+            identity = getRepoIdentity(codebasePath);
+        } catch {
+            // Fallback to path-based identity if git is not available
+            const hash = crypto.createHash('md5').update(codebasePath).digest('hex');
+            identity = `path:${hash}`;
+            console.warn(`[Synchronizer] Git identity unavailable, using path-based fallback: ${identity}`);
+        }
         const hash = crypto.createHash('md5').update(identity).digest('hex');
         return path.join(merkleDir, `${hash}.json`);
     }

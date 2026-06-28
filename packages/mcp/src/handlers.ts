@@ -168,6 +168,8 @@ export class ToolHandlers {
      */
     private async syncIndexedCodebasesFromCloud(): Promise<void> {
         try {
+            // Clear stale identity cache before syncing (handles remote URL/branch changes)
+            this.snapshotManager.clearIdentityCache();
             console.log(`[SYNC-CLOUD] 🔄 Syncing indexed codebases from Zilliz Cloud...`);
 
             // Get all collections using the interface method
@@ -344,7 +346,7 @@ export class ToolHandlers {
      * once — the system handles both indexes internally.
      */
     public async handleIndex(args: any) {
-        const { path: codebasePath = "." } = args;
+        const { path: codebasePath = ".", mode: graphMode = "full" } = args;
         const absolutePath = resolveCodebasePath(codebasePath);
 
         // 1. Run vector indexing (same as handleIndexCodebase)
@@ -363,11 +365,20 @@ export class ToolHandlers {
 
             if (alreadyGraphIndexed && !args.force) {
                 console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), skipping`);
+                // Include graph status so user knows the state
+                const vectorText = vectorResult.content[0]?.text || '';
+                return {
+                    ...vectorResult,
+                    content: [{
+                        type: 'text',
+                        text: vectorText + `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (use force=true to re-index)`,
+                    }],
+                };
             } else {
                 try {
                     const graphResult = await this.graphToolHandlers.handleIndexRepository({
                         repo_path: absolutePath,
-                        mode: 'full',
+                        mode: graphMode,
                     });
                     const graphText = graphResult.content[0]?.text || '';
                     console.log(`[INDEX] Graph indexing completed: ${graphText.substring(0, 120)}...`);
@@ -412,7 +423,7 @@ export class ToolHandlers {
                     isError: true
                 };
             }
-            const splitterType: RequestSplitterType = requestedSplitter;
+            const splitterType = requestedSplitter; // narrowed by isRequestSplitterType above
             const indexOptions: CodebaseIndexOptions = {
                 requestSplitter: splitterType,
                 requestCustomExtensions: customFileExtensions,
@@ -813,9 +824,8 @@ export class ToolHandlers {
             // Check if this codebase is indexed or being indexed
             const indexedCodebasePath = this.snapshotManager.findIndexedCodebasePath(absolutePath);
             const indexingCodebasePath = this.snapshotManager.findIndexingCodebasePath(absolutePath);
-            const matchedCodebase = [indexedCodebasePath, indexingCodebasePath]
-                .filter((codebase): codebase is string => codebase !== undefined)
-                .sort((a, b) => b.length - a.length)[0];
+            // Prefer indexed over indexing (identity-based lookup, no need for path length sort)
+            const matchedCodebase = indexedCodebasePath || indexingCodebasePath;
             let searchCodebasePath = matchedCodebase || absolutePath;
             let isIndexed = indexedCodebasePath === searchCodebasePath;
             const isIndexing = indexingCodebasePath === searchCodebasePath;
@@ -880,7 +890,7 @@ export class ToolHandlers {
                 const invalid = cleaned.filter((e: string) => !(e.startsWith('.') && e.length > 1 && !/\s/.test(e)));
                 if (invalid.length > 0) {
                     return {
-                        content: [{ type: 'text', text: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Use proper extensions like '.ts', '.py'.` }],
+                        content: [{ type: 'text', text: `Error: Invalid file extensions in extensionFilter: ${JSON.stringify(invalid)}. Extensions must start with '.' (e.g., '.ts', '.py', '.java').` }],
                         isError: true
                     };
                 }
@@ -1166,37 +1176,22 @@ export class ToolHandlers {
                 const project = getRepoIdentity(absolutePath);
                 const store = this.graphToolHandlers.getStore();
                 const stats = store.getProjectStats(project);
-                const schema = store.getSchema();
 
                 lines.push('## Graph Index (SQLite)');
                 lines.push(`  Nodes: ${stats.nodes} | Edges: ${stats.edges}`);
 
-                // Node type breakdown
-                if (schema.nodeLabels.length > 0) {
-                    const nodeTypeCounts: string[] = [];
-                    for (const label of schema.nodeLabels) {
-                        const result = store.findNodes({ project, label: label as any, limit: 1 });
-                        if (result.total > 0) {
-                            nodeTypeCounts.push(`${label}: ${result.total}`);
-                        }
-                    }
-                    if (nodeTypeCounts.length > 0) {
-                        lines.push(`  Types: ${nodeTypeCounts.join(', ')}`);
-                    }
+                // Node type breakdown (single aggregate query)
+                const nodeTypeCounts = store.getNodeTypeCounts(project);
+                const typeEntries = Object.entries(nodeTypeCounts);
+                if (typeEntries.length > 0) {
+                    lines.push(`  Types: ${typeEntries.map(([k, v]) => `${k}: ${v}`).join(', ')}`);
                 }
 
-                // Edge type breakdown
-                if (schema.edgeTypes.length > 0) {
-                    const edgeTypeCounts: string[] = [];
-                    for (const etype of schema.edgeTypes) {
-                        const edges = store.findEdges(project, [etype as any], 1);
-                        if (edges.length > 0) {
-                            edgeTypeCounts.push(`${etype}: ${edges.length}`);
-                        }
-                    }
-                    if (edgeTypeCounts.length > 0) {
-                        lines.push(`  Relationships: ${edgeTypeCounts.join(', ')}`);
-                    }
+                // Edge type breakdown (single aggregate query)
+                const edgeTypeCounts = store.getEdgeTypeCounts(project);
+                const edgeEntries = Object.entries(edgeTypeCounts);
+                if (edgeEntries.length > 0) {
+                    lines.push(`  Relationships: ${edgeEntries.map(([k, v]) => `${k}: ${v}`).join(', ')}`);
                 }
 
                 // Routes summary
@@ -1391,6 +1386,7 @@ export class ToolHandlers {
         searchResults: any[],
         codebasePath: string,
         _existingMessage: string,
+        maxContextFiles: number = 10,
     ): string {
         const store = this.graphToolHandlers!.getStore();
         const project = getRepoIdentity(codebasePath);
@@ -1399,17 +1395,28 @@ export class ToolHandlers {
 
         // Collect all unique file paths from search results
         const seenFiles = new Set<string>();
-        for (const result of searchResults.slice(0, 5)) {
+        for (const result of searchResults.slice(0, maxContextFiles)) {
             seenFiles.add(result.relativePath);
         }
 
         // For each file, find containing functions and enrich
         for (const filePath of seenFiles) {
-            const nodeResult = store.findNodes({
+            // Normalize path: strip leading slash and prefix for exact match
+            const normalizedPath = filePath.replace(/^\/+/, '');
+            let nodeResult = store.findNodes({
                 project,
-                exactFilePath: filePath,
+                exactFilePath: normalizedPath,
                 limit: 20,
             });
+
+            // Fallback: try without exact path match if nothing found
+            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
+                nodeResult = store.findNodes({
+                    project,
+                    exactFilePath: filePath,
+                    limit: 20,
+                });
+            }
 
             if (nodeResult.results.length === 0) continue;
 

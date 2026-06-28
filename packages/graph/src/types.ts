@@ -177,4 +177,17 @@ export interface GraphStore {
 
     // Schema
     getSchema(): { nodeLabels: string[]; edgeTypes: string[] };
+    getNodeTypeCounts(project: string): Record<string, number>;
+    getEdgeTypeCounts(project: string): Record<string, number>;
+
+    // Raw queries (for advanced use cases)
+    executeQuery(project: string, query: string): { rows: Array<Record<string, unknown>> };
+
+    // File-level operations
+    deleteNodesByFile(project: string, filePath: string): void;
+
+    // ADR operations
+    getADRs(project?: string): Array<{ id: number; project: string; title: string; status: string; content: string; created: string }>;
+    createADR(adr: { project: string; title: string; content: string; status: string }): number;
+    updateADR(id: number, updates: { status?: string; content?: string }): void;
 }

@@ -154,10 +154,14 @@ export class Context {
     constructor(config: ContextConfig = {}) {
         // Initialize services
         this.embedding = config.embedding || new OpenAIEmbedding({
-            apiKey: envManager.get('OPENAI_API_KEY') || 'your-openai-api-key',
+            apiKey: envManager.get('OPENAI_API_KEY') || 'missing-openai-api-key',
             model: 'text-embedding-3-small',
             ...(envManager.get('OPENAI_BASE_URL') && { baseURL: envManager.get('OPENAI_BASE_URL') })
         });
+
+        if (!config.embedding && !envManager.get('OPENAI_API_KEY')) {
+            console.warn('[Context] No OPENAI_API_KEY found in environment. Embedding operations will fail.');
+        }
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
