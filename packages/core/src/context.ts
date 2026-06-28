@@ -24,6 +24,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
+import { matchGlob } from './utils/glob-matcher';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -1333,84 +1334,12 @@ export class Context {
         const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
 
         for (const pattern of ignorePatterns) {
-            if (this.isPatternMatch(normalizedPath, pattern)) {
+            if (matchGlob(normalizedPath, pattern)) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    /**
-     * Simple glob pattern matching
-     * @param filePath File path to test
-     * @param pattern Glob pattern
-     * @returns True if pattern matches
-     */
-    private isPatternMatch(filePath: string, pattern: string): boolean {
-        const cleanPath = filePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
-        const normalizedPattern = pattern.replace(/\\/g, '/');
-        const cleanPattern = normalizedPattern.replace(/^\/+|\/+$/g, '');
-        const isRootAnchored = normalizedPattern.startsWith('/');
-        const isDirectoryPattern = normalizedPattern.endsWith('/');
-
-        if (!cleanPath || !cleanPattern) {
-            return false;
-        }
-
-        // Handle directory patterns (ending with /)
-        if (isDirectoryPattern) {
-            if (isRootAnchored) {
-                return this.simpleGlobMatch(cleanPath, cleanPattern) ||
-                    cleanPath.startsWith(`${cleanPattern}/`);
-            }
-
-            return this.matchesDirectoryPattern(cleanPath, cleanPattern);
-        }
-
-        if (isRootAnchored) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle file patterns
-        if (cleanPattern.includes('/')) {
-            // Pattern with path separator - match exact path
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        } else {
-            // Pattern without path separator - match filename in any directory
-            const fileName = path.basename(cleanPath);
-            return this.simpleGlobMatch(fileName, cleanPattern);
-        }
-    }
-
-    private matchesDirectoryPattern(filePath: string, dirPattern: string): boolean {
-        const pathParts = filePath.split('/');
-        const dirPartCount = dirPattern.split('/').length;
-
-        for (let i = 0; i <= pathParts.length - dirPartCount; i++) {
-            const candidate = pathParts.slice(i, i + dirPartCount).join('/');
-            if (this.simpleGlobMatch(candidate, dirPattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Simple glob matching supporting * wildcard
-     * @param text Text to test
-     * @param pattern Pattern with * wildcards
-     * @returns True if pattern matches
-     */
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
-        return regex.test(text);
     }
 
     private dedupePatterns(patterns: string[]): string[] {

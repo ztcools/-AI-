@@ -29,6 +29,7 @@ export class OpenAIEmbedding extends Embedding {
 
         // Use known dimension for standard models
         if (knownModels[model]) {
+            this.dimension = knownModels[model].dimension;
             return knownModels[model].dimension;
         }
 
@@ -40,6 +41,7 @@ export class OpenAIEmbedding extends Embedding {
                 input: processedText,
                 encoding_format: 'float',
             });
+            this.dimension = response.data[0].embedding.length;
             return response.data[0].embedding.length;
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : 'Unknown error';

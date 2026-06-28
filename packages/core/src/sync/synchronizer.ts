@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
 import { getRepoIdentity } from '../utils/git-identity';
+import { matchGlob } from '../utils/glob-matcher';
 
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
@@ -128,7 +129,7 @@ export class FileSynchronizer {
 
         // Check direct pattern matches first
         for (const pattern of this.ignorePatterns) {
-            if (this.matchPattern(normalizedPath, pattern)) {
+            if (matchGlob(normalizedPath, pattern)) {
                 return true;
             }
         }
@@ -138,75 +139,13 @@ export class FileSynchronizer {
         for (let i = 0; i < normalizedPathParts.length; i++) {
             const partialPath = normalizedPathParts.slice(0, i + 1).join('/');
             for (const pattern of this.ignorePatterns) {
-                if (this.matchPattern(partialPath, pattern)) {
+                if (matchGlob(partialPath, pattern)) {
                     return true;
                 }
             }
         }
 
         return false;
-    }
-
-    private matchPattern(filePath: string, pattern: string): boolean {
-        // Clean both path and pattern
-        const cleanPath = filePath.replace(/^\/+|\/+$/g, '');
-        const normalizedPattern = pattern.replace(/\\/g, '/');
-        const cleanPattern = normalizedPattern.replace(/^\/+|\/+$/g, '');
-        const isRootAnchored = normalizedPattern.startsWith('/');
-        const isDirectoryPattern = normalizedPattern.endsWith('/');
-
-        if (!cleanPath || !cleanPattern) {
-            return false;
-        }
-
-        // Handle directory patterns (ending with /)
-        if (isDirectoryPattern) {
-            if (isRootAnchored) {
-                return this.simpleGlobMatch(cleanPath, cleanPattern) ||
-                    cleanPath.startsWith(`${cleanPattern}/`);
-            }
-
-            return this.matchesDirectoryPattern(cleanPath, cleanPattern);
-        }
-
-        if (isRootAnchored) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle path patterns (containing /)
-        if (cleanPattern.includes('/')) {
-            return this.simpleGlobMatch(cleanPath, cleanPattern);
-        }
-
-        // Handle filename patterns (no /) - match against basename
-        const fileName = path.basename(cleanPath);
-        return this.simpleGlobMatch(fileName, cleanPattern);
-    }
-
-    private matchesDirectoryPattern(filePath: string, dirPattern: string): boolean {
-        const pathParts = filePath.split('/');
-        const dirPartCount = dirPattern.split('/').length;
-
-        for (let i = 0; i <= pathParts.length - dirPartCount; i++) {
-            const candidate = pathParts.slice(i, i + dirPartCount).join('/');
-            if (this.simpleGlobMatch(candidate, dirPattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private simpleGlobMatch(text: string, pattern: string): boolean {
-        if (!text || !pattern) return false;
-
-        // Convert glob pattern to regex
-        const regexPattern = pattern
-            .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex special chars except *
-            .replace(/\*/g, '.*'); // Convert * to .*
-
-        const regex = new RegExp(`^${regexPattern}$`);
-        return regex.test(text);
     }
 
     private buildMerkleDAG(fileHashes: Map<string, string>): MerkleDAG {

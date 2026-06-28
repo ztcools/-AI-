@@ -124,7 +124,7 @@ export interface VectorDatabase {
      * @param outputFields Fields to return
      * @param limit Maximum number of results
      */
-    query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]>;
+    query(collectionName: string, filter?: string, outputFields?: string[], limit?: number): Promise<Record<string, any>[]>;
 
     /**
      * Get collection description

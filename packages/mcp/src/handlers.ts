@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError, getRepoIdentity } from "@zilliz/claude-context-core";
 import { SnapshotManager } from "./snapshot.js";
-import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
+import type { CodebaseIndexOptions, CodebaseInfoIndexFailed, CodebaseInfoIndexing, CodebaseInfoIndexed, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
 import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
 import type { GraphToolHandlers } from "./graph-handlers.js";
@@ -224,9 +224,9 @@ export class ToolHandlers {
                         try {
                             const results = await vectorDb.query(
                                 collectionName,
-                                undefined as any, // Don't pass empty filter
-                                ['metadata'], // Only fetch metadata field
-                                1 // Only need one result to extract codebasePath
+                                undefined,
+                                ['metadata'],
+                                1
                             );
 
                             if (results && results.length > 0) {
@@ -615,7 +615,7 @@ export class ToolHandlers {
             // Check current status and log if retrying after failure
             const currentStatus = this.snapshotManager.getCodebaseStatus(absolutePath);
             if (currentStatus === 'indexfailed') {
-                const failedInfo = this.snapshotManager.getCodebaseInfo(absolutePath) as any;
+                const failedInfo = this.snapshotManager.getCodebaseInfo(absolutePath) as CodebaseInfoIndexFailed;
                 console.log(`[BACKGROUND-INDEX] Retrying indexing for previously failed codebase. Previous error: ${failedInfo?.errorMessage || 'Unknown error'}`);
             }
 
@@ -1195,7 +1195,7 @@ export class ToolHandlers {
                 }
 
                 // Routes summary
-                const routeResult = store.findNodes({ project, label: 'Route' as any, limit: 100 });
+                const routeResult = store.findNodes({ project, label: 'Route', limit: 100 });
                 if (routeResult.total > 0) {
                     lines.push(`  Routes: ${routeResult.total}`);
                     for (const r of routeResult.results.slice(0, 5)) {
@@ -1301,8 +1301,8 @@ export class ToolHandlers {
 
             switch (status) {
                 case 'indexed':
-                    if (info && 'indexedFiles' in info) {
-                        const indexedInfo = info as any;
+                    if (info && info.status === 'indexed') {
+                        const indexedInfo = info as CodebaseInfoIndexed;
                         statusMessage = `✅ Codebase '${statusCodebasePath}' is fully indexed and ready for search.`;
                         statusMessage += `\n📊 Statistics: ${indexedInfo.indexedFiles} files, ${indexedInfo.totalChunks} chunks`;
                         statusMessage += `\n📅 Status: ${indexedInfo.indexStatus}`;
@@ -1313,8 +1313,8 @@ export class ToolHandlers {
                     break;
 
                 case 'indexing':
-                    if (info && 'indexingPercentage' in info) {
-                        const indexingInfo = info as any;
+                    if (info && info.status === 'indexing') {
+                        const indexingInfo = info as CodebaseInfoIndexing;
                         const progressPercentage = indexingInfo.indexingPercentage || 0;
                         statusMessage = `🔄 Codebase '${statusCodebasePath}' is currently being indexed. Progress: ${progressPercentage.toFixed(1)}%`;
 
@@ -1331,8 +1331,8 @@ export class ToolHandlers {
                     break;
 
                 case 'indexfailed':
-                    if (info && 'errorMessage' in info) {
-                        const failedInfo = info as any;
+                    if (info && info.status === 'indexfailed') {
+                        const failedInfo = info as CodebaseInfoIndexFailed;
                         statusMessage = `❌ Codebase '${statusCodebasePath}' indexing failed.`;
                         statusMessage += `\n🚨 Error: ${failedInfo.errorMessage}`;
                         if (failedInfo.lastAttemptedPercentage !== undefined) {

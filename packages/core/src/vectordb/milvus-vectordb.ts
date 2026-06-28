@@ -432,7 +432,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
-    async query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]> {
+    async query(collectionName: string, filter?: string, outputFields?: string[], limit?: number): Promise<Record<string, any>[]> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);
 
