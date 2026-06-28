@@ -26,6 +26,9 @@ import { getRepoIdentity } from '@zilliz/claude-context-core';
 // Max nodes to load for cross-file call resolution
 const MAX_CROSS_FILE_NODES = 200000;
 
+// Max rows to return from query_graph
+const QUERY_GRAPH_MAX_ROWS = 1000;
+
 export class GraphToolHandlers {
     private store: SqliteGraphStore;
     private extractor: GraphExtractor;
@@ -107,7 +110,7 @@ export class GraphToolHandlers {
                 const idMap = new Map<number, number>();
                 for (const node of result.nodes) {
                     const realId = this.store.upsertNode(node);
-                    idMap.set(nodeCount + idMap.size, realId);
+                    idMap.set(idMap.size, realId);
                 }
                 nodeCount += result.nodes.length;
 
@@ -428,7 +431,8 @@ export class GraphToolHandlers {
                     encoding: 'utf-8',
                     timeout: 10000,
                 });
-            } catch {
+            } catch (err: any) {
+                console.warn(`[Graph] git diff failed for branch '${baseBranch}': ${err.message}`);
                 // Try diff against working tree
                 diffOutput = execSync('git diff --name-only HEAD', {
                     cwd: repoPath,
@@ -544,8 +548,9 @@ export class GraphToolHandlers {
             if (result.rows.length === 0) {
                 lines.push('Query returned no results.');
             } else {
-                lines.push(`Query results (${result.rows.length} rows):`);
-                for (const row of result.rows) {
+                const displayRows = result.rows.slice(0, QUERY_GRAPH_MAX_ROWS);
+                lines.push(`Query results (${displayRows.length} rows${result.rows.length > QUERY_GRAPH_MAX_ROWS ? `, truncated from ${result.rows.length}` : ''}):`);
+                for (const row of displayRows) {
                     lines.push(`  ${JSON.stringify(row)}`);
                 }
             }
@@ -626,8 +631,8 @@ export class GraphToolHandlers {
         for (const trace of traces) {
             const sourceService = trace.source_service as string;
             const targetService = trace.target_service as string;
-            const method = trace.method as string;
-            const path = trace.path as string;
+            const method = (trace.method as string) || 'HTTP';
+            const path = (trace.path as string) || '/';
             const statusCode = trace.status_code as number;
             const durationMs = trace.duration_ms as number;
 
@@ -716,12 +721,24 @@ export class GraphToolHandlers {
             }
         }
 
-        // 2. Find all IMPORTS edges
+        // 2. Find all IMPORTS edges and batch-load source/target nodes
         const importEdges = this.store.findEdges(project, ['IMPORTS'], MAX_CROSS_FILE_NODES);
 
+        // Batch-load all referenced nodes to avoid N+1 queries
+        const nodeIds = new Set<number>();
         for (const edge of importEdges) {
-            const sourceNode = this.store.getNodeById(edge.sourceId);
-            const targetNode = this.store.getNodeById(edge.targetId);
+            nodeIds.add(edge.sourceId);
+            nodeIds.add(edge.targetId);
+        }
+        const nodeMap = new Map<number, GraphNode>();
+        for (const id of nodeIds) {
+            const node = this.store.getNodeById(id);
+            if (node) nodeMap.set(id, node);
+        }
+
+        for (const edge of importEdges) {
+            const sourceNode = nodeMap.get(edge.sourceId);
+            const targetNode = nodeMap.get(edge.targetId);
             if (!sourceNode || !targetNode) continue;
 
             // The target node is a Module node with importedName in properties

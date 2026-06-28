@@ -78,6 +78,8 @@ export class GraphSearcher {
                 const searchRegex = regex ? new RegExp(pattern, 'g') : new RegExp(escapeRegex(pattern), 'gi');
 
                 for (let i = 0; i < lines.length; i++) {
+                    // Reset lastIndex — g flag requires it for new strings per ECMAScript
+                    searchRegex.lastIndex = 0;
                     if (searchRegex.test(lines[i])) {
                         matches.push({ filePath, line: i + 1, content: lines[i].trim() });
                     }

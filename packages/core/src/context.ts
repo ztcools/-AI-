@@ -906,6 +906,9 @@ export class Context {
                                 console.error('[Context] Stack trace:', error.stack);
                             }
                         } finally {
+                            if (chunkBuffer.length > 0) {
+                                console.warn(`[Context] Discarding ${chunkBuffer.length} chunks due to batch processing failure`);
+                            }
                             chunkBuffer = []; // Always clear buffer, even on failure
                         }
                     }
