@@ -463,4 +463,83 @@ describe('FindEdges and CrossFile', () => {
     });
 });
 
+describe('FusionSearchParser', () => {
+    it('should parse graph search output format', () => {
+        // Simulate the parseGraphSearchResults logic inline
+        const text = `Found 3 results:
+
+- Function: main (test.main)
+  File: src/main.ts:1-10
+  Degree: in=0, out=2
+  Score: 0.85
+- Class: App (test.App)
+  File: src/app.ts:1-50
+  Degree: in=1, out=0
+  Score: 0.70
+- Method: greet (test.App.greet)
+  File: src/app.ts:15-20
+  Degree: in=1, out=1
+`;
+
+        const results: Array<{ node: { name: string; qualifiedName: string; filePath: string; startLine: number; endLine: number; label: string }; score: number; inDegree: number; outDegree: number }> = [];
+        const lines = text.split('\n');
+        let current: typeof results[0] | null = null;
+
+        for (const line of lines) {
+            const defMatch = line.match(/^-\s+(\w+):\s+(\S+)\s+\((\S+)\)/);
+            if (defMatch) {
+                if (current) results.push(current);
+                current = {
+                    node: {
+                        label: defMatch[1],
+                        name: defMatch[2],
+                        qualifiedName: defMatch[3],
+                        filePath: '',
+                        startLine: 0,
+                        endLine: 0,
+                    },
+                    score: 0,
+                    inDegree: 0,
+                    outDegree: 0,
+                };
+                continue;
+            }
+            if (current) {
+                const fileMatch = line.match(/^\s+File:\s+(\S+):(\d+)-(\d+)/);
+                if (fileMatch) {
+                    current.node.filePath = fileMatch[1];
+                    current.node.startLine = parseInt(fileMatch[2]);
+                    current.node.endLine = parseInt(fileMatch[3]);
+                }
+                const degreeMatch = line.match(/^\s+Degree:\s+in=(\d+),\s+out=(\d+)/);
+                if (degreeMatch) {
+                    current.inDegree = parseInt(degreeMatch[1]);
+                    current.outDegree = parseInt(degreeMatch[2]);
+                }
+                const scoreMatch = line.match(/^\s+Score:\s+([\d.]+)/);
+                if (scoreMatch) {
+                    current.score = parseFloat(scoreMatch[1]);
+                }
+            }
+        }
+        if (current) results.push(current);
+
+        assert.strictEqual(results.length, 3);
+        assert.strictEqual(results[0].node.name, 'main');
+        assert.strictEqual(results[0].node.label, 'Function');
+        assert.strictEqual(results[0].score, 0.85);
+        assert.strictEqual(results[0].inDegree, 0);
+        assert.strictEqual(results[0].outDegree, 2);
+        assert.strictEqual(results[0].node.filePath, 'src/main.ts');
+        assert.strictEqual(results[0].node.startLine, 1);
+
+        assert.strictEqual(results[1].node.name, 'App');
+        assert.strictEqual(results[1].node.label, 'Class');
+
+        assert.strictEqual(results[2].node.name, 'greet');
+        assert.strictEqual(results[2].node.label, 'Method');
+        assert.strictEqual(results[2].node.qualifiedName, 'test.App.greet');
+    });
+});
+
 console.log('All graph tests passed!');
