@@ -88,28 +88,22 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase to enable intelligent code search. One call handles both vector indexing (Milvus) and knowledge graph construction (SQLite). The codebase is identified by its git remote URL + branch name, so team members sharing the same repo+branch can reuse each other's indexes.
+Index a codebase for intelligent code search. One call builds both vector index (Milvus) and knowledge graph (SQLite). Codebases are identified by git remote URL + branch, so team members sharing the same repo+branch reuse each other's indexes.
 
-⚠️ **IMPORTANT**:
-- The 'path' parameter accepts absolute paths, relative paths, or "." for the IDE workspace.
-- Before indexing, the system checks if the repository is already indexed. If already indexed, indexing is skipped unless force=true.
-- **First-time setup**: User MUST call this manually once per project. After that, the system handles incremental updates automatically.
-
-✨ **Usage**: Just call this once when starting work on a project. The system handles everything internally — vector search, code graph, call tracing — all automatically available.
+⚠️ **First-time setup**: User MUST call this manually once per project. After that, incremental updates are automatic.
 `;
 
         const search_description = `
-Search the indexed codebase using natural language. Returns matched code snippets enriched with graph context (callers, callees, call chains, architecture, dead code detection).
+Search the indexed codebase with natural language. Returns matched code snippets enriched with graph context (callers, callees, call chains, architecture, dead code).
 
-🎯 **When to call this tool** (call it BEFORE reading files):
-- User asks how something works or where something is implemented
-- Before modifying or writing code — understand existing patterns first
-- Debugging or locating the source of a bug
-- Code review or understanding unfamiliar code
+🎯 **When to call** (call BEFORE reading files):
+- User asks how something works or where it's implemented
+- Before modifying code — check existing patterns
+- Debugging a bug
+- Understanding unfamiliar code or reviewing PRs
 - Refactoring — find all related code and callers
-- Built-in fallback: if vector search finds nothing, graph search runs automatically
 
-💡 This is the PRIMARY way to understand code. Prefer search over reading files directly — one call gives you the code, its call chain, and its architectural context.
+💡 Prefer search over reading files directly. One call returns the code, its call chain, and architecture context.
 `;
 
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
