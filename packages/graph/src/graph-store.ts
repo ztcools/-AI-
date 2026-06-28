@@ -365,6 +365,17 @@ export class SqliteGraphStore implements GraphStore {
         this.db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
     }
 
+    deleteNodesByFile(project: string, filePath: string): void {
+        // Delete edges connected to nodes in this file first
+        this.db.prepare(`
+            DELETE FROM edges WHERE project = ? AND (
+                source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
+                OR target_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
+            )
+        `).run(project, project, filePath, project, filePath);
+        this.db.prepare('DELETE FROM nodes WHERE project = ? AND file_path = ?').run(project, filePath);
+    }
+
     // ── Batch operations ─────────────────────────────────────────
 
     beginTransaction(): void {

@@ -513,6 +513,13 @@ export class SnapshotManager {
     }
 
     /**
+     * Get codebase info by identity directly (used when iterating getIndexedCodebases())
+     */
+    public getCodebaseInfoByIdentity(identity: string): CodebaseInfo | undefined {
+        return this.codebaseInfoMap.get(identity);
+    }
+
+    /**
      * Read a codebase's info directly from the on-disk snapshot, bypassing the
      * in-memory codebaseInfoMap. Looks up by identity (computed from codebasePath)
      * and also tries the raw path for backward compatibility with old-format snapshots.
@@ -596,6 +603,9 @@ export class SnapshotManager {
         this.codebaseFileCount.delete(identity);
         this.codebaseInfoMap.delete(identity);
         this.recentlyRemoved.add(identity);
+        // Clear identity cache for this path (and any aliases)
+        const resolved = path.resolve(codebasePath);
+        this.identityCache.delete(resolved);
 
         console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath} (identity: ${identity})`);
     }

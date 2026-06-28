@@ -185,10 +185,19 @@ export class SyncManager {
             let totalStats = { added: 0, removed: 0, modified: 0 };
 
             for (let i = 0; i < indexedCodebases.length; i++) {
-                const codebasePath = indexedCodebases[i];
+                const identity = indexedCodebases[i];
+                const codebaseInfo = this.snapshotManager.getCodebaseInfoByIdentity(identity);
+                const codebasePath = codebaseInfo?.localPath;
                 const codebaseStartTime = Date.now();
 
-                console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${codebasePath}'`);
+                console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${identity}' (localPath: ${codebasePath || 'N/A'})`);
+
+                // getIndexedCodebases() returns identities, not filesystem paths.
+                // Skip if we can't resolve the localPath from codebaseInfoMap.
+                if (!codebasePath) {
+                    console.warn(`[SYNC-DEBUG] No localPath found for identity '${identity}'. Skipping sync.`);
+                    continue;
+                }
 
                 // Check if codebase path still exists
                 try {
@@ -304,7 +313,9 @@ export class SyncManager {
         console.log(`[SYNC-DEBUG] Setting up periodic sync every ${syncIntervalMs}ms`);
         const syncInterval = setInterval(() => {
             console.log('[SYNC-DEBUG] Executing scheduled periodic sync');
-            this.handleSyncIndex();
+            this.handleSyncIndex().catch(err => {
+                console.error('[SYNC-DEBUG] Unhandled error in periodic sync:', err);
+            });
         }, syncIntervalMs);
 
         console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', syncInterval);

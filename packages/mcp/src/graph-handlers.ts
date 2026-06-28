@@ -98,6 +98,12 @@ export class GraphToolHandlers {
                 if (!lang) continue;
 
                 const relPath = path.relative(repoPath, filePath);
+
+                // For incremental indexing, delete old nodes+edges for this file
+                if (specificFiles && specificFiles.length > 0) {
+                    this.store.deleteNodesByFile(project, relPath);
+                }
+
                 const source = fs.readFileSync(filePath, 'utf-8');
 
                 const result = this.extractor.extract(source, {
@@ -423,16 +429,41 @@ export class GraphToolHandlers {
                 return { content: [{ type: 'text', text: lines.join('\n') }] };
             }
 
+            // Try to detect default branch from git remote
+            let getDiffBranch = baseBranch;
+            if (!args.base_branch) {
+                try {
+                    const refHead = execSync('git symbolic-ref refs/remotes/origin/HEAD', {
+                        cwd: repoPath, encoding: 'utf-8', timeout: 5000,
+                    }).trim();
+                    // Extract branch name from e.g. "refs/remotes/origin/main"
+                    const detected = refHead.split('/').pop() || 'main';
+                    getDiffBranch = detected;
+                    console.log(`[Graph] Detected default branch: ${detected}`);
+                } catch {
+                    // Fall back to checking common branch names
+                    for (const candidate of ['main', 'master', 'develop']) {
+                        try {
+                            execSync(`git rev-parse --verify ${candidate}`, {
+                                cwd: repoPath, encoding: 'utf-8', timeout: 5000,
+                            });
+                            getDiffBranch = candidate;
+                            break;
+                        } catch { /* try next */ }
+                    }
+                }
+            }
+
             // Run git diff to find changed files
             let diffOutput: string;
             try {
-                diffOutput = execSync(`git diff --name-only ${baseBranch}...HEAD`, {
+                diffOutput = execSync(`git diff --name-only ${getDiffBranch}...HEAD`, {
                     cwd: repoPath,
                     encoding: 'utf-8',
                     timeout: 10000,
                 });
             } catch (err: any) {
-                console.warn(`[Graph] git diff failed for branch '${baseBranch}': ${err.message}`);
+                console.warn(`[Graph] git diff failed for branch '${getDiffBranch}': ${err.message}`);
                 // Try diff against working tree
                 diffOutput = execSync('git diff --name-only HEAD', {
                     cwd: repoPath,
@@ -846,7 +877,12 @@ export class GraphToolHandlers {
     private scanFiles(dir: string, extensions: string[]): string[] {
         const results: string[] = [];
         const extSet = new Set(extensions);
-        const ignoreSet = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__']);
+        const ignoreSet = new Set([
+            'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
+            '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
+            '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp', '.tox',
+            '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
+        ]);
 
         const stack: string[] = [dir];
         while (stack.length > 0) {
