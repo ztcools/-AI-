@@ -791,7 +791,7 @@ export class GraphExtractor {
                         project: ctx.project,
                         sourceId: routeIdx,
                         targetId: entry.nodeIndex,
-                        type: 'HANDLES' as any,
+                        type: 'HANDLES',
                         properties: { method, path: routePath },
                     });
                 }

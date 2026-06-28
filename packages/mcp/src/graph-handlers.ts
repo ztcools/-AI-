@@ -1,9 +1,11 @@
 /**
  * Graph MCP tool handlers. Extends claude-context with knowledge graph
  * capabilities: search_graph, trace_path, query_graph, get_code_snippet,
- * get_graph_schema, get_architecture, search_code_graph, detect_changes,
- * list_projects, delete_project, index_status, manage_adr, fusion_search,
- * ingest_traces.
+ * get_graph_schema, get_architecture, detect_changes, list_projects,
+ * delete_project, index_status, manage_adr, ingest_traces.
+ *
+ * These are internal handlers used by the unified 4-tool interface
+ * (index/search/clear/status) in handlers.ts.
  */
 import * as path from 'path';
 import * as os from 'os';

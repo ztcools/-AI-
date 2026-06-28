@@ -151,38 +151,7 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     findNodes(options: GraphSearchOptions): GraphSearchResponse {
-        const conditions: string[] = [];
-        const params: unknown[] = [];
-
-        if (options.project) {
-            conditions.push('n.project = ?');
-            params.push(options.project);
-        }
-
-        if (options.label) {
-            conditions.push('n.label = ?');
-            params.push(options.label);
-        }
-
-        if (options.namePattern) {
-            conditions.push('n.name LIKE ?');
-            params.push(this.regexToLike(options.namePattern));
-        }
-
-        if (options.qnPattern) {
-            conditions.push('n.qualified_name LIKE ?');
-            params.push(this.regexToLike(options.qnPattern));
-        }
-
-        if (options.filePattern) {
-            conditions.push('n.file_path LIKE ?');
-            params.push(this.regexToLike(options.filePattern));
-        }
-        if (options.exactFilePath) {
-            conditions.push('n.file_path = ?');
-            params.push(options.exactFilePath);
-        }
-
+        const { conditions, params: conditionParams } = this.buildFindConditions(options);
         const whereClause = conditions.length > 0 ? conditions.join(' AND ') : '1=1';
         const limit = options.limit ?? 200;
         const offset = options.offset ?? 0;
@@ -190,6 +159,7 @@ export class SqliteGraphStore implements GraphStore {
         // Build query with optional FTS ranking
         let query: string;
         let countQuery: string;
+        let countRow: { total: number };
 
         if (options.query && options.query.trim().length > 0) {
             // BM25 full-text search via FTS5
@@ -202,15 +172,16 @@ export class SqliteGraphStore implements GraphStore {
                 ORDER BY score
                 LIMIT ? OFFSET ?
             `;
-            params.unshift(ftsQuery);
-            params.push(limit, offset);
-
             countQuery = `
                 SELECT COUNT(*) as total
                 FROM nodes n
                 JOIN nodes_fts fts ON n.id = fts.rowid
                 WHERE nodes_fts MATCH ? AND ${whereClause}
             `;
+
+            const rows = this.db.prepare(query).all(ftsQuery, ...conditionParams, limit, offset) as Array<Record<string, unknown>>;
+            countRow = this.db.prepare(countQuery).get(ftsQuery, ...conditionParams) as { total: number };
+            return this.buildNodeResults(rows, countRow, options, offset);
         } else {
             query = `
                 SELECT n.*, 0 AS score
@@ -219,29 +190,61 @@ export class SqliteGraphStore implements GraphStore {
                 ORDER BY n.name
                 LIMIT ? OFFSET ?
             `;
-            params.push(limit, offset);
-
             countQuery = `
                 SELECT COUNT(*) as total
                 FROM nodes n
                 WHERE ${whereClause}
             `;
+
+            const rows = this.db.prepare(query).all(...conditionParams, limit, offset) as Array<Record<string, unknown>>;
+            countRow = this.db.prepare(countQuery).get(...conditionParams) as { total: number };
+            return this.buildNodeResults(rows, countRow, options, offset);
+        }
+    }
+
+    /**
+     * Build WHERE conditions and params from search options.
+     * Extracted as a shared method to ensure count query and main query
+     * use the same parameter binding order.
+     */
+    private buildFindConditions(options: GraphSearchOptions): { conditions: string[]; params: unknown[] } {
+        const conditions: string[] = [];
+        const params: unknown[] = [];
+
+        if (options.project) {
+            conditions.push('n.project = ?');
+            params.push(options.project);
+        }
+        if (options.label) {
+            conditions.push('n.label = ?');
+            params.push(options.label);
+        }
+        if (options.namePattern) {
+            conditions.push('n.name LIKE ?');
+            params.push(this.regexToLike(options.namePattern));
+        }
+        if (options.qnPattern) {
+            conditions.push('n.qualified_name LIKE ?');
+            params.push(this.regexToLike(options.qnPattern));
+        }
+        if (options.filePattern) {
+            conditions.push('n.file_path LIKE ?');
+            params.push(this.regexToLike(options.filePattern));
+        }
+        if (options.exactFilePath) {
+            conditions.push('n.file_path = ?');
+            params.push(options.exactFilePath);
         }
 
-        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+        return { conditions, params };
+    }
 
-        // Build count params matching the whereClause conditions
-        const countParams: unknown[] = [];
-        if (options.query && options.query.trim().length > 0) {
-            countParams.push(this.buildFtsQuery(options.query));
-        }
-        if (options.project) countParams.push(options.project);
-        if (options.label) countParams.push(options.label);
-        if (options.namePattern) countParams.push(this.regexToLike(options.namePattern));
-        if (options.qnPattern) countParams.push(this.regexToLike(options.qnPattern));
-        if (options.filePattern) countParams.push(this.regexToLike(options.filePattern));
-        if (options.exactFilePath) countParams.push(options.exactFilePath);
-        const countRow = this.db.prepare(countQuery).get(...countParams) as { total: number };
+    private buildNodeResults(
+        rows: Array<Record<string, unknown>>,
+        countRow: { total: number },
+        options: GraphSearchOptions,
+        offset: number,
+    ): GraphSearchResponse {
 
         const results: GraphSearchResult[] = [];
 

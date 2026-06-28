@@ -40,6 +40,7 @@ export type GraphEdgeType =
     | 'INHERITS'
     | 'IMPLEMENTS'
     | 'DECORATES'
+    | 'HANDLES'
     | 'HTTP_CALLS'
     | 'ASYNC_CALLS'
     | 'DATA_FLOWS'
