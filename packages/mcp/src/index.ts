@@ -242,9 +242,14 @@ This tool is versatile and can be used before completing various tasks to retrie
                                 },
                                 mode: {
                                     type: "string",
-                                    enum: ["full", "moderate", "fast"],
+                                    enum: ["full", "incremental"],
                                     default: "full",
-                                    description: "Indexing mode: full (all files), moderate (filtered), fast (minimal)"
+                                    description: "Indexing mode: full (all files), incremental (git diff changed files only)"
+                                },
+                                files: {
+                                    type: "array",
+                                    items: { type: "string" },
+                                    description: "Specific files to re-index (relative paths). Overrides mode."
                                 }
                             },
                             required: ["repo_path"]
@@ -406,6 +411,34 @@ This tool is versatile and can be used before completing various tasks to retrie
                             required: ["action"]
                         }
                     },
+                    {
+                        name: "ingest_traces",
+                        description: `Ingest HTTP/async trace data for cross-service call analysis. Accepts trace records with source service, target service, HTTP method, path, and status code.`,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                project: { type: "string", description: "Project identifier" },
+                                traces: {
+                                    type: "array",
+                                    description: "Array of trace records",
+                                    items: {
+                                        type: "object",
+                                        properties: {
+                                            source_service: { type: "string", description: "Source service name" },
+                                            target_service: { type: "string", description: "Target service name" },
+                                            method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "GRPC", "MESSAGE", "EVENT"] },
+                                            path: { type: "string", description: "HTTP path or RPC method" },
+                                            status_code: { type: "integer", description: "HTTP status code" },
+                                            duration_ms: { type: "number", description: "Request duration in milliseconds" },
+                                            timestamp: { type: "string", description: "ISO timestamp" }
+                                        },
+                                        required: ["source_service", "target_service", "method", "path"]
+                                    }
+                                }
+                            },
+                            required: ["project", "traces"]
+                        }
+                    },
                 ]
             };
         });
@@ -452,6 +485,8 @@ This tool is versatile and can be used before completing various tasks to retrie
                     return this.graphToolHandlers.handleQueryGraph(safeArgs);
                 case "manage_adr":
                     return this.graphToolHandlers.handleManageAdr(safeArgs);
+                case "ingest_traces":
+                    return this.graphToolHandlers.handleIngestTraces(safeArgs);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);

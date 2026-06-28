@@ -6,6 +6,7 @@
  */
 import * as path from 'path';
 import * as os from 'os';
+import * as fs from 'fs';
 import {
     SqliteGraphStore,
     GraphExtractor,
@@ -18,7 +19,6 @@ import {
     TraceOptions,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
-import * as fs from 'fs';
 
 export class GraphToolHandlers {
     private store: SqliteGraphStore;
@@ -49,6 +49,7 @@ export class GraphToolHandlers {
     async handleIndexRepository(args: Record<string, unknown>): Promise<{ content: Array<{ type: string; text: string }> }> {
         const repoPath = args.repo_path as string;
         const mode = (args.mode as string) || 'full';
+        const specificFiles = args.files as string[] | undefined;
 
         if (!repoPath || !fs.existsSync(repoPath)) {
             return { content: [{ type: 'text', text: `Error: Path '${repoPath}' does not exist.` }] };
@@ -58,12 +59,24 @@ export class GraphToolHandlers {
         const startTime = Date.now();
 
         try {
-            // Scan files
             const supportedExts = this.extractor.getSupportedLanguages()
                 .flatMap((lang: string) => this.langToExts(lang));
 
-            const files = this.scanFiles(repoPath, supportedExts);
-            console.log(`[GraphIndex] Found ${files.length} files for project '${project}'`);
+            let files: string[];
+
+            if (specificFiles && specificFiles.length > 0) {
+                // Incremental: re-index only specified files
+                files = specificFiles.map(f => path.resolve(repoPath, f)).filter(f => fs.existsSync(f));
+                console.log(`[GraphIndex] Incremental indexing ${files.length} specified files for '${project}'`);
+            } else if (mode === 'incremental') {
+                // Auto-detect changed files via git diff
+                files = this.detectChangedFiles(repoPath, supportedExts);
+                console.log(`[GraphIndex] Incremental indexing ${files.length} detected changed files for '${project}'`);
+            } else {
+                // Full scan
+                files = this.scanFiles(repoPath, supportedExts);
+                console.log(`[GraphIndex] Full indexing ${files.length} files for '${project}'`);
+            }
 
             let nodeCount = 0;
             let edgeCount = 0;
@@ -106,6 +119,10 @@ export class GraphToolHandlers {
                     }
                 }
             }
+
+            // ── Cross-file call resolution ────────────────────────
+            const crossEdges = this.resolveCrossFileCalls(project);
+            edgeCount += crossEdges;
 
             this.store.commitTransaction();
 
@@ -587,7 +604,157 @@ export class GraphToolHandlers {
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
+    // ── Tool: ingest_traces ─────────────────────────────────────
+
+    handleIngestTraces(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
+        const project = args.project as string;
+        const traces = args.traces as Array<Record<string, unknown>>;
+
+        if (!project || !traces || traces.length === 0) {
+            return { content: [{ type: 'text', text: 'Error: "project" and "traces" are required.' }] };
+        }
+
+        let count = 0;
+        const lines: string[] = [];
+        lines.push(`Ingesting ${traces.length} traces for project '${project}':`);
+
+        for (const trace of traces) {
+            const sourceService = trace.source_service as string;
+            const targetService = trace.target_service as string;
+            const method = trace.method as string;
+            const path = trace.path as string;
+            const statusCode = trace.status_code as number;
+            const durationMs = trace.duration_ms as number;
+
+            if (!sourceService || !targetService) continue;
+
+            // Create service nodes
+            const sourceQN = `${project}.${sourceService}`;
+            const targetQN = `${project}.${targetService}`;
+
+            const sourceId = this.store.upsertNode({
+                project,
+                label: 'Resource',
+                name: sourceService,
+                qualifiedName: sourceQN,
+                filePath: `service://${sourceService}`,
+                startLine: 0,
+                endLine: 0,
+                properties: { type: 'service' },
+            });
+
+            const targetId = this.store.upsertNode({
+                project,
+                label: 'Resource',
+                name: targetService,
+                qualifiedName: targetQN,
+                filePath: `service://${targetService}`,
+                startLine: 0,
+                endLine: 0,
+                properties: { type: 'service' },
+            });
+
+            // Create CROSS_HTTP_CALLS edge
+            const edgeType = method === 'GRPC' ? 'CROSS_CHANNEL' as const
+                : method === 'MESSAGE' || method === 'EVENT' ? 'CROSS_ASYNC_CALLS' as const
+                    : 'CROSS_HTTP_CALLS' as const;
+
+            this.store.upsertEdge({
+                project,
+                sourceId,
+                targetId,
+                type: edgeType,
+                properties: {
+                    method,
+                    path,
+                    statusCode,
+                    durationMs,
+                    timestamp: trace.timestamp,
+                },
+            });
+
+            count++;
+            lines.push(`  ${sourceService} --> ${method} ${path} --> ${targetService} (${statusCode || 'n/a'})`);
+        }
+
+        lines.push('');
+        lines.push(`Ingested ${count} cross-service traces.`);
+
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
+
+    /**
+     * Resolve cross-file calls by matching imported names to actual
+     * function definitions across the project.
+     * Returns the number of cross-file CALLS edges created.
+     */
+    private resolveCrossFileCalls(project: string): number {
+        let count = 0;
+
+        // 1. Build global function registry: name → qualifiedName → nodeId
+        const allNodes = this.store.findNodes({ project, limit: 100000 });
+        const globalRegistry = new Map<string, Array<{ qualifiedName: string; nodeId: number; filePath: string }>>();
+
+        for (const result of allNodes.results) {
+            const node = result.node;
+            if (node.label === 'Function' || node.label === 'Method') {
+                if (!globalRegistry.has(node.name)) {
+                    globalRegistry.set(node.name, []);
+                }
+                globalRegistry.get(node.name)!.push({
+                    qualifiedName: node.qualifiedName,
+                    nodeId: node.id,
+                    filePath: node.filePath,
+                });
+            }
+        }
+
+        // 2. Find all IMPORTS edges
+        const importEdges = this.store.findEdges(project, ['IMPORTS'], 100000);
+
+        for (const edge of importEdges) {
+            const sourceNode = this.store.getNodeById(edge.sourceId);
+            const targetNode = this.store.getNodeById(edge.targetId);
+            if (!sourceNode || !targetNode) continue;
+
+            // The target node is a Module node with importedName in properties
+            const importedName = targetNode.properties.importedName as string;
+            if (!importedName) continue;
+
+            // 3. Resolve imported name to global function definitions
+            const candidates = globalRegistry.get(importedName);
+            if (!candidates || candidates.length === 0) continue;
+
+            for (const candidate of candidates) {
+                // Skip self-references
+                if (candidate.nodeId === sourceNode.id) continue;
+
+                // Create CALLS edge: source function → imported function
+                try {
+                    this.store.upsertEdge({
+                        project,
+                        sourceId: sourceNode.id,
+                        targetId: candidate.nodeId,
+                        type: 'CALLS',
+                        properties: {
+                            crossFile: true,
+                            importedName,
+                            sourceFile: sourceNode.filePath,
+                            targetFile: candidate.filePath,
+                        },
+                    });
+                    count++;
+                } catch {
+                    // Skip duplicate or invalid edges
+                }
+            }
+        }
+
+        console.log(`[GraphIndex] Resolved ${count} cross-file calls for project '${project}'`);
+        return count;
+    }
 
     private langToExts(lang: string): string[] {
         const map: Record<string, string[]> = {
@@ -636,6 +803,25 @@ export class GraphToolHandlers {
 
     private escapeRegex(str: string): string {
         return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    private detectChangedFiles(repoPath: string, extensions: string[]): string[] {
+        const extSet = new Set(extensions);
+        try {
+            const { execSync } = require('child_process');
+            const diffOutput = execSync('git diff --name-only HEAD', {
+                cwd: repoPath,
+                encoding: 'utf-8',
+                timeout: 10000,
+            }).trim();
+
+            return diffOutput.split('\n')
+                .filter((f: string) => Boolean(f))
+                .map((f: string) => path.resolve(repoPath, f))
+                .filter((f: string) => fs.existsSync(f) && extSet.has(path.extname(f)));
+        } catch {
+            return [];
+        }
     }
 
     private scanFiles(dir: string, extensions: string[]): string[] {

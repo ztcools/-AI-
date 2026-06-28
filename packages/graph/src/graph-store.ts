@@ -322,6 +322,22 @@ export class SqliteGraphStore implements GraphStore {
         return rows.map(r => this.rowToEdge(r));
     }
 
+    findEdges(project: string, types?: GraphEdgeType[], limit?: number): GraphEdge[] {
+        const conditions: string[] = ['e.project = ?'];
+        const params: unknown[] = [project];
+
+        if (types && types.length > 0) {
+            conditions.push(`e.type IN (${types.map(() => '?').join(',')})`);
+            params.push(...types);
+        }
+
+        const sql = `SELECT * FROM edges e WHERE ${conditions.join(' AND ')} LIMIT ?`;
+        params.push(limit ?? 1000);
+
+        const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+        return rows.map(r => this.rowToEdge(r));
+    }
+
     // ── Project operations ───────────────────────────────────────
 
     listProjects(): string[] {

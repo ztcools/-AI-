@@ -423,4 +423,44 @@ describe('ADR and QueryGraph', () => {
     });
 });
 
+describe('FindEdges and CrossFile', () => {
+    let store: SqliteGraphStore;
+
+    before(() => {
+        store = new SqliteGraphStore(TEST_DB + '-cross');
+        store.initialize();
+
+        // Create two functions in different files
+        const a = store.upsertNode({ project: 'p', label: 'Function', name: 'foo', qualifiedName: 'p.src.a.foo', filePath: 'src/a.ts', startLine: 1, endLine: 5, properties: {} });
+        const b = store.upsertNode({ project: 'p', label: 'Function', name: 'bar', qualifiedName: 'p.src.b.bar', filePath: 'src/b.ts', startLine: 1, endLine: 5, properties: {} });
+
+        // Create IMPORTS edge (foo imports bar)
+        store.upsertEdge({ project: 'p', sourceId: a, targetId: b, type: 'IMPORTS', properties: { importedName: 'bar' } });
+
+        // Create CALLS edge for testing
+        store.upsertEdge({ project: 'p', sourceId: a, targetId: b, type: 'CALLS', properties: { crossFile: true } });
+    });
+
+    after(() => {
+        store.close();
+    });
+
+    it('should find edges by type', () => {
+        const edges = store.findEdges('p', ['CALLS']);
+        assert.strictEqual(edges.length, 1);
+        assert.strictEqual(edges[0].type, 'CALLS');
+    });
+
+    it('should find IMPORTS edges', () => {
+        const edges = store.findEdges('p', ['IMPORTS']);
+        assert.strictEqual(edges.length, 1);
+        assert.strictEqual(edges[0].type, 'IMPORTS');
+    });
+
+    it('should return all edges for project', () => {
+        const edges = store.findEdges('p');
+        assert.strictEqual(edges.length, 2);
+    });
+});
+
 console.log('All graph tests passed!');
