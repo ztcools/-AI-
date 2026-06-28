@@ -165,24 +165,46 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
             requestOptions.body = JSON.stringify(data);
         }
 
-        try {
-            const response = await fetch(url, requestOptions);
+        const maxRetries = 3;
+        let lastError: Error | null = null;
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const response = await fetch(url, requestOptions);
+
+                if (!response.ok) {
+                    const status = response.status;
+                    if ((status >= 500 || status === 429) && attempt < maxRetries - 1) {
+                        const delay = Math.pow(2, attempt) * 1000;
+                        console.warn(`[MilvusRestfulDB] Retryable HTTP ${status} from ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const result: any = await response.json();
+
+                if (result.code !== 0 && result.code !== 200) {
+                    throw new Error(`Milvus API error: ${result.message || 'Unknown error'}`);
+                }
+
+                return result;
+            } catch (error: any) {
+                lastError = error;
+                const isNetworkError = error?.message?.includes('fetch') || error?.message?.includes('ECONNREFUSED') || error?.message?.includes('ETIMEDOUT');
+                if (isNetworkError && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000;
+                    console.warn(`[MilvusRestfulDB] Network error for ${url}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                    continue;
+                }
+                break;
             }
-
-            const result: any = await response.json();
-
-            if (result.code !== 0 && result.code !== 200) {
-                throw new Error(`Milvus API error: ${result.message || 'Unknown error'}`);
-            }
-
-            return result;
-        } catch (error) {
-            console.error(`[MilvusRestfulDB] Milvus REST API request failed:`, error);
-            throw error;
         }
+
+        console.error(`[MilvusRestfulDB] Milvus REST API request failed after ${maxRetries} attempts:`, lastError);
+        throw lastError || new Error('Milvus REST API request failed');
     }
 
     async createCollection(collectionName: string, dimension: number, description?: string): Promise<void> {

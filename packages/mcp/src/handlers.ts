@@ -462,25 +462,28 @@ export class ToolHandlers {
             }
 
             //Check if the snapshot and cloud index are in sync (compare by identity)
-            const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
-            const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
-            if (snapshotHasIndex !== vectorDbHasIndex) {
-                if (vectorDbHasIndex && !snapshotHasIndex) {
-                    // Query Milvus for real row count. If unknown/empty, log and move on
-                    // without writing 0/0+completed (which would trigger the force-reindex
-                    // loop in Issue #295). The user is about to (re)index anyway.
-                    const stats = await this.queryCollectionStats(absolutePath);
-                    if (stats) {
-                        console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
-                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+            // Skip consistency check when forceReindex already cleared the snapshot
+            if (!alreadyCleared) {
+                const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(codebaseIdentity);
+                const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
+                if (snapshotHasIndex !== vectorDbHasIndex) {
+                    if (vectorDbHasIndex && !snapshotHasIndex) {
+                        // Query Milvus for real row count. If unknown/empty, log and move on
+                        // without writing 0/0+completed (which would trigger the force-reindex
+                        // loop in Issue #295). The user is about to (re)index anyway.
+                        const stats = await this.queryCollectionStats(absolutePath);
+                        if (stats) {
+                            console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
+                            this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                            this.snapshotManager.saveCodebaseSnapshot();
+                        } else {
+                            console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
+                        }
+                    } else if (!vectorDbHasIndex && snapshotHasIndex) {
+                        console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
+                        this.snapshotManager.removeCodebaseCompletely(absolutePath);
                         this.snapshotManager.saveCodebaseSnapshot();
-                    } else {
-                        console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
                     }
-                } else if (!vectorDbHasIndex && snapshotHasIndex) {
-                    console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
-                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
-                    this.snapshotManager.saveCodebaseSnapshot();
                 }
             }
 

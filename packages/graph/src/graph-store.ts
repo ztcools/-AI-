@@ -576,11 +576,12 @@ export class SqliteGraphStore implements GraphStore {
 
     private regexToLike(pattern: string): string {
         // Convert simple regex patterns to SQL LIKE patterns
-        // Escape LIKE wildcards % and _ to prevent unintended matching
+        // Strip regex special chars first, then escape LIKE wildcards last
+        // (order matters: \ in \% must survive the regex strip)
         const escaped = pattern
+            .replace(/[.*+?^${}()|[\]\\]/g, '')
             .replace(/%/g, '\\%')
             .replace(/_/g, '\\_')
-            .replace(/[.*+?^${}()|[\]\\]/g, '')
             .replace(/^%|%$/g, '');
         return '%' + escaped + '%';
     }
