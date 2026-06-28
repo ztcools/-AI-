@@ -150,6 +150,9 @@ export class OllamaEmbedding extends Embedding {
     }
 
     getDimension(): number {
+        if (!this.dimensionDetected && !this.config.dimension) {
+            console.warn('[OllamaEmbedding] Dimension not yet detected. Call embed() first to detect actual dimension.');
+        }
         return this.dimension;
     }
 
