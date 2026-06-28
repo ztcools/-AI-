@@ -19,7 +19,6 @@ import {
     GraphSearchOptions,
     GraphSearchResponse,
     TraceOptions,
-    escapeRegex,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
 
@@ -501,17 +500,27 @@ export class GraphToolHandlers {
             }
             lines.push('');
 
-            // Find impacted nodes
-            const result = this.store.findNodes({
-                project,
-                filePattern: changedFiles.map(f => escapeRegex(f)).join('|'),
-                limit: 1000,
-            });
+            // Find impacted nodes — query per file since regexToLike strips | separator
+            const impactedNodes: GraphNode[] = [];
+            const seenNodeIds = new Set<number>();
+            for (const file of changedFiles) {
+                const fileResult = this.store.findNodes({
+                    project,
+                    filePattern: file,
+                    limit: 100,
+                });
+                for (const r of fileResult.results) {
+                    if (!seenNodeIds.has(r.node.id)) {
+                        seenNodeIds.add(r.node.id);
+                        impactedNodes.push(r.node);
+                    }
+                }
+            }
 
-            if (result.results.length > 0) {
-                lines.push(`Impacted graph nodes: ${result.results.length}`);
-                for (const r of result.results) {
-                    lines.push(`  ${r.node.label} ${r.node.name} (${r.node.filePath}:${r.node.startLine})`);
+            if (impactedNodes.length > 0) {
+                lines.push(`Impacted graph nodes: ${impactedNodes.length}`);
+                for (const r of impactedNodes) {
+                    lines.push(`  ${r.label} ${r.name} (${r.filePath}:${r.startLine})`);
                 }
             } else {
                 lines.push('No graph nodes directly impacted by changes.');

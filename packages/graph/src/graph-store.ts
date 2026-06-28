@@ -578,8 +578,9 @@ export class SqliteGraphStore implements GraphStore {
         // Convert simple regex patterns to SQL LIKE patterns
         // Strip regex special chars first, then escape LIKE wildcards last
         // (order matters: \ in \% must survive the regex strip)
+        // NOTE: . and + are NOT stripped — they are valid in file paths and qualified names
         const escaped = pattern
-            .replace(/[.*+?^${}()|[\]\\]/g, '')
+            .replace(/[*?^${}()|[\]\\]/g, '')
             .replace(/%/g, '\\%')
             .replace(/_/g, '\\_')
             .replace(/^%|%$/g, '');

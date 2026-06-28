@@ -167,7 +167,7 @@ export class GraphSearcher {
         for (const filePath of uniqueFiles) {
             const nodeResult = this.store.findNodes({
                 project,
-                filePattern: escapeRegex(filePath),
+                filePattern: filePath,
                 limit: 500,
             });
             fileNodes.set(filePath, nodeResult.results.map(r => r.node));
