@@ -439,6 +439,12 @@ export class ToolHandlers {
             if (this.snapshotManager.getIndexingCodebases().includes(codebaseIdentity)) {
                 if (forceReindex) {
                     console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
+                    // Cancel the old indexing task to prevent it from writing to the cleared collection
+                    const oldTask = this.indexingTasks.get(absolutePath);
+                    if (oldTask) {
+                        oldTask.controller.abort();
+                        this.indexingTasks.delete(absolutePath);
+                    }
                     this.snapshotManager.removeCodebaseCompletely(absolutePath);
                     this.snapshotManager.saveCodebaseSnapshot();
                 } else {

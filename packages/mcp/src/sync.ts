@@ -215,7 +215,6 @@ export class SyncManager {
 
                 try {
                     console.log(`[SYNC-DEBUG] Calling context.reindexByChange() for '${codebasePath}'`);
-                    const codebaseInfo = this.snapshotManager.getCodebaseInfo(codebasePath);
                     const requestSplitterType: RequestSplitterType = resolveRequestSplitterType(codebaseInfo?.requestSplitter);
                     const requestIgnorePatterns = codebaseInfo?.requestIgnorePatterns || [];
                     const requestCustomExtensions = codebaseInfo?.requestCustomExtensions || [];

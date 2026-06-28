@@ -100,7 +100,7 @@ export class GraphToolHandlers {
                 const relPath = path.relative(repoPath, filePath);
 
                 // For incremental indexing, delete old nodes+edges for this file
-                if (specificFiles && specificFiles.length > 0) {
+                if (specificFiles || mode === 'incremental') {
                     this.store.deleteNodesByFile(project, relPath);
                 }
 

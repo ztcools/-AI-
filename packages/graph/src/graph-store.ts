@@ -240,9 +240,13 @@ export class SqliteGraphStore implements GraphStore {
 
         const results: GraphSearchResult[] = [];
 
+        // Batch-load degrees for all result nodes to avoid N+1 queries
+        const nodeIds = rows.map(row => row.id as number);
+        const degreeMap = this.getNodeDegreesBatch(nodeIds);
+
         for (const row of rows) {
             const node = this.rowToNode(row);
-            const { inDegree, outDegree } = this.getNodeDegree(node.id);
+            const { inDegree, outDegree } = degreeMap.get(node.id) || { inDegree: 0, outDegree: 0 };
 
             // Apply degree filters
             if (options.minDegree !== undefined && (inDegree + outDegree) < options.minDegree) continue;
@@ -275,6 +279,37 @@ export class SqliteGraphStore implements GraphStore {
             'SELECT COUNT(*) as cnt FROM edges WHERE source_id = ?'
         ).get(nodeId) as { cnt: number };
         return { inDegree: inRow.cnt, outDegree: outRow.cnt };
+    }
+
+    getNodeDegreesBatch(nodeIds: number[]): Map<number, { inDegree: number; outDegree: number }> {
+        const degreeMap = new Map<number, { inDegree: number; outDegree: number }>();
+        if (nodeIds.length === 0) return degreeMap;
+
+        // Initialize all nodes with 0 degrees
+        for (const id of nodeIds) degreeMap.set(id, { inDegree: 0, outDegree: 0 });
+
+        // Batch out-degree: one query per edge direction
+        const inRows = this.db.prepare(`
+            SELECT target_id as id, COUNT(*) as cnt FROM edges
+            WHERE target_id IN (${nodeIds.map(() => '?').join(',')})
+            GROUP BY target_id
+        `).all(...nodeIds) as Array<{ id: number; cnt: number }>;
+        for (const row of inRows) {
+            const entry = degreeMap.get(row.id);
+            if (entry) entry.inDegree = row.cnt;
+        }
+
+        const outRows = this.db.prepare(`
+            SELECT source_id as id, COUNT(*) as cnt FROM edges
+            WHERE source_id IN (${nodeIds.map(() => '?').join(',')})
+            GROUP BY source_id
+        `).all(...nodeIds) as Array<{ id: number; cnt: number }>;
+        for (const row of outRows) {
+            const entry = degreeMap.get(row.id);
+            if (entry) entry.outDegree = row.cnt;
+        }
+
+        return degreeMap;
     }
 
     // ── Edge operations ──────────────────────────────────────────
