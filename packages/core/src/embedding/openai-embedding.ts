@@ -11,6 +11,7 @@ export class OpenAIEmbedding extends Embedding {
     private client: OpenAI;
     private config: OpenAIEmbeddingConfig;
     private dimension: number = 1536; // Default dimension for text-embedding-3-small
+    private dimensionDetected: boolean = false;
     protected maxTokens: number = 8192; // Maximum tokens for OpenAI embedding models
 
     constructor(config: OpenAIEmbeddingConfig) {
@@ -60,8 +61,9 @@ export class OpenAIEmbedding extends Embedding {
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model] && this.dimension !== knownModels[model].dimension) {
             this.dimension = knownModels[model].dimension;
-        } else if (!knownModels[model]) {
+        } else if (!knownModels[model] && !this.dimensionDetected) {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
 
         try {
@@ -91,8 +93,9 @@ export class OpenAIEmbedding extends Embedding {
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model] && this.dimension !== knownModels[model].dimension) {
             this.dimension = knownModels[model].dimension;
-        } else if (!knownModels[model]) {
+        } else if (!knownModels[model] && !this.dimensionDetected) {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
 
         const maxRetries = 3;
@@ -157,11 +160,13 @@ export class OpenAIEmbedding extends Embedding {
      */
     async setModel(model: string): Promise<void> {
         this.config.model = model;
+        this.dimensionDetected = false;
         const knownModels = OpenAIEmbedding.getSupportedModels();
         if (knownModels[model]) {
             this.dimension = knownModels[model].dimension;
         } else {
             this.dimension = await this.detectDimension();
+            this.dimensionDetected = true;
         }
     }
 
