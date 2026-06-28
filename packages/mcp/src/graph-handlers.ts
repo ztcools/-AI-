@@ -18,8 +18,9 @@ import {
     GraphSearcher,
     ArchitectureAnalyzer,
     GraphNode,
+    GraphNodeLabel,
     GraphSearchOptions,
-    GraphSearchResponse,
+    SearchCodeOptions,
     TraceOptions,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
@@ -200,7 +201,7 @@ export class GraphToolHandlers {
         const options: GraphSearchOptions = {
             project,
             query,
-            label: label as any,
+            label: label as GraphNodeLabel,
             namePattern,
             qnPattern,
             filePattern,
@@ -401,7 +402,7 @@ export class GraphToolHandlers {
             pattern,
             filePattern,
             pathFilter,
-            mode: mode as any,
+            mode: mode as SearchCodeOptions['mode'],
             context,
             regex,
             limit,

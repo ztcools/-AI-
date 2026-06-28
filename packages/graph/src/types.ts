@@ -18,7 +18,8 @@ export type GraphNodeLabel =
     | 'Folder'
     | 'Package'
     | 'Route'
-    | 'Resource';  // K8s / Infra resources
+    | 'Resource'  // K8s / Infra resources
+    | 'ADR';       // Architecture Decision Records
 
 export interface GraphNode {
     id: number;

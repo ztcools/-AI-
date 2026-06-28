@@ -557,7 +557,7 @@ export class SqliteGraphStore implements GraphStore {
 
     getADRs(project?: string): Array<{ id: number; project: string; title: string; status: string; content: string; created: string }> {
         // ADRs are stored as nodes with label 'ADR'
-        const options: GraphSearchOptions = { label: 'ADR' as GraphNodeLabel, limit: 1000 };
+        const options: GraphSearchOptions = { label: 'ADR', limit: 1000 };
         if (project) options.project = project;
         const result = this.findNodes(options);
         return result.results.map(r => ({
@@ -573,7 +573,7 @@ export class SqliteGraphStore implements GraphStore {
     createADR(adr: { project: string; title: string; content: string; status: string }): number {
         return this.upsertNode({
             project: adr.project,
-            label: 'ADR' as GraphNodeLabel,
+            label: 'ADR',
             name: adr.title,
             qualifiedName: `${adr.project}.adr.${adr.title.replace(/\s+/g, '-').toLowerCase()}`,
             filePath: 'adr://',
