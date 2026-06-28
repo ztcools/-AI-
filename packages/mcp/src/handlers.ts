@@ -346,24 +346,47 @@ export class ToolHandlers {
      * once — the system handles both indexes internally.
      */
     public async handleIndex(args: any) {
+        const { path: codebasePath = "." } = args;
+        const absolutePath = resolveCodebasePath(codebasePath);
+
         // 1. Run vector indexing (same as handleIndexCodebase)
         const vectorResult = await this.handleIndexCodebase(args);
 
-        // 2. Also run graph indexing in the background
-        // Start graph indexing after vector completes — graph is synchronous
-        // so it's fast enough to run inline
+        // If vector indexing returned an error, skip graph indexing
+        if (vectorResult.isError) {
+            return vectorResult;
+        }
+
+        // 2. Graph indexing — skip if already indexed and not forced
         if (this.graphToolHandlers) {
-            const { path: codebasePath = "." } = args;
-            const absolutePath = resolveCodebasePath(codebasePath);
-            try {
-                const graphResult = await this.graphToolHandlers.handleIndexRepository({
-                    repo_path: absolutePath,
-                    mode: 'full',
-                });
-                const graphText = graphResult.content[0]?.text || '';
-                console.log(`[INDEX] Graph indexing completed: ${graphText.substring(0, 120)}...`);
-            } catch (e: any) {
-                console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
+            const project = getRepoIdentity(absolutePath);
+            const stats = this.graphToolHandlers.getStore().getProjectStats(project);
+            const alreadyGraphIndexed = stats.nodes > 0;
+
+            if (alreadyGraphIndexed && !args.force) {
+                console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), skipping`);
+            } else {
+                try {
+                    const graphResult = await this.graphToolHandlers.handleIndexRepository({
+                        repo_path: absolutePath,
+                        mode: 'full',
+                    });
+                    const graphText = graphResult.content[0]?.text || '';
+                    console.log(`[INDEX] Graph indexing completed: ${graphText.substring(0, 120)}...`);
+
+                    const vectorText = vectorResult.content[0]?.text || '';
+                    return {
+                        ...vectorResult,
+                        content: [{ type: 'text', text: vectorText + '\n\n' + graphText }],
+                    };
+                } catch (e: any) {
+                    console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
+                    const vectorText = vectorResult.content[0]?.text || '';
+                    return {
+                        ...vectorResult,
+                        content: [{ type: 'text', text: vectorText + `\n\n⚠️ Graph indexing failed: ${e.message}` }],
+                    };
+                }
             }
         }
 
@@ -938,7 +961,7 @@ export class ToolHandlers {
 
                         const nodeResult = this.graphToolHandlers.getStore().findNodes({
                             project,
-                            filePattern: result.relativePath,
+                            exactFilePath: result.relativePath,
                             limit: 5,
                         });
 

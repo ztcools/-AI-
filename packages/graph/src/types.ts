@@ -67,7 +67,8 @@ export interface GraphSearchOptions {
     label?: GraphNodeLabel;
     namePattern?: string;     // Regex pattern on name
     qnPattern?: string;       // Regex pattern on qualified name
-    filePattern?: string;     // Regex pattern on file path
+    filePattern?: string;     // Regex/LIKE pattern on file path
+    exactFilePath?: string;   // Exact file path match (overrides filePattern)
     minDegree?: number;
     maxDegree?: number;
     limit?: number;

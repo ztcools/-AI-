@@ -178,6 +178,10 @@ export class SqliteGraphStore implements GraphStore {
             conditions.push('n.file_path LIKE ?');
             params.push(this.regexToLike(options.filePattern));
         }
+        if (options.exactFilePath) {
+            conditions.push('n.file_path = ?');
+            params.push(options.exactFilePath);
+        }
 
         const whereClause = conditions.length > 0 ? conditions.join(' AND ') : '1=1';
         const limit = options.limit ?? 200;
