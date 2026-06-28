@@ -95,7 +95,6 @@ export function resolveCodebasePath(inputPath: string): string {
 
 /**
  * Ensure path is absolute. If relative path is provided, resolve it properly.
- * @deprecated Use resolveCodebasePath() instead for better workspace detection
  */
 export function ensureAbsolutePath(inputPath: string): string {
     return resolveCodebasePath(inputPath);

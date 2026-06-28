@@ -639,7 +639,7 @@ export class SnapshotManager {
                 try {
                     const stat = fs.statSync(lockPath);
                     if (Date.now() - stat.mtimeMs > 10000) {
-                        fs.rmdirSync(lockPath);
+                        fs.rmSync(lockPath, { recursive: true });
                         continue;
                     }
                 } catch { }
@@ -652,7 +652,7 @@ export class SnapshotManager {
 
     private releaseLock(): void {
         try {
-            fs.rmdirSync(this.snapshotFilePath + '.lock');
+            fs.rmSync(this.snapshotFilePath + '.lock', { recursive: true });
         } catch { }
     }
 

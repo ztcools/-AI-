@@ -2,7 +2,8 @@
  * Graph MCP tool handlers. Extends claude-context with knowledge graph
  * capabilities: search_graph, trace_path, query_graph, get_code_snippet,
  * get_graph_schema, get_architecture, search_code_graph, detect_changes,
- * list_projects, delete_project, index_status, manage_adr.
+ * list_projects, delete_project, index_status, manage_adr, fusion_search,
+ * ingest_traces.
  */
 import * as path from 'path';
 import * as os from 'os';
@@ -346,9 +347,9 @@ export class GraphToolHandlers {
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // ── Tool: search_code (graph-enhanced) ───────────────────────
+    // ── Tool: search_code_graph (graph-enhanced) ─────────────────
 
-    handleSearchCode(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
+    handleSearchCodeGraph(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
         const project = args.project as string;
         const pattern = args.pattern as string;
         const filePattern = args.file_pattern as string | undefined;
@@ -815,7 +816,8 @@ export class GraphToolHandlers {
                 .filter((f: string) => Boolean(f))
                 .map((f: string) => path.resolve(repoPath, f))
                 .filter((f: string) => fs.existsSync(f) && extSet.has(path.extname(f)));
-        } catch {
+        } catch (err: any) {
+            console.warn(`[Graph] detectChangedFiles failed for ${repoPath}: ${err.message}`);
             return [];
         }
     }
@@ -825,20 +827,21 @@ export class GraphToolHandlers {
         const extSet = new Set(extensions);
         const ignoreSet = new Set(['node_modules', '.git', 'dist', 'build', '.next', '__pycache__']);
 
-        function walk(current: string) {
+        const stack: string[] = [dir];
+        while (stack.length > 0) {
+            const current = stack.pop()!;
             const entries = fs.readdirSync(current, { withFileTypes: true });
             for (const entry of entries) {
                 if (ignoreSet.has(entry.name)) continue;
                 const fullPath = path.join(current, entry.name);
                 if (entry.isDirectory()) {
-                    walk(fullPath);
+                    stack.push(fullPath);
                 } else if (entry.isFile() && extSet.has(path.extname(entry.name))) {
                     results.push(fullPath);
                 }
             }
         }
 
-        walk(dir);
         return results;
     }
 }

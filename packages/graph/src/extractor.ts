@@ -9,15 +9,35 @@
 import Parser from 'tree-sitter';
 import { GraphNode, GraphNodeLabel, GraphEdge, GraphEdgeType } from './types';
 
-// Language parsers (reuse existing tree-sitter grammars from core package)
-const JavaScript = require('tree-sitter-javascript');
-const TypeScript = require('tree-sitter-typescript').typescript;
-const Python = require('tree-sitter-python');
-const Java = require('tree-sitter-java');
-const Cpp = require('tree-sitter-cpp');
-const Go = require('tree-sitter-go');
-const Rust = require('tree-sitter-rust');
-const CSharp = require('tree-sitter-c-sharp');
+// Lazy-load language parsers with fallback — any single parser failure
+// won't prevent the module from loading other languages.
+function loadParser(name: string): any {
+    try {
+        switch (name) {
+            case 'javascript':
+                return require('tree-sitter-javascript');
+            case 'typescript':
+                return require('tree-sitter-typescript').typescript;
+            case 'python':
+                return require('tree-sitter-python');
+            case 'java':
+                return require('tree-sitter-java');
+            case 'cpp':
+                return require('tree-sitter-cpp');
+            case 'go':
+                return require('tree-sitter-go');
+            case 'rust':
+                return require('tree-sitter-rust');
+            case 'csharp':
+                return require('tree-sitter-c-sharp');
+            default:
+                return null;
+        }
+    } catch (e: any) {
+        console.warn(`[GraphExtractor] Failed to load tree-sitter parser for '${name}': ${e.message}`);
+        return null;
+    }
+}
 
 // ── Language configuration ─────────────────────────────────────────
 
@@ -34,7 +54,7 @@ interface LanguageConfig {
 
 const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
     javascript: {
-        parser: JavaScript,
+        parser: loadParser('javascript'),
         nodeTypes: {
             function_declaration: 'Function',
             arrow_function: 'Function',
@@ -48,7 +68,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: ['method_definition'],
     },
     typescript: {
-        parser: TypeScript,
+        parser: loadParser('typescript'),
         nodeTypes: {
             function_declaration: 'Function',
             arrow_function: 'Function',
@@ -64,7 +84,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: ['method_definition'],
     },
     python: {
-        parser: Python,
+        parser: loadParser('python'),
         nodeTypes: {
             function_definition: 'Function',
             class_definition: 'Class',
@@ -77,7 +97,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: [],
     },
     java: {
-        parser: Java,
+        parser: loadParser('java'),
         nodeTypes: {
             method_declaration: 'Method',
             class_declaration: 'Class',
@@ -91,7 +111,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: ['method_declaration', 'constructor_declaration'],
     },
     cpp: {
-        parser: Cpp,
+        parser: loadParser('cpp'),
         nodeTypes: {
             function_definition: 'Function',
             class_specifier: 'Class',
@@ -105,7 +125,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: [],
     },
     go: {
-        parser: Go,
+        parser: loadParser('go'),
         nodeTypes: {
             function_declaration: 'Function',
             method_declaration: 'Method',
@@ -119,7 +139,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: ['method_declaration'],
     },
     rust: {
-        parser: Rust,
+        parser: loadParser('rust'),
         nodeTypes: {
             function_item: 'Function',
             impl_item: 'Class',
@@ -135,7 +155,7 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
         nestedDefTypes: [],
     },
     csharp: {
-        parser: CSharp,
+        parser: loadParser('csharp'),
         nodeTypes: {
             method_declaration: 'Method',
             class_declaration: 'Class',
@@ -190,6 +210,11 @@ export class GraphExtractor {
     extract(source: string, ctx: ExtractionContext): ExtractionResult {
         const config = this.getLanguageConfig(ctx.language);
         if (!config) {
+            return { nodes: [], edges: [] };
+        }
+
+        if (!config.parser) {
+            console.warn(`[GraphExtractor] Parser not available for ${ctx.language}, skipping ${ctx.filePath}`);
             return { nodes: [], edges: [] };
         }
 
@@ -248,7 +273,9 @@ export class GraphExtractor {
     // ── Private: Pass 1 - Collect definitions ─────────────────────
 
     private getLanguageConfig(language: string): LanguageConfig | null {
-        return LANGUAGE_CONFIGS[language] || null;
+        const config = LANGUAGE_CONFIGS[language];
+        if (!config || !config.parser) return null;
+        return config;
     }
 
     private collectDefinitions(

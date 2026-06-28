@@ -491,7 +491,7 @@ This tool is versatile and can be used before completing various tasks to retrie
                 case "get_architecture":
                     return this.graphToolHandlers.handleGetArchitecture(safeArgs);
                 case "search_code_graph":
-                    return this.graphToolHandlers.handleSearchCode(safeArgs);
+                    return this.graphToolHandlers.handleSearchCodeGraph(safeArgs);
                 case "list_projects":
                     return this.graphToolHandlers.handleListProjects();
                 case "delete_project":
