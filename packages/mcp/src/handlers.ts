@@ -1458,8 +1458,10 @@ export class ToolHandlers {
             seenFiles.add(result.relativePath);
         }
 
-        // === Layer 1: Direct call relationships (original logic) ===
-        const directRelations: string[] = [];
+        // === Layer 1: Direct call relationships (batch-queried) ===
+        const allNodeIds = new Set<number>();
+        const fileNodes: Array<{ node: any; filePath: string }> = [];
+
         for (const filePath of seenFiles) {
             const normalizedPath = filePath.replace(/^\/+/, '');
             let nodeResult = store.findNodes({
@@ -1474,43 +1476,60 @@ export class ToolHandlers {
                     limit: 20,
                 });
             }
-            if (nodeResult.results.length === 0) continue;
-
             for (const r of nodeResult.results) {
-                const n = r.node;
-                const key = n.qualifiedName;
-                if (seenSymbols.has(key)) continue;
-                seenSymbols.add(key);
-
-                const callerEdges = store.getEdgesByTarget(n.id, 'CALLS');
-                const calleeEdges = store.getEdgesBySource(n.id, 'CALLS');
-
-                const callerNames = callerEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
-                    const caller = store.getNodeById(e.sourceId);
-                    return caller ? caller.name : '?';
-                });
-                const calleeNames = calleeEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
-                    const callee = store.getNodeById(e.targetId);
-                    return callee ? callee.name : '?';
-                });
-
-                let line = `${n.label} \`${n.name}\``;
-                if (callerNames.length > 0) {
-                    line += ` ← ${callerNames.join(', ')}`;
-                    if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
-                }
-                if (calleeNames.length > 0) {
-                    line += ` → ${calleeNames.join(', ')}`;
-                    if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
-                }
-                if (callerEdges.length === 0 && calleeEdges.length === 0) {
-                    line += ` [unused]`;
-                } else if (callerEdges.length === 0 && n.label === 'Function') {
-                    line += ` [entry]`;
-                }
-                line += ` (${n.filePath}:${n.startLine})`;
-                directRelations.push(line);
+                fileNodes.push({ node: r.node, filePath: normalizedPath });
+                allNodeIds.add(r.node.id);
             }
+        }
+
+        // Batch-collect all edges in one pass per direction
+        const allCallerEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
+        const allCalleeEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
+
+        for (const { node } of fileNodes) {
+            allCallerEdges.set(node.id, store.getEdgesByTarget(node.id, 'CALLS'));
+            allCalleeEdges.set(node.id, store.getEdgesBySource(node.id, 'CALLS'));
+            for (const e of allCallerEdges.get(node.id)!) allNodeIds.add(e.sourceId);
+            for (const e of allCalleeEdges.get(node.id)!) allNodeIds.add(e.targetId);
+        }
+
+        // Single batch lookup for all referenced nodes
+        const nodeMap = store.getNodesById(Array.from(allNodeIds));
+
+        const directRelations: string[] = [];
+        for (const { node } of fileNodes) {
+            const key = node.qualifiedName;
+            if (seenSymbols.has(key)) continue;
+            seenSymbols.add(key);
+
+            const callerEdges = allCallerEdges.get(node.id) || [];
+            const calleeEdges = allCalleeEdges.get(node.id) || [];
+
+            const callerNames = callerEdges.slice(0, 3).map((e) => {
+                const caller = nodeMap.get(e.sourceId);
+                return caller ? caller.name : '?';
+            });
+            const calleeNames = calleeEdges.slice(0, 3).map((e) => {
+                const callee = nodeMap.get(e.targetId);
+                return callee ? callee.name : '?';
+            });
+
+            let line = `${node.label} \`${node.name}\``;
+            if (callerNames.length > 0) {
+                line += ` ← ${callerNames.join(', ')}`;
+                if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
+            }
+            if (calleeNames.length > 0) {
+                line += ` → ${calleeNames.join(', ')}`;
+                if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
+            }
+            if (callerEdges.length === 0 && calleeEdges.length === 0) {
+                line += ` [unused]`;
+            } else if (callerEdges.length === 0 && node.label === 'Function') {
+                line += ` [entry]`;
+            }
+            line += ` (${node.filePath}:${node.startLine})`;
+            directRelations.push(line);
         }
 
         if (directRelations.length > 0) {
