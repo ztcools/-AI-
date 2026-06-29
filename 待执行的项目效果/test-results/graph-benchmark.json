@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-06-29T00:39:55.463Z",
+  "repos": {
+    "express": {
+      "files": 141,
+      "lines": 21581,
+      "nodes": 949,
+      "edges": 159,
+      "indexTimeMs": 2075,
+      "traceDepth": 0,
+      "clusters": 20,
+      "entryPoints": 2,
+      "deadCode": 86,
+      "searchHits": 3.6
+    }
+  },
+  "summary": {
+    "repoCount": 1,
+    "totalNodes": 949,
+    "totalEdges": 159,
+    "totalIndexTimeMs": 2075,
+    "avgNodesPerRepo": 949,
+    "avgEdgesPerRepo": 159
+  }
+}

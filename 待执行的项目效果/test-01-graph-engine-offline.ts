@@ -14,9 +14,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── 动态加载 graph 模块 ──────────────────────────────────────────
-const graphDist = path.resolve(__dirname, '../../packages/graph/dist');
+const graphDist = path.resolve(__dirname, '../packages/graph/dist');
 const { SqliteGraphStore } = await import(path.join(graphDist, 'graph-store.js'));
 const { GraphExtractor } = await import(path.join(graphDist, 'extractor.js'));
 const { CallTracer } = await import(path.join(graphDist, 'tracer.js'));
@@ -129,10 +132,10 @@ async function main() {
         const nodeResult = store.findNodes({ project, label: 'Function', limit: 10 });
         for (const r of nodeResult.results) {
             const tStart = Date.now();
-            const path = tracer.traceCalls(r.node.id, 'both', 5);
+            const path1 = tracer.trace({ startNodeId: r.node.id, direction: 'both', maxDepth: 5 });
             traceTime += Date.now() - tStart;
             traceCount++;
-            const depth = path.nodes.length;
+            const depth = (path1.callers?.length || 0) + (path1.callees?.length || 0);
             if (depth > maxDepth) maxDepth = depth;
         }
 
@@ -140,7 +143,7 @@ async function main() {
 
         // ── 3. 架构分析 ──────────────────────────────────────
         const archStart = Date.now();
-        const arch = archAnalyzer.analyze(project);
+        const arch = archAnalyzer.getArchitecture(project);
         const archTime = Date.now() - archStart;
 
         console.log(`  架构: ${arch.clusters?.length || 0} 个模块, ${arch.entryPoints?.length || 0} 个入口点`);
@@ -151,7 +154,7 @@ async function main() {
         let searchHits = 0;
         const searchStart = Date.now();
         for (const q of searchQueries) {
-            const result = searcher.search({ project, query: q, limit: 5 });
+            const result = store.findNodes({ project, namePattern: q, limit: 5 });
             searchHits += result.total;
         }
         const searchTime = Date.now() - searchStart;
