@@ -1,0 +1,32 @@
+{
+  "index": {
+    "ok": true,
+    "timeMs": 1681,
+    "text": "Started background indexing for codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' using AST splitter.\n\nIndexing is running in the background. You can search the codebase while indexing is"
+  },
+  "status": {
+    "ok": true,
+    "text": "## Vector Index (Milvus)\n🔄 Codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' is currently being indexed. Progress: 0.0% (Preparing and scanning files...)\n🕐 Last updated: 6/29/2026, 9:03"
+  },
+  "search_main function": {
+    "ok": true,
+    "length": 138
+  },
+  "search_error handling": {
+    "ok": true,
+    "length": 138
+  },
+  "search_configuration": {
+    "ok": true,
+    "length": 138
+  },
+  "clear": {
+    "ok": false,
+    "text": "Error: Codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' (identity: https://github.com/expressjs/express.git:master) is not indexed or being indexed."
+  },
+  "summary": {
+    "passed": 5,
+    "failed": 1,
+    "total": 6
+  }
+}

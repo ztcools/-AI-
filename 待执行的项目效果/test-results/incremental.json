@@ -1,0 +1,55 @@
+{
+  "tests": [
+    {
+      "name": "首次全量索引",
+      "condition": true,
+      "detail": "Started background indexing for codebase '/home/zt/claude-context/待执行的项目效果/test-"
+    },
+    {
+      "name": "已索引时跳过",
+      "condition": true,
+      "detail": "耗时 0.8s (已跳过)"
+    },
+    {
+      "name": "force=true 全量重建",
+      "condition": true,
+      "detail": "Started background indexing for codebase '/home/zt/claude-context/待执行的项目效果/test-"
+    },
+    {
+      "name": "status 包含向量索引",
+      "condition": true,
+      "detail": ""
+    },
+    {
+      "name": "status 包含图索引",
+      "condition": false,
+      "detail": ""
+    }
+  ],
+  "firstIndex": {
+    "ok": true,
+    "timeMs": 1145,
+    "text": "Started background indexing for codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' using AST splitter.\n\nIndexing is running in the background. You can search the codebase while indexing is"
+  },
+  "secondIndex": {
+    "ok": true,
+    "timeMs": 793,
+    "skipped": true
+  },
+  "forceReindex": {
+    "ok": true,
+    "timeMs": 1796,
+    "text": "Started background indexing for codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' using AST splitter.\n\nIndexing is running in the background. You can search the codebase while indexing is"
+  },
+  "status": {
+    "hasVector": true,
+    "hasGraph": false,
+    "text": "## Vector Index (Milvus)\n🔄 Codebase '/home/zt/claude-context/待执行的项目效果/test-repos/express' is currently being indexed. Progress: 0.0% (Preparing and scanning files...)\n🕐 Last updated: 6/29/2026, 9:03:24 AM\n"
+  },
+  "summary": {
+    "passed": 4,
+    "failed": 1,
+    "total": 5,
+    "repo": "express"
+  }
+}

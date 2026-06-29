@@ -1,0 +1,75 @@
+{
+  "timestamp": "2026-06-29T01:03:18.538Z",
+  "totalGrepTokens": 547755,
+  "totalMcpTokens": 3213,
+  "totalSaved": 544542,
+  "avgSavedPercent": 99,
+  "results": [
+    {
+      "repo": "express",
+      "scenario": "查找认证逻辑",
+      "grepTokens": 30285,
+      "mcpTokens": 535,
+      "grepFiles": 10,
+      "grepLines": 4459,
+      "savedTokens": 29750,
+      "savedPercent": 98,
+      "mcpOk": true
+    },
+    {
+      "repo": "express",
+      "scenario": "找数据库连接",
+      "grepTokens": 7291,
+      "mcpTokens": 535,
+      "grepFiles": 10,
+      "grepLines": 1172,
+      "savedTokens": 6756,
+      "savedPercent": 93,
+      "mcpOk": true
+    },
+    {
+      "repo": "express",
+      "scenario": "错误处理",
+      "grepTokens": 13269,
+      "mcpTokens": 535,
+      "grepFiles": 10,
+      "grepLines": 1832,
+      "savedTokens": 12734,
+      "savedPercent": 96,
+      "mcpOk": true
+    },
+    {
+      "repo": "typescript",
+      "scenario": "查找认证逻辑",
+      "grepTokens": 98636,
+      "mcpTokens": 536,
+      "grepFiles": 10,
+      "grepLines": 8693,
+      "savedTokens": 98100,
+      "savedPercent": 99,
+      "mcpOk": true
+    },
+    {
+      "repo": "typescript",
+      "scenario": "找数据库连接",
+      "grepTokens": 289011,
+      "mcpTokens": 536,
+      "grepFiles": 10,
+      "grepLines": 319,
+      "savedTokens": 288475,
+      "savedPercent": 100,
+      "mcpOk": true
+    },
+    {
+      "repo": "typescript",
+      "scenario": "错误处理",
+      "grepTokens": 109263,
+      "mcpTokens": 536,
+      "grepFiles": 10,
+      "grepLines": 9781,
+      "savedTokens": 108727,
+      "savedPercent": 100,
+      "mcpOk": true
+    }
+  ]
+}

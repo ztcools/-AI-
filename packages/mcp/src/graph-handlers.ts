@@ -27,16 +27,18 @@ import { getRepoIdentity } from '@zilliz/claude-context-core';
 
 // Max nodes to load for cross-file call resolution
 const MAX_CROSS_FILE_NODES = 200000;
+const CROSS_FILE_BATCH_SIZE = 50000;
 
 // Max rows to return from query_graph
 const QUERY_GRAPH_MAX_ROWS = 1000;
 
 // Shared directory ignore set for both code and IaC file scanning
+// Keep in sync with core's DEFAULT_IGNORE_PATTERNS in context.ts
 const IGNORE_DIRS = new Set([
     'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
-    '.venv', 'vendor', 'target', 'coverage', '.cache', '.idea', '.vscode',
-    '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp', '.tox',
-    '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
+    '.venv', 'vendor', 'target', 'coverage', '.nyc_output', '.cache',
+    '.idea', '.vscode', '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp',
+    '.tox', '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
 ]);
 
 export class GraphToolHandlers {
@@ -95,7 +97,7 @@ export class GraphToolHandlers {
                 console.log(`[GraphIndex] Incremental indexing ${files.length} specified files for '${project}'`);
             } else if (mode === 'incremental') {
                 // Auto-detect changed files via git diff
-                files = this.detectChangedFiles(repoPath, supportedExts);
+                files = this.detectChangedFilesByExt(repoPath, supportedExts);
                 console.log(`[GraphIndex] Incremental indexing ${files.length} detected changed files for '${project}'`);
             } else {
                 // Full scan
@@ -429,6 +431,58 @@ export class GraphToolHandlers {
         }
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    // ── Structured change detection (for internal use) ───────────
+
+    /** Returns changed files as structured data, avoiding text parsing. */
+    detectChangedFiles(args: { project: string; baseBranch?: string }): { changedFiles: string[]; diffBranch: string } | null {
+        const { project, baseBranch: baseBranchArg } = args;
+        const baseBranch = baseBranchArg || 'main';
+
+        try {
+            const nodes = this.store.findNodes({ project, limit: 1 });
+            if (nodes.results.length === 0) return null;
+
+            const repoPath = this.findRepoPath(project);
+            if (!repoPath) return null;
+
+            let diffBranch = baseBranch;
+            try {
+                const refHead = execSync('git symbolic-ref refs/remotes/origin/HEAD', {
+                    cwd: repoPath, encoding: 'utf-8', timeout: 5000,
+                }).trim();
+                const detected = refHead.split('/').pop() || 'main';
+                diffBranch = detected;
+            } catch {
+                for (const candidate of ['main', 'master', 'develop']) {
+                    try {
+                        execSync(`git rev-parse --verify ${candidate}`, {
+                            cwd: repoPath, encoding: 'utf-8', timeout: 5000,
+                        });
+                        diffBranch = candidate;
+                        break;
+                    } catch { /* try next */ }
+                }
+            }
+
+            let diffOutput: string;
+            try {
+                diffOutput = execSync(`git diff --name-only ${diffBranch}...HEAD`, {
+                    cwd: repoPath, encoding: 'utf-8', timeout: 10000,
+                });
+            } catch {
+                diffOutput = execSync('git diff --name-only HEAD', {
+                    cwd: repoPath, encoding: 'utf-8', timeout: 10000,
+                });
+                diffBranch = 'HEAD';
+            }
+
+            const changedFiles = diffOutput.trim().split('\n').filter(Boolean);
+            return { changedFiles, diffBranch };
+        } catch {
+            return null;
+        }
     }
 
     // ── Tool: detect_changes ─────────────────────────────────────
@@ -793,21 +847,27 @@ export class GraphToolHandlers {
         let count = 0;
 
         // 1. Build global function registry: name → qualifiedName → nodeId
-        const allNodes = this.store.findNodes({ project, limit: MAX_CROSS_FILE_NODES });
+        // Batch-load nodes to avoid loading all 200K at once
         const globalRegistry = new Map<string, Array<{ qualifiedName: string; nodeId: number; filePath: string }>>();
-
-        for (const result of allNodes.results) {
-            const node = result.node;
-            if (node.label === 'Function' || node.label === 'Method') {
-                if (!globalRegistry.has(node.name)) {
-                    globalRegistry.set(node.name, []);
+        let offset = 0;
+        let hasMore = true;
+        while (hasMore) {
+            const batch = this.store.findNodes({ project, limit: CROSS_FILE_BATCH_SIZE, offset });
+            for (const result of batch.results) {
+                const node = result.node;
+                if (node.label === 'Function' || node.label === 'Method') {
+                    if (!globalRegistry.has(node.name)) {
+                        globalRegistry.set(node.name, []);
+                    }
+                    globalRegistry.get(node.name)!.push({
+                        qualifiedName: node.qualifiedName,
+                        nodeId: node.id,
+                        filePath: node.filePath,
+                    });
                 }
-                globalRegistry.get(node.name)!.push({
-                    qualifiedName: node.qualifiedName,
-                    nodeId: node.id,
-                    filePath: node.filePath,
-                });
             }
+            offset += batch.results.length;
+            hasMore = batch.results.length === CROSS_FILE_BATCH_SIZE && offset < MAX_CROSS_FILE_NODES;
         }
 
         // 2. Find all IMPORTS edges and batch-load source/target nodes
@@ -889,8 +949,12 @@ export class GraphToolHandlers {
         const homeDir = os.homedir();
         const searchPaths = [
             process.cwd(),
-            path.join(homeDir, 'deploy'),
             homeDir,
+            path.join(homeDir, 'deploy'),
+            path.join(homeDir, 'projects'),
+            path.join(homeDir, 'code'),
+            path.join(homeDir, 'src'),
+            path.join(homeDir, 'work'),
         ];
 
         for (const searchPath of searchPaths) {
@@ -919,7 +983,7 @@ export class GraphToolHandlers {
 
     private _repoPathCache: Map<string, string> = new Map();
 
-    private detectChangedFiles(repoPath: string, extensions: string[]): string[] {
+    private detectChangedFilesByExt(repoPath: string, extensions: string[]): string[] {
         const extSet = new Set(extensions);
         try {
             const diffOutput = execSync('git diff --name-only HEAD', {

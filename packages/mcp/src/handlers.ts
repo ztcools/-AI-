@@ -342,8 +342,8 @@ export class ToolHandlers {
     // ── Unified Index: Vector + Graph ─────────────────────────────
     /**
      * Single entry point for indexing. Runs vector index (Milvus) and
-     * graph index (SQLite) in sequence. Developers only need to call this
-     * once — the system handles both indexes internally.
+     * graph index (SQLite). Vector index runs first and returns immediately;
+     * graph index runs in background to avoid blocking MCP response.
      */
     public async handleIndex(args: any) {
         const { path: codebasePath = ".", mode: graphMode = "full" } = args;
@@ -357,94 +357,59 @@ export class ToolHandlers {
             return vectorResult;
         }
 
-        // 2. Graph indexing — skip if already indexed and not forced
+        // 2. Graph indexing — run in background after response
         if (this.graphToolHandlers) {
             const project = getRepoIdentity(absolutePath);
             const stats = this.graphToolHandlers.getStore().getProjectStats(project);
             const alreadyGraphIndexed = stats.nodes > 0;
 
-            if (alreadyGraphIndexed && !args.force) {
-                console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), checking for changes...`);
-
-                // Detect changes for smart incremental indexing
-                let changedFiles: string[] = [];
+            // Defer graph indexing to background to avoid blocking MCP response
+            setImmediate(async () => {
                 try {
-                    const changesResult = this.graphToolHandlers.handleDetectChanges({
-                        project,
-                    });
-                    const changesText = changesResult.content[0]?.text || '';
-                    const changedMatch = changesText.match(/Changed files:\s*\n([\s\S]*?)(?:\n\n|$)/);
-                    if (changedMatch) {
-                        changedFiles = changedMatch[1]
-                            .split('\n')
-                            .map(l => l.trim().replace(/^-\s*/, ''))
-                            .filter(l => l.length > 0);
-                    }
-                } catch {
-                    // change detection failure shouldn't block
-                }
+                    if (alreadyGraphIndexed && !args.force) {
+                        console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), checking for changes...`);
 
-                if (changedFiles.length > 0) {
-                    console.log(`[INDEX] Detected ${changedFiles.length} changed files, running incremental graph index`);
-                    try {
-                        const graphResult = await this.graphToolHandlers.handleIndexRepository({
+                        let changedFiles: string[] = [];
+                        try {
+                            const detectResult = this.graphToolHandlers!.detectChangedFiles({ project });
+                            if (detectResult) {
+                                changedFiles = detectResult.changedFiles;
+                            }
+                        } catch {
+                            // change detection failure shouldn't block
+                        }
+
+                        if (changedFiles.length > 0) {
+                            console.log(`[INDEX] Detected ${changedFiles.length} changed files, running incremental graph index`);
+                            await this.graphToolHandlers!.handleIndexRepository({
+                                repo_path: absolutePath,
+                                mode: 'incremental',
+                                files: changedFiles,
+                            });
+                            console.log(`[INDEX] Incremental graph index complete (${changedFiles.length} files)`);
+                        } else {
+                            console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
+                        }
+                    } else {
+                        await this.graphToolHandlers!.handleIndexRepository({
                             repo_path: absolutePath,
-                            mode: 'incremental',
-                            files: changedFiles,
+                            mode: graphMode,
                         });
-                        const graphText = graphResult.content[0]?.text || '';
-                        const vectorText = vectorResult.content[0]?.text || '';
-                        return {
-                            ...vectorResult,
-                            content: [{ type: 'text', text: vectorText + '\n\n' + graphText + `\n  (incremental: ${changedFiles.length} files)` }],
-                        };
-                    } catch (e: any) {
-                        console.warn(`[INDEX] Incremental graph indexing failed: ${e.message}`);
-                        const vectorText = vectorResult.content[0]?.text || '';
-                        return {
-                            ...vectorResult,
-                            content: [{
-                                type: 'text', text: vectorText +
-                                    `\n\n⚠️ Graph incremental indexing failed: ${e.message}` +
-                                    `\n  Use force=true to re-index fully.`
-                            }],
-                        };
+                        console.log(`[INDEX] Graph indexing completed for '${project}'`);
                     }
-                }
-
-                // No changes — skip
-                console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
-                const vectorText = vectorResult.content[0]?.text || '';
-                return {
-                    ...vectorResult,
-                    content: [{
-                        type: 'text',
-                        text: vectorText + `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (no changes detected, use force=true to re-index)`,
-                    }],
-                };
-            } else {
-                try {
-                    const graphResult = await this.graphToolHandlers.handleIndexRepository({
-                        repo_path: absolutePath,
-                        mode: graphMode,
-                    });
-                    const graphText = graphResult.content[0]?.text || '';
-                    console.log(`[INDEX] Graph indexing completed: ${graphText.substring(0, 120)}...`);
-
-                    const vectorText = vectorResult.content[0]?.text || '';
-                    return {
-                        ...vectorResult,
-                        content: [{ type: 'text', text: vectorText + '\n\n' + graphText }],
-                    };
                 } catch (e: any) {
                     console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
-                    const vectorText = vectorResult.content[0]?.text || '';
-                    return {
-                        ...vectorResult,
-                        content: [{ type: 'text', text: vectorText + `\n\n⚠️ Graph indexing failed: ${e.message}` }],
-                    };
                 }
-            }
+            });
+
+            const vectorText = vectorResult.content[0]?.text || '';
+            const graphNote = alreadyGraphIndexed && !args.force
+                ? `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (checking for changes in background)`
+                : `\n\n[Graph] Indexing in background...`;
+            return {
+                ...vectorResult,
+                content: [{ type: 'text', text: vectorText + graphNote }],
+            };
         }
 
         return vectorResult;

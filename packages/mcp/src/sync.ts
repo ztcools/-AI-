@@ -59,7 +59,6 @@ function getBackgroundSyncIntervalMs(): number {
 export class SyncManager {
     private context: Context;
     private snapshotManager: SnapshotManager;
-    private isSyncing: boolean = false;
     private syncLockToken: string | null = null;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
@@ -170,16 +169,10 @@ export class SyncManager {
 
         console.log(`[SYNC-DEBUG] Found ${indexedCodebases.length} indexed codebases:`, indexedCodebases);
 
-        if (this.isSyncing) {
-            console.log('[SYNC-DEBUG] Index sync already in progress. Skipping.');
-            return;
-        }
-
         if (!this.acquireGlobalSyncLock()) {
             return;
         }
 
-        this.isSyncing = true;
         console.log(`[SYNC-DEBUG] Starting index sync for all ${indexedCodebases.length} codebases...`);
 
         try {
@@ -272,7 +265,6 @@ export class SyncManager {
             console.error(`[SYNC-DEBUG] Error during index sync after ${totalElapsed}ms:`, error);
             console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
         } finally {
-            this.isSyncing = false;
             this.releaseGlobalSyncLock();
             const totalElapsed = Date.now() - syncStartTime;
             console.log(`[SYNC-DEBUG] handleSyncIndex() finished at ${new Date().toISOString()}, total duration: ${totalElapsed}ms`);

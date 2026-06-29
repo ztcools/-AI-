@@ -1,0 +1,89 @@
+{
+  "timestamp": "2026-06-29T01:03:20.340Z",
+  "averageResultLength": 140,
+  "graphContextRate": 0,
+  "callChainRate": 0,
+  "qualityScore": 0,
+  "results": [
+    {
+      "query": "main function entry point",
+      "mcpResultLength": 138,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "error handling middleware",
+      "mcpResultLength": 138,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "database connection",
+      "mcpResultLength": 138,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "configuration settings",
+      "mcpResultLength": 138,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "routing handler",
+      "mcpResultLength": 138,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "main function entry point",
+      "mcpResultLength": 141,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "error handling middleware",
+      "mcpResultLength": 141,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "database connection",
+      "mcpResultLength": 141,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "configuration settings",
+      "mcpResultLength": 141,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    },
+    {
+      "query": "routing handler",
+      "mcpResultLength": 141,
+      "hasGraphContext": false,
+      "hasCallChain": false,
+      "uniqueFiles": 0,
+      "avgResultLength": 28
+    }
+  ]
+}

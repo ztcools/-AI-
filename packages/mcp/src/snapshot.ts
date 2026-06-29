@@ -742,7 +742,10 @@ export class SnapshotManager {
                 lastUpdated: new Date().toISOString()
             };
 
-            fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
+            // Atomic write: write to temp file first, then rename
+            const tmpPath = this.snapshotFilePath + '.tmp';
+            fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2));
+            fs.renameSync(tmpPath, this.snapshotFilePath);
 
             this.recentlyRemoved.clear();
 
