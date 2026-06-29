@@ -13,6 +13,8 @@ import * as fs from 'fs';
 import { execSync } from 'child_process';
 import {
     SqliteGraphStore,
+    InMemoryGraphBuffer,
+    FunctionRegistry,
     GraphExtractor,
     CallTracer,
     GraphSearcher,
@@ -24,12 +26,6 @@ import {
     TraceOptions,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
-
-// Max nodes to load for cross-file call resolution
-const MAX_CROSS_FILE_NODES = 200000;
-const CROSS_FILE_BATCH_SIZE = 50000;
-
-// Max rows to return from query_graph
 const QUERY_GRAPH_MAX_ROWS = 1000;
 
 // Shared directory ignore set for both code and IaC file scanning
@@ -48,6 +44,8 @@ export class GraphToolHandlers {
     private tracer: CallTracer;
     private searcher: GraphSearcher;
     private architecture: ArchitectureAnalyzer;
+    /** Track in-progress graph indexing per project (project → {total, current, startTime}) */
+    private indexingProgress: Map<string, { total: number; current: number; startTime: number }> = new Map();
 
     constructor(dbPath?: string) {
         this.store = new SqliteGraphStore(dbPath);
@@ -60,6 +58,17 @@ export class GraphToolHandlers {
 
     getStore(): SqliteGraphStore {
         return this.store;
+    }
+
+    /** Get graph indexing progress for a project. Returns null if not indexing. */
+    getIndexingProgress(project: string): { total: number; current: number; elapsed: number } | null {
+        const progress = this.indexingProgress.get(project);
+        if (!progress) return null;
+        return {
+            total: progress.total,
+            current: progress.current,
+            elapsed: (Date.now() - progress.startTime) / 1000,
+        };
     }
 
     close(): void {
@@ -87,7 +96,6 @@ export class GraphToolHandlers {
             let files: string[];
 
             if (specificFiles && specificFiles.length > 0) {
-                // Incremental: re-index only specified files
                 const resolvedFiles = specificFiles.map(f => path.resolve(repoPath, f));
                 const existingFiles = resolvedFiles.filter(f => fs.existsSync(f));
                 const skippedCount = resolvedFiles.length - existingFiles.length;
@@ -97,46 +105,28 @@ export class GraphToolHandlers {
                 files = existingFiles;
                 console.log(`[GraphIndex] Incremental indexing ${files.length} specified files for '${project}'`);
             } else if (mode === 'incremental') {
-                // Auto-detect changed files via git diff
                 files = this.detectChangedFilesByExt(repoPath, supportedExts);
                 console.log(`[GraphIndex] Incremental indexing ${files.length} detected changed files for '${project}'`);
             } else {
-                // Full scan
                 files = this.scanFiles(repoPath, supportedExts);
-                // Also scan for infrastructure-as-code files
                 files.push(...this.scanIaCFiles(repoPath));
                 console.log(`[GraphIndex] Full indexing ${files.length} files for '${project}'`);
             }
 
+            // ── Phase 1: Extract into InMemoryGraphBuffer ─────────
+            const graphBuffer = new InMemoryGraphBuffer(project);
+            this.indexingProgress.set(project, { total: files.length, current: 0, startTime });
+
             let nodeCount = 0;
             let edgeCount = 0;
 
-            // Full mode: clear old project data in its own transaction first
-            // This is done separately to avoid a single huge transaction spanning
-            // all files, which would lose all progress on crash/interrupt.
-            if (mode === 'full' && !specificFiles) {
-                this.store.beginTransaction();
-                this.store.deleteProject(project);
-                this.store.commitTransaction();
-                console.log(`[GraphIndex] Cleared existing graph data for '${project}'`);
-            }
-
-            for (const filePath of files) {
+            for (let i = 0; i < files.length; i++) {
+                const filePath = files[i];
                 const ext = path.extname(filePath);
                 const lang = GraphExtractor.extToLanguage(ext);
                 if (!lang) continue;
 
                 const relPath = path.relative(repoPath, filePath);
-
-                // Per-file transaction: commit after each file so partial
-                // progress survives crashes/interrupts.
-                this.store.beginTransaction();
-
-                // For incremental indexing, delete old nodes+edges for this file
-                if (specificFiles || mode === 'incremental') {
-                    this.store.deleteNodesByFile(project, relPath);
-                }
-
                 const source = fs.readFileSync(filePath, 'utf-8');
 
                 const result = this.extractor.extract(source, {
@@ -145,53 +135,71 @@ export class GraphToolHandlers {
                     language: lang,
                 });
 
-                // Insert nodes and build temp-index → real-ID mapping
+                // Insert nodes into graph buffer
                 const idMap = new Map<number, number>();
                 for (const node of result.nodes) {
-                    const realId = this.store.upsertNode(node);
+                    const realId = graphBuffer.upsertNode(
+                        node.label,
+                        node.name,
+                        node.qualifiedName,
+                        node.filePath,
+                        node.startLine,
+                        node.endLine,
+                        node.properties,
+                    );
                     idMap.set(idMap.size, realId);
                 }
                 nodeCount += result.nodes.length;
 
-                // Resolve edges with real IDs
+                // Insert edges into graph buffer
                 for (const edge of result.edges) {
                     const sourceId = idMap.get(edge.sourceId);
                     const targetId = idMap.get(edge.targetId);
                     if (sourceId !== undefined && targetId !== undefined) {
-                        this.store.upsertEdge({
-                            ...edge,
-                            sourceId,
-                            targetId,
-                        });
+                        graphBuffer.insertEdge(sourceId, targetId, edge.type, edge.properties);
                         edgeCount++;
                     }
                 }
 
-                this.store.commitTransaction();
+                // Update progress (every 10 files)
+                if (i % 10 === 0) {
+                    this.indexingProgress.set(project, { total: files.length, current: i + 1, startTime });
+                }
             }
 
-            // ── Cross-file call resolution ────────────────────────
-            let crossEdges = 0;
-            try {
-                this.store.beginTransaction();
-                crossEdges = this.resolveCrossFileCalls(project);
-                this.store.commitTransaction();
-            } catch (err: any) {
-                console.warn(`[GraphIndex] Cross-file call resolution failed for '${project}': ${err.message}`);
-            }
+            console.log(`[GraphIndex] Phase 1 done: ${nodeCount} nodes, ${edgeCount} intra-file edges for '${project}'`);
+
+            // ── Phase 2: Build FunctionRegistry & resolve cross-file calls ──
+            const registry = new FunctionRegistry();
+            graphBuffer.forEachNode((node: GraphNode) => {
+                if (node.label === 'Function' || node.label === 'Method') {
+                    registry.add(node.name, node.qualifiedName, node.label);
+                }
+            });
+            console.log(`[GraphIndex] Registry built: ${registry.size()} functions/methods registered`);
+
+            // Build per-file import map from IMPORTS edges
+            const crossEdges = this.resolveCrossFileCallsWithRegistry(
+                graphBuffer, registry, project,
+            );
             edgeCount += crossEdges;
 
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-            const stats = this.store.getProjectStats(project);
+            console.log(`[GraphIndex] Phase 2 done: ${crossEdges} cross-file call edges resolved`);
 
+            // ── Phase 3: Flush to SQLite ──────────────────────────
+            const { nodes: writtenNodes, edges: writtenEdges } = graphBuffer.flushToStore(this.store);
+            this.indexingProgress.delete(project);
+
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             return {
                 content: [{
                     type: 'text',
-                    text: `Indexed repository '${project}': ${stats.nodes} nodes, ${stats.edges} edges in ${elapsed}s`,
+                    text: `Indexed repository '${project}': ${writtenNodes} nodes, ${writtenEdges} edges in ${elapsed}s`,
                 }],
             };
         } catch (error: any) {
             this.store.rollbackTransaction();
+            this.indexingProgress.delete(project);
             return {
                 content: [{ type: 'text', text: `Error indexing repository: ${error.message}` }],
             };
@@ -803,88 +811,85 @@ export class GraphToolHandlers {
     // ── Helpers ──────────────────────────────────────────────────
 
     /**
-     * Resolve cross-file calls by matching imported names to actual
-     * function definitions across the project.
-     * Returns the number of cross-file CALLS edges created.
+     * Resolve cross-file calls using the FunctionRegistry for O(1) lookups.
+     * Mirrors codebase-memory-mcp's pass_calls.c resolution strategy.
      */
-    private resolveCrossFileCalls(project: string): number {
+    private resolveCrossFileCallsWithRegistry(
+        graphBuffer: InMemoryGraphBuffer,
+        registry: FunctionRegistry,
+        project: string,
+    ): number {
         let count = 0;
 
-        // 1. Build global function registry: name → qualifiedName → nodeId
-        // Batch-load nodes to avoid loading all 200K at once
-        const globalRegistry = new Map<string, Array<{ qualifiedName: string; nodeId: number; filePath: string }>>();
-        let offset = 0;
-        let hasMore = true;
-        while (hasMore) {
-            const batch = this.store.findNodes({ project, limit: CROSS_FILE_BATCH_SIZE, offset });
-            for (const result of batch.results) {
-                const node = result.node;
-                if (node.label === 'Function' || node.label === 'Method') {
-                    if (!globalRegistry.has(node.name)) {
-                        globalRegistry.set(node.name, []);
-                    }
-                    globalRegistry.get(node.name)!.push({
-                        qualifiedName: node.qualifiedName,
-                        nodeId: node.id,
-                        filePath: node.filePath,
-                    });
-                }
-            }
-            offset += batch.results.length;
-            hasMore = batch.results.length === CROSS_FILE_BATCH_SIZE && offset < MAX_CROSS_FILE_NODES;
-        }
-
-        // 2. Find all IMPORTS edges and batch-load source/target nodes
-        const importEdges = this.store.findEdges(project, ['IMPORTS'], MAX_CROSS_FILE_NODES);
-
-        // Batch-load all referenced nodes to avoid N+1 queries
-        const nodeIds = new Set<number>();
-        for (const edge of importEdges) {
-            nodeIds.add(edge.sourceId);
-            nodeIds.add(edge.targetId);
-        }
-        const nodeMap = this.store.getNodesById(Array.from(nodeIds));
+        // Find all IMPORTS edges
+        const importEdges = graphBuffer.findEdgesByType('IMPORTS');
 
         for (const edge of importEdges) {
-            const sourceNode = nodeMap.get(edge.sourceId);
-            const targetNode = nodeMap.get(edge.targetId);
+            const sourceNode = graphBuffer.findNodeById(edge.sourceId);
+            const targetNode = graphBuffer.findNodeById(edge.targetId);
             if (!sourceNode || !targetNode) continue;
 
             // The target node is a Module node with importedName in properties
             const importedName = targetNode.properties.importedName as string;
             if (!importedName) continue;
 
-            // 3. Resolve imported name to global function definitions
-            const candidates = globalRegistry.get(importedName);
-            if (!candidates || candidates.length === 0) continue;
+            // Compute module QN for the source file
+            const moduleQN = this.computeModuleQN(project, sourceNode.filePath);
 
-            for (const candidate of candidates) {
-                // Skip self-references
-                if (candidate.nodeId === sourceNode.id) continue;
-
-                // Create CALLS edge: source function → imported function
-                try {
-                    this.store.upsertEdge({
-                        project,
-                        sourceId: sourceNode.id,
-                        targetId: candidate.nodeId,
-                        type: 'CALLS',
-                        properties: {
-                            crossFile: true,
-                            importedName,
-                            sourceFile: sourceNode.filePath,
-                            targetFile: candidate.filePath,
-                        },
-                    });
-                    count++;
-                } catch (err: any) {
-                    console.warn(`[Graph] Failed to create cross-file CALLS edge: ${sourceNode.name} → ${candidate.qualifiedName}: ${err.message}`);
-                }
+            // Build import map for this file from all IMPORTS edges of the source
+            const importMap: Array<{ key: string; val: string }> = [];
+            const sourceImports = graphBuffer.findEdgesBySourceType(sourceNode.id, 'IMPORTS');
+            for (const impEdge of sourceImports) {
+                const impTarget = graphBuffer.findNodeById(impEdge.targetId);
+                if (!impTarget) continue;
+                const localName = impTarget.properties.importedName as string;
+                if (!localName) continue;
+                // Resolve the module qn from the import target
+                const impModuleQN = this.computeModuleQN(project, impTarget.filePath);
+                importMap.push({ key: localName, val: impModuleQN });
             }
+
+            const importKeys = importMap.map((m) => m.key);
+            const importVals = importMap.map((m) => m.val);
+
+            // Resolve using the 4-step strategy chain
+            const resolution = registry.resolve(
+                importedName,
+                moduleQN,
+                importKeys,
+                importVals,
+            );
+
+            if (!resolution.qualifiedName) continue;
+
+            // Find the resolved target node in the graph buffer
+            const resolvedNode = graphBuffer.findNodeByQN(resolution.qualifiedName);
+            if (!resolvedNode || resolvedNode.id === sourceNode.id) continue;
+
+            // Create CALLS edge with cross-file metadata
+            graphBuffer.insertEdge(sourceNode.id, resolvedNode.id, 'CALLS', {
+                crossFile: true,
+                importedName,
+                strategy: resolution.strategy,
+                confidence: resolution.confidence,
+                sourceFile: sourceNode.filePath,
+                targetFile: resolvedNode.filePath,
+            });
+            count++;
         }
 
-        console.log(`[GraphIndex] Resolved ${count} cross-file calls for project '${project}'`);
+        console.log(`[GraphIndex] Resolved ${count} cross-file calls for project '${project}' via registry`);
         return count;
+    }
+
+    /** Compute module QN from project and file path. */
+    private computeModuleQN(project: string, filePath: string): string {
+        // Strip extension and convert / to .
+        const noExt = filePath.replace(/\.[^.]+$/, '');
+        const parts = noExt.split('/').filter(Boolean);
+        // Drop __init__ and index
+        const filtered = parts.filter((p) => p !== '__init__' && p !== 'index');
+        return [project, ...filtered].join('.');
     }
 
     private langToExts(lang: string): string[] {
