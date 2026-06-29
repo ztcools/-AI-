@@ -1,6 +1,8 @@
 import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { execSync } from 'child_process';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
 import { getRepoIdentity } from '../utils/git-identity';
@@ -50,6 +52,37 @@ export class FileSynchronizer {
     }
 
     private async generateFileHashes(dir: string): Promise<Map<string, string>> {
+        const fileHashes = new Map<string, string>();
+
+        // Try git ls-files first — respects .gitignore and is much faster
+        let files: string[] = [];
+        try {
+            const extPatterns = this.supportedExtensions.map((e) => `"*${e}"`).join(' ');
+            const output = execSync(
+                `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`,
+                { encoding: 'utf-8', timeout: 10_000, maxBuffer: 10 * 1024 * 1024 }
+            );
+            files = output.trim().split('\n').filter(Boolean).map(f => path.join(dir, f));
+        } catch {
+            // Fallback: filesystem walk
+            return await this.generateFileHashesFromFS(dir);
+        }
+
+        for (const fullPath of files) {
+            if (!fsSync.existsSync(fullPath)) continue;
+            const relativePath = path.relative(this.rootDir, fullPath).replace(/\\/g, '/');
+            if (this.shouldIgnore(relativePath)) continue;
+            try {
+                const hash = await this.hashFile(fullPath);
+                fileHashes.set(relativePath, hash);
+            } catch (error: any) {
+                console.warn(`[Synchronizer] Cannot hash file ${relativePath}: ${error.message}`);
+            }
+        }
+        return fileHashes;
+    }
+
+    private async generateFileHashesFromFS(dir: string): Promise<Map<string, string>> {
         const fileHashes = new Map<string, string>();
 
         let entries;
