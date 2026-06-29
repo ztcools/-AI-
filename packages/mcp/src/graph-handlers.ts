@@ -500,67 +500,23 @@ export class GraphToolHandlers {
         lines.push('');
 
         try {
-            // Find the repo path by looking up the project in the graph
-            const nodes = this.store.findNodes({ project, limit: 1 });
-            if (nodes.results.length === 0) {
-                return { content: [{ type: 'text', text: `Project '${project}' not found in graph index.` }] };
-            }
-
-            // Try to find the repo on disk
-            const repoPath = this.findRepoPath(project);
-            if (!repoPath) {
+            // Use structured detectChangedFiles to avoid code duplication
+            const detectResult = this.detectChangedFiles({ project, baseBranch });
+            if (!detectResult) {
+                const nodes = this.store.findNodes({ project, limit: 1 });
+                if (nodes.results.length === 0) {
+                    return { content: [{ type: 'text', text: `Project '${project}' not found in graph index.` }] };
+                }
                 lines.push('Repository not found on disk. Use index_repository to re-index.');
                 return { content: [{ type: 'text', text: lines.join('\n') }] };
             }
 
-            // Try to detect default branch from git remote
-            let getDiffBranch = baseBranch;
-            if (!args.base_branch) {
-                try {
-                    const refHead = execSync('git symbolic-ref refs/remotes/origin/HEAD', {
-                        cwd: repoPath, encoding: 'utf-8', timeout: 5000,
-                    }).trim();
-                    // Extract branch name from e.g. "refs/remotes/origin/main"
-                    const detected = refHead.split('/').pop() || 'main';
-                    getDiffBranch = detected;
-                    console.log(`[Graph] Detected default branch: ${detected}`);
-                } catch {
-                    // Fall back to checking common branch names
-                    for (const candidate of ['main', 'master', 'develop']) {
-                        try {
-                            execSync(`git rev-parse --verify ${candidate}`, {
-                                cwd: repoPath, encoding: 'utf-8', timeout: 5000,
-                            });
-                            getDiffBranch = candidate;
-                            break;
-                        } catch { /* try next */ }
-                    }
-                }
-            }
+            const { changedFiles, diffBranch: diffBranchUsed } = detectResult;
 
-            // Run git diff to find changed files
-            let diffOutput: string;
-            let diffBranchUsed = getDiffBranch;
-            try {
-                diffOutput = execSync(`git diff --name-only ${getDiffBranch}...HEAD`, {
-                    cwd: repoPath,
-                    encoding: 'utf-8',
-                    timeout: 10000,
-                });
-            } catch (err: any) {
-                console.warn(`[Graph] git diff failed for branch '${getDiffBranch}': ${err.message}`);
-                // Try diff against working tree as fallback
-                diffOutput = execSync('git diff --name-only HEAD', {
-                    cwd: repoPath,
-                    encoding: 'utf-8',
-                    timeout: 10000,
-                });
-                diffBranchUsed = 'HEAD';
-                lines.push(`Warning: Could not diff against '${getDiffBranch}', falling back to uncommitted changes only.`);
+            if (diffBranchUsed === 'HEAD' && diffBranchUsed !== baseBranch) {
+                lines.push(`Warning: Could not diff against '${baseBranch}', falling back to uncommitted changes only.`);
                 lines.push('');
             }
-
-            const changedFiles = diffOutput.trim().split('\n').filter(Boolean);
 
             if (changedFiles.length === 0) {
                 lines.push('No changes detected.');
