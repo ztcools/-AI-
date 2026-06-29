@@ -39,6 +39,7 @@ const IGNORE_DIRS = new Set([
     '.venv', 'vendor', 'target', 'coverage', '.nyc_output', '.cache',
     '.idea', '.vscode', '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp',
     '.tox', '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
+    '.svn', '.hg', 'bower_components', '.terraform', '.parcel-cache',
 ]);
 
 export class GraphToolHandlers {
@@ -110,12 +111,13 @@ export class GraphToolHandlers {
             let nodeCount = 0;
             let edgeCount = 0;
 
-            this.store.beginTransaction();
-
-            // Full mode: clear old project data before re-indexing (inside transaction)
-            // Skip deleteProject when specificFiles is provided to avoid data loss
+            // Full mode: clear old project data in its own transaction first
+            // This is done separately to avoid a single huge transaction spanning
+            // all files, which would lose all progress on crash/interrupt.
             if (mode === 'full' && !specificFiles) {
+                this.store.beginTransaction();
                 this.store.deleteProject(project);
+                this.store.commitTransaction();
                 console.log(`[GraphIndex] Cleared existing graph data for '${project}'`);
             }
 
@@ -125,6 +127,10 @@ export class GraphToolHandlers {
                 if (!lang) continue;
 
                 const relPath = path.relative(repoPath, filePath);
+
+                // Per-file transaction: commit after each file so partial
+                // progress survives crashes/interrupts.
+                this.store.beginTransaction();
 
                 // For incremental indexing, delete old nodes+edges for this file
                 if (specificFiles || mode === 'incremental') {
@@ -160,18 +166,20 @@ export class GraphToolHandlers {
                         edgeCount++;
                     }
                 }
+
+                this.store.commitTransaction();
             }
 
             // ── Cross-file call resolution ────────────────────────
             let crossEdges = 0;
             try {
+                this.store.beginTransaction();
                 crossEdges = this.resolveCrossFileCalls(project);
+                this.store.commitTransaction();
             } catch (err: any) {
                 console.warn(`[GraphIndex] Cross-file call resolution failed for '${project}': ${err.message}`);
             }
             edgeCount += crossEdges;
-
-            this.store.commitTransaction();
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             const stats = this.store.getProjectStats(project);

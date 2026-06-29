@@ -352,12 +352,14 @@ export class ToolHandlers {
         // 1. Run vector indexing (same as handleIndexCodebase)
         const vectorResult = await this.handleIndexCodebase(args);
 
-        // If vector indexing returned an error, skip graph indexing
-        if (vectorResult.isError) {
+        // If vector indexing returned a real error (not "already indexed"), skip graph indexing
+        const vectorText = vectorResult.content[0]?.text || '';
+        const isAlreadyIndexed = vectorResult.isError && vectorText.includes('already indexed');
+        if (vectorResult.isError && !isAlreadyIndexed) {
             return vectorResult;
         }
 
-        // 2. Graph indexing — run in background after response
+        // 2. Graph indexing — always attempt, even if vector indicates "already indexed"
         if (this.graphToolHandlers) {
             const project = getRepoIdentity(absolutePath);
             const stats = this.graphToolHandlers.getStore().getProjectStats(project);
@@ -366,6 +368,7 @@ export class ToolHandlers {
             // Defer graph indexing to background to avoid blocking MCP response
             setImmediate(async () => {
                 try {
+                    let graphResult: { content: Array<{ type: string; text: string }> } | undefined;
                     if (alreadyGraphIndexed && !args.force) {
                         console.log(`[INDEX] Graph already indexed for '${project}' (${stats.nodes} nodes), checking for changes...`);
 
@@ -381,34 +384,46 @@ export class ToolHandlers {
 
                         if (changedFiles.length > 0) {
                             console.log(`[INDEX] Detected ${changedFiles.length} changed files, running incremental graph index`);
-                            await this.graphToolHandlers!.handleIndexRepository({
+                            graphResult = await this.graphToolHandlers!.handleIndexRepository({
                                 repo_path: absolutePath,
                                 mode: 'incremental',
                                 files: changedFiles,
                             });
-                            console.log(`[INDEX] Incremental graph index complete (${changedFiles.length} files)`);
                         } else {
                             console.log(`[INDEX] No changes detected for '${project}', skipping graph indexing`);
                         }
                     } else {
-                        await this.graphToolHandlers!.handleIndexRepository({
+                        graphResult = await this.graphToolHandlers!.handleIndexRepository({
                             repo_path: absolutePath,
                             mode: graphMode,
                         });
-                        console.log(`[INDEX] Graph indexing completed for '${project}'`);
+                    }
+
+                    // Check for errors in the returned content (handleIndexRepository
+                    // returns errors as text, not by throwing)
+                    if (graphResult) {
+                        const text = graphResult.content[0]?.text || '';
+                        if (text.startsWith('Error')) {
+                            console.error(`[INDEX] Graph indexing error: ${text}`);
+                        } else {
+                            console.log(`[INDEX] Graph indexing completed for '${project}'`);
+                        }
                     }
                 } catch (e: any) {
                     console.warn(`[INDEX] Graph indexing failed (non-fatal): ${e.message}`);
                 }
             });
 
-            const vectorText = vectorResult.content[0]?.text || '';
             const graphNote = alreadyGraphIndexed && !args.force
                 ? `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (checking for changes in background)`
                 : `\n\n[Graph] Indexing in background...`;
+            const responseText = isAlreadyIndexed
+                ? vectorText + graphNote
+                : vectorText + graphNote;
             return {
                 ...vectorResult,
-                content: [{ type: 'text', text: vectorText + graphNote }],
+                isError: false, // Don't block on "already indexed" — graph is still processing
+                content: [{ type: 'text', text: responseText }],
             };
         }
 
