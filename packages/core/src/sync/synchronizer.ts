@@ -57,6 +57,9 @@ export class FileSynchronizer {
         // Try git ls-files first — respects .gitignore and is much faster
         let files: string[] = [];
         try {
+            if (this.supportedExtensions.length === 0) {
+                return fileHashes;
+            }
             const extPatterns = this.supportedExtensions.map((e) => `"*${e}"`).join(' ');
             const output = execSync(
                 `git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`,

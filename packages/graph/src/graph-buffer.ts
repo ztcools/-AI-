@@ -19,8 +19,6 @@ import {
     GraphEdge,
     GraphNodeLabel,
     GraphEdgeType,
-    GraphSearchOptions,
-    GraphSearchResponse,
     GraphSearchResult,
 } from './types';
 
@@ -416,98 +414,6 @@ export class InMemoryGraphBuffer {
         }
         return Array.from(files);
     }
-
-    // ── Search (compatible with GraphStore interface) ─────────────
-
-    /**
-     * Search nodes in the buffer. Supports name regex, label filter,
-     * file pattern, degree filters. Mirrors cbm_store_find_nodes.
-     */
-    findNodes(options: GraphSearchOptions): GraphSearchResponse {
-        let results: GraphNode[] = Array.from(this.nodeByQN.values());
-
-        // Filter by project
-        if (options.project) {
-            results = results.filter((n) => n.project === options.project);
-        }
-
-        // Filter by label
-        if (options.label) {
-            results = results.filter((n) => n.label === options.label);
-        }
-
-        // Filter by name regex
-        if (options.namePattern) {
-            try {
-                const re = new RegExp(options.namePattern, 'i');
-                results = results.filter((n) => re.test(n.name));
-            } catch {
-                // Invalid regex, no results
-                results = [];
-            }
-        }
-
-        // Filter by qualified name regex
-        if (options.qnPattern) {
-            try {
-                const re = new RegExp(options.qnPattern, 'i');
-                results = results.filter((n) => re.test(n.qualifiedName));
-            } catch {
-                results = [];
-            }
-        }
-
-        // Filter by file pattern (glob-style)
-        if (options.filePattern) {
-            const pattern = options.filePattern
-                .replace(/\*/g, '.*')
-                .replace(/\?/g, '.');
-            try {
-                const re = new RegExp(pattern, 'i');
-                results = results.filter((n) => re.test(n.filePath));
-            } catch {
-                results = [];
-            }
-        }
-
-        // Filter by exact file path
-        if (options.exactFilePath) {
-            results = results.filter((n) => n.filePath === options.exactFilePath);
-        }
-
-        // Compute degrees for filtering
-        const degreeFiltered = results.filter((n) => {
-            const inDeg = this.edgesByTargetType.get(makeTgtTypeKey(n.id, 'CALLS'))?.length ?? 0;
-            const outDeg = this.edgesBySourceType.get(makeSrcTypeKey(n.id, 'CALLS'))?.length ?? 0;
-            if (options.minDegree !== undefined && (inDeg + outDeg) < options.minDegree) return false;
-            if (options.maxDegree !== undefined && (inDeg + outDeg) > options.maxDegree) return false;
-            return true;
-        });
-
-        const total = degreeFiltered.length;
-        const offset = options.offset ?? 0;
-        const limit = options.limit ?? 200;
-        const paginated = degreeFiltered.slice(offset, offset + limit);
-
-        const searchResults: GraphSearchResult[] = paginated.map((node) => {
-            const inDeg = this.edgesByTargetType.get(makeTgtTypeKey(node.id, 'CALLS'))?.length ?? 0;
-            const outDeg = this.edgesBySourceType.get(makeSrcTypeKey(node.id, 'CALLS'))?.length ?? 0;
-            return {
-                node,
-                score: 0, // No BM25 in buffer, score computed in SQLite
-                inDegree: inDeg,
-                outDegree: outDeg,
-            };
-        });
-
-        return {
-            results: searchResults,
-            total,
-            hasMore: offset + limit < total,
-        };
-    }
-
-    // ── Batch flush to SQLite ─────────────────────────────────────
 
     /**
      * Flush all buffered nodes and edges to a SQLite store.

@@ -417,9 +417,7 @@ export class ToolHandlers {
             const graphNote = alreadyGraphIndexed && !args.force
                 ? `\n\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (checking for changes in background)`
                 : `\n\n[Graph] Indexing in background...`;
-            const responseText = isAlreadyIndexed
-                ? vectorText + graphNote
-                : vectorText + graphNote;
+            const responseText = vectorText + graphNote;
             return {
                 ...vectorResult,
                 isError: false, // Don't block on "already indexed" — graph is still processing
@@ -430,7 +428,7 @@ export class ToolHandlers {
         return vectorResult;
     }
 
-    public async handleIndexCodebase(args: any) {
+    private async handleIndexCodebase(args: any) {
         const { path: codebasePath = ".", force, splitter, customExtensions, ignorePatterns } = args;
         const forceReindex = force || false;
         const requestedSplitter = splitter || 'ast'; // Default to AST

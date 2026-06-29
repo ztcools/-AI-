@@ -1,8 +1,8 @@
 /**
  * Graph MCP tool handlers. Extends claude-context with knowledge graph
- * capabilities: search_graph, trace_path, query_graph, get_code_snippet,
+ * capabilities: search_graph, trace_path, get_code_snippet,
  * get_graph_schema, get_architecture, detect_changes, list_projects,
- * delete_project, index_status, manage_adr, ingest_traces.
+ * delete_project, index_status.
  *
  * These are internal handlers used by the unified 4-tool interface
  * (index/search/clear/status) in handlers.ts.
@@ -22,11 +22,9 @@ import {
     GraphNode,
     GraphNodeLabel,
     GraphSearchOptions,
-    SearchCodeOptions,
     TraceOptions,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
-const QUERY_GRAPH_MAX_ROWS = 1000;
 
 // Shared directory ignore set for both code and IaC file scanning
 // Keep in sync with core's DEFAULT_IGNORE_PATTERNS in context.ts
@@ -135,9 +133,11 @@ export class GraphToolHandlers {
                     language: lang,
                 });
 
-                // Insert nodes into graph buffer
+                // Insert nodes into graph buffer, mapping by array index (extractor uses
+                // nodes.length as nodeIndex, which is 0-based sequential)
                 const idMap = new Map<number, number>();
-                for (const node of result.nodes) {
+                for (let nodeIndex = 0; nodeIndex < result.nodes.length; nodeIndex++) {
+                    const node = result.nodes[nodeIndex];
                     const realId = graphBuffer.upsertNode(
                         node.label,
                         node.name,
@@ -147,7 +147,7 @@ export class GraphToolHandlers {
                         node.endLine,
                         node.properties,
                     );
-                    idMap.set(idMap.size, realId);
+                    idMap.set(nodeIndex, realId);
                 }
                 nodeCount += result.nodes.length;
 
@@ -421,48 +421,6 @@ export class GraphToolHandlers {
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // ── Tool: search_code_graph (graph-enhanced) ─────────────────
-
-    handleSearchCodeGraph(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
-        const project = args.project as string;
-        const pattern = args.pattern as string;
-        const filePattern = args.file_pattern as string | undefined;
-        const pathFilter = args.path_filter as string | undefined;
-        const mode = (args.mode as string) || 'compact';
-        const context = args.context as number | undefined;
-        const regex = (args.regex as boolean) || false;
-        const limit = (args.limit as number) || 10;
-
-        if (!project || !pattern) {
-            return { content: [{ type: 'text', text: 'Error: "project" and "pattern" are required.' }] };
-        }
-
-        const result = this.searcher.searchCode({
-            project,
-            pattern,
-            filePattern,
-            pathFilter,
-            mode: mode as SearchCodeOptions['mode'],
-            context,
-            regex,
-            limit,
-        });
-
-        const lines: string[] = [];
-        lines.push(`Graph-enhanced search: "${pattern}"`);
-        lines.push(`Total grep matches: ${result.totalGrepMatches}, Enriched results: ${result.totalResults}`);
-        lines.push('');
-
-        for (const r of result.results) {
-            lines.push(`- ${r.node.label}: ${r.node.name}`);
-            lines.push(`  File: ${r.node.filePath}:${r.matchLine}`);
-            lines.push(`  ${r.snippet}`);
-            lines.push('');
-        }
-
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
-    }
-
     // ── Structured change detection (for internal use) ───────────
 
     /** Returns changed files as structured data, avoiding text parsing. */
@@ -649,175 +607,6 @@ export class GraphToolHandlers {
         lines.push(`  Edges: ${stats.edges}`);
         lines.push(`  Node labels: ${schema.nodeLabels.join(', ') || 'none'}`);
         lines.push(`  Edge types: ${schema.edgeTypes.join(', ') || 'none'}`);
-
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
-    }
-
-    // ── Tool: query_graph ────────────────────────────────────────
-
-    handleQueryGraph(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
-        const project = args.project as string;
-        const query = args.query as string;
-
-        if (!project || !query) {
-            return { content: [{ type: 'text', text: 'Error: "project" and "query" are required.' }] };
-        }
-
-        try {
-            const result = this.store.executeQuery(project, query);
-            const lines: string[] = [];
-
-            if (result.rows.length === 0) {
-                lines.push('Query returned no results.');
-            } else {
-                const displayRows = result.rows.slice(0, QUERY_GRAPH_MAX_ROWS);
-                lines.push(`Query results (${displayRows.length} rows${result.rows.length > QUERY_GRAPH_MAX_ROWS ? `, truncated from ${result.rows.length}` : ''}):`);
-                for (const row of displayRows) {
-                    lines.push(`  ${JSON.stringify(row)}`);
-                }
-            }
-
-            return { content: [{ type: 'text', text: lines.join('\n') }] };
-        } catch (error: any) {
-            return { content: [{ type: 'text', text: `Query error: ${error.message}` }] };
-        }
-    }
-
-    // ── Tool: manage_adr ─────────────────────────────────────────
-
-    handleManageAdr(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
-        const action = (args.action as string) || 'list';
-        const project = args.project as string;
-        const title = args.title as string;
-        const content = args.content as string;
-
-        const lines: string[] = [];
-
-        switch (action) {
-            case 'list': {
-                const adrs = this.store.getADRs(project);
-                if (adrs.length === 0) {
-                    lines.push(project ? `No ADRs for project '${project}'.` : 'No ADRs found.');
-                } else {
-                    lines.push(`ADRs (${adrs.length}):`);
-                    for (const adr of adrs) {
-                        lines.push(`  [${adr.id}] ${adr.title} (${adr.status}, ${adr.created})`);
-                    }
-                }
-                break;
-            }
-            case 'create': {
-                if (!project || !title) {
-                    return { content: [{ type: 'text', text: 'Error: "project" and "title" are required for create.' }] };
-                }
-                const id = this.store.createADR({
-                    project,
-                    title,
-                    content: content || '',
-                    status: 'proposed',
-                });
-                lines.push(`ADR created: id=${id}, title="${title}"`);
-                break;
-            }
-            case 'update': {
-                const adrId = args.id as number;
-                const status = args.status as string;
-                if (!adrId) {
-                    return { content: [{ type: 'text', text: 'Error: "id" is required for update.' }] };
-                }
-                this.store.updateADR(adrId, { status, content });
-                lines.push(`ADR ${adrId} updated.`);
-                break;
-            }
-            default:
-                return { content: [{ type: 'text', text: `Unknown action: ${action}. Use "list", "create", or "update".` }] };
-        }
-
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
-    }
-
-    // ── Tool: ingest_traces ─────────────────────────────────────
-
-    handleIngestTraces(args: Record<string, unknown>): { content: Array<{ type: string; text: string }> } {
-        const project = args.project as string;
-        const traces = args.traces as Array<Record<string, unknown>>;
-
-        if (!project || !traces || traces.length === 0) {
-            return { content: [{ type: 'text', text: 'Error: "project" and "traces" are required.' }] };
-        }
-
-        let count = 0;
-        const lines: string[] = [];
-        lines.push(`Ingesting ${traces.length} traces for project '${project}':`);
-
-        this.store.beginTransaction();
-        try {
-            for (const trace of traces) {
-                const sourceService = trace.source_service as string;
-                const targetService = trace.target_service as string;
-                const method = (trace.method as string) || 'HTTP';
-                const path = (trace.path as string) || '/';
-                const statusCode = trace.status_code as number;
-                const durationMs = trace.duration_ms as number;
-
-                if (!sourceService || !targetService) continue;
-
-                // Create service nodes
-                const sourceQN = `${project}.${sourceService}`;
-                const targetQN = `${project}.${targetService}`;
-
-                const sourceId = this.store.upsertNode({
-                    project,
-                    label: 'Resource',
-                    name: sourceService,
-                    qualifiedName: sourceQN,
-                    filePath: `service://${sourceService}`,
-                    startLine: 0,
-                    endLine: 0,
-                    properties: { type: 'service' },
-                });
-
-                const targetId = this.store.upsertNode({
-                    project,
-                    label: 'Resource',
-                    name: targetService,
-                    qualifiedName: targetQN,
-                    filePath: `service://${targetService}`,
-                    startLine: 0,
-                    endLine: 0,
-                    properties: { type: 'service' },
-                });
-
-                // Create CROSS_HTTP_CALLS edge
-                const edgeType = method === 'GRPC' ? 'CROSS_CHANNEL' as const
-                    : method === 'MESSAGE' || method === 'EVENT' ? 'CROSS_ASYNC_CALLS' as const
-                        : 'CROSS_HTTP_CALLS' as const;
-
-                this.store.upsertEdge({
-                    project,
-                    sourceId,
-                    targetId,
-                    type: edgeType,
-                    properties: {
-                        method,
-                        path,
-                        statusCode,
-                        durationMs,
-                        timestamp: trace.timestamp,
-                    },
-                });
-
-                count++;
-                lines.push(`  ${sourceService} --> ${method} ${path} --> ${targetService} (${statusCode || 'n/a'})`);
-            }
-            this.store.commitTransaction();
-        } catch (e: any) {
-            this.store.rollbackTransaction();
-            throw e;
-        }
-
-        lines.push('');
-        lines.push(`Ingested ${count} cross-service traces.`);
 
         return { content: [{ type: 'text', text: lines.join('\n') }] };
     }

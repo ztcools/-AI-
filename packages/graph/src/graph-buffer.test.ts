@@ -238,16 +238,4 @@ describe('InMemoryGraphBuffer', () => {
             assert.strictEqual(node.filePath, firstPath);
         }
     });
-
-    it('should search nodes by name pattern', () => {
-        const gb = new InMemoryGraphBuffer('test');
-        gb.upsertNode('Function', 'authenticate', 'test.auth.authenticate', 'src/auth.ts', 1, 5);
-        gb.upsertNode('Function', 'authorize', 'test.auth.authorize', 'src/auth.ts', 10, 15);
-        gb.upsertNode('Function', 'login', 'test.auth.login', 'src/auth.ts', 20, 25);
-
-        const result = gb.findNodes({ project: 'test', namePattern: 'auth' });
-        assert.strictEqual(result.total, 2);
-        assert.ok(result.results.some((r) => r.node.name === 'authenticate'));
-        assert.ok(result.results.some((r) => r.node.name === 'authorize'));
-    });
 });
