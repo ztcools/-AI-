@@ -1228,6 +1228,15 @@ export class ToolHandlers {
                 lines.push('## Graph Index (SQLite)');
                 lines.push(`  Nodes: ${stats.nodes} | Edges: ${stats.edges}`);
 
+                // Graph indexing progress (if in progress)
+                const graphProgress = this.graphToolHandlers.getIndexingProgress(project);
+                if (graphProgress) {
+                    const pct = graphProgress.total > 0
+                        ? Math.round((graphProgress.current / graphProgress.total) * 100)
+                        : 0;
+                    lines.push(`  Indexing: ${pct}% (${graphProgress.current}/${graphProgress.total} files, ${graphProgress.elapsed.toFixed(1)}s elapsed)`);
+                }
+
                 // Node type breakdown (single aggregate query)
                 const nodeTypeCounts = store.getNodeTypeCounts(project);
                 const typeEntries = Object.entries(nodeTypeCounts);
