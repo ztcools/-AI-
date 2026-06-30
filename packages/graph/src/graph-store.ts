@@ -162,6 +162,11 @@ export class SqliteGraphStore implements GraphStore {
         }
     }
 
+    /** Flush the WAL to the main database file and release space. */
+    checkpoint(): void {
+        this.db.pragma('wal_checkpoint(TRUNCATE)');
+    }
+
     // ── Node operations ──────────────────────────────────────────
 
     upsertNode(node: Omit<GraphNode, 'id'>): number {

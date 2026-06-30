@@ -77,8 +77,9 @@ class ContextMcpServer {
         this.graphToolHandlers = new GraphToolHandlers();
         this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, this.graphToolHandlers);
 
-        // Load existing codebase snapshot on startup
-        this.snapshotManager.loadCodebaseSnapshot();
+        // Load existing codebase snapshot on startup (fire-and-forget in constructor,
+        // will be fully loaded before server starts handling requests)
+        void this.snapshotManager.loadCodebaseSnapshot();
 
         this.setupTools();
     }

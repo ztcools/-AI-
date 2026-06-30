@@ -153,6 +153,7 @@ export interface GraphStore {
     // Lifecycle
     initialize(): void;
     close(): void;
+    checkpoint(): void;
 
     // Node operations
     upsertNode(node: Omit<GraphNode, 'id'>): number;

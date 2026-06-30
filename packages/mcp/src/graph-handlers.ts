@@ -10,7 +10,6 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
-import * as fsPromises from 'fs/promises';
 import { execSync } from 'child_process';
 import {
     SqliteGraphStore,
@@ -126,11 +125,10 @@ export class GraphToolHandlers {
                 if (!lang) continue;
 
                 const relPath = path.relative(repoPath, filePath);
-                // Use async read to avoid blocking the event loop — the vector
-                // index runs concurrently and needs the event loop to process
-                // Milvus/Embedding network callbacks. sync readFileSync would
-                // starve those callbacks for the entire 9000+-file loop.
-                const source = await fsPromises.readFile(filePath, 'utf-8');
+                // Use sync read — we yield the event loop every 100 files so the
+                // vector index's async callbacks still get CPU time. Avoiding
+                // per-file async dispatch saves ~9000 event-loop round-trips.
+                const source = fs.readFileSync(filePath, 'utf-8');
 
                 const result = this.extractor.extract(source, {
                     project,
@@ -166,15 +164,12 @@ export class GraphToolHandlers {
                     }
                 }
 
-                // Update progress (every 10 files)
-                if (i % 10 === 0) {
+                // Update progress (every 100 files)
+                if (i % 100 === 0) {
                     this.indexingProgress.set(project, { total: files.length, current: i + 1, startTime });
-                }
-
-                // Yield the event loop every 50 files so the vector index
-                // (Milvus/Embedding async callbacks) gets CPU time between
-                // batches of CPU-bound tree-sitter parsing.
-                if (i % 50 === 0) {
+                    // Yield the event loop every 100 files — the async readFile
+                    // above already yields naturally, so 100-file spacing is enough
+                    // to let the vector index's network I/O callbacks drain.
                     await new Promise<void>(resolve => setImmediate(resolve));
                 }
             }
@@ -210,7 +205,8 @@ export class GraphToolHandlers {
             console.log(`[GraphIndex] Phase 3: flushing ${nodeCount} nodes, ${edgeCount} edges to SQLite...`);
 
             const isIncremental = !!(specificFiles || mode === 'incremental');
-            const BATCH_SIZE = 1000;
+            // 10K per batch — 100K nodes = 10 yields instead of 100.
+            const BATCH_SIZE = 10000;
 
             if (isIncremental) {
                 const deleteFiles = [...new Set(graphBuffer.getAllFiles())];
@@ -225,61 +221,68 @@ export class GraphToolHandlers {
             const allEdges = graphBuffer.getAllEdges();
             const idMap = new Map<number, number>();
 
-            // Flush nodes in batches, yielding the event loop between batches
-            for (let offset = 0; offset < allNodes.length; offset += BATCH_SIZE) {
-                const batch = allNodes.slice(offset, offset + BATCH_SIZE);
-                this.store.beginTransaction();
-                try {
-                    for (const node of batch) {
-                        const realId = this.store.upsertNode({
-                            project: node.project,
-                            label: node.label,
-                            name: node.name,
-                            qualifiedName: node.qualifiedName,
-                            filePath: node.filePath,
-                            startLine: node.startLine,
-                            endLine: node.endLine,
-                            properties: node.properties,
-                        });
-                        idMap.set(node.id, realId);
-                    }
-                    this.store.commitTransaction();
-                } catch (e) {
-                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
-                    throw e;
+            // Use a single giant transaction for nodes — SQLite journal is
+            // per-connection and batches are an MCP-yield optimisation, not a
+            // correctness constraint. One transaction is 10-50× faster.
+            this.store.beginTransaction();
+            try {
+                for (const node of allNodes) {
+                    const realId = this.store.upsertNode({
+                        project: node.project,
+                        label: node.label,
+                        name: node.name,
+                        qualifiedName: node.qualifiedName,
+                        filePath: node.filePath,
+                        startLine: node.startLine,
+                        endLine: node.endLine,
+                        properties: node.properties,
+                    });
+                    idMap.set(node.id, realId);
                 }
-                // Yield the event loop so the MCP protocol handler can respond
-                // to status/search requests and the vector index can continue.
-                await new Promise<void>(resolve => setImmediate(resolve));
+                this.store.commitTransaction();
+            } catch (e) {
+                try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                throw e;
+            }
+            // Yield once after all nodes are written
+            await new Promise<void>(resolve => setImmediate(resolve));
+
+            // Flush edges in one transaction, yielding between batches
+            let writtenEdges = 0;
+            this.store.beginTransaction();
+            try {
+                for (const edge of allEdges) {
+                    if (writtenEdges > 0 && writtenEdges % BATCH_SIZE === 0) {
+                        this.store.commitTransaction();
+                        await new Promise<void>(resolve => setImmediate(resolve));
+                        this.store.beginTransaction();
+                    }
+                    const realSourceId = idMap.get(edge.sourceId);
+                    const realTargetId = idMap.get(edge.targetId);
+                    if (realSourceId === undefined || realTargetId === undefined) {
+                        continue;
+                    }
+                    this.store.upsertEdge({
+                        project: edge.project,
+                        sourceId: realSourceId,
+                        targetId: realTargetId,
+                        type: edge.type,
+                        properties: edge.properties,
+                    });
+                    writtenEdges++;
+                }
+                this.store.commitTransaction();
+            } catch (e) {
+                try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                throw e;
             }
 
-            // Flush edges in batches, yielding between batches
-            let writtenEdges = 0;
-            for (let offset = 0; offset < allEdges.length; offset += BATCH_SIZE) {
-                const batch = allEdges.slice(offset, offset + BATCH_SIZE);
-                this.store.beginTransaction();
-                try {
-                    for (const edge of batch) {
-                        const realSourceId = idMap.get(edge.sourceId);
-                        const realTargetId = idMap.get(edge.targetId);
-                        if (realSourceId === undefined || realTargetId === undefined) {
-                            continue;
-                        }
-                        this.store.upsertEdge({
-                            project: edge.project,
-                            sourceId: realSourceId,
-                            targetId: realTargetId,
-                            type: edge.type,
-                            properties: edge.properties,
-                        });
-                        writtenEdges++;
-                    }
-                    this.store.commitTransaction();
-                } catch (e) {
-                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
-                    throw e;
-                }
-                await new Promise<void>(resolve => setImmediate(resolve));
+            // ── WAL checkpoint: flush accumulated WAL to the main DB file ──
+            try {
+                this.store.checkpoint();
+                console.log('[GraphIndex] WAL checkpointed after Phase 3 flush');
+            } catch {
+                // Non-critical — the next writer will auto-checkpoint
             }
 
             console.log(`[GraphIndex] Phase 3 done: ${allNodes.length} nodes, ${writtenEdges} edges written`);
@@ -702,6 +705,8 @@ export class GraphToolHandlers {
     /**
      * Resolve cross-file calls using the FunctionRegistry for O(1) lookups.
      * Mirrors codebase-memory-mcp's pass_calls.c resolution strategy.
+     *
+     * Perf: import edges are grouped by source node so each import map is built only ONCE.
      */
     private async resolveCrossFileCallsWithRegistry(
         graphBuffer: InMemoryGraphBuffer,
@@ -712,29 +717,36 @@ export class GraphToolHandlers {
 
         // Find all IMPORTS edges
         const importEdges = graphBuffer.findEdgesByType('IMPORTS');
+        if (importEdges.length === 0) return 0;
 
-        for (let i = 0; i < importEdges.length; i++) {
-            const edge = importEdges[i];
-            const sourceNode = graphBuffer.findNodeById(edge.sourceId);
-            const targetNode = graphBuffer.findNodeById(edge.targetId);
-            if (!sourceNode || !targetNode) continue;
+        // ── Group import edges by source node ─────────────────
+        // Build the import map once per source node, then resolve all edges
+        // for that source using the cached map. Avoids O(n²) rebuild.
+        const bySource = new Map<number, typeof importEdges>();
+        for (const edge of importEdges) {
+            const list = bySource.get(edge.sourceId);
+            if (list) {
+                list.push(edge);
+            } else {
+                bySource.set(edge.sourceId, [edge]);
+            }
+        }
 
-            // The target node is a Module node with importedName in properties
-            const importedName = targetNode.properties.importedName as string;
-            if (!importedName) continue;
+        let processed = 0;
+        for (const [sourceId, edges] of bySource) {
+            const sourceNode = graphBuffer.findNodeById(sourceId);
+            if (!sourceNode) continue;
 
-            // Compute module QN for the source file
             const moduleQN = this.computeModuleQN(project, sourceNode.filePath);
 
-            // Build import map for this file from all IMPORTS edges of the source
+            // Build import map for this source ONCE
             const importMap: Array<{ key: string; val: string }> = [];
-            const sourceImports = graphBuffer.findEdgesBySourceType(sourceNode.id, 'IMPORTS');
+            const sourceImports = graphBuffer.findEdgesBySourceType(sourceId, 'IMPORTS');
             for (const impEdge of sourceImports) {
                 const impTarget = graphBuffer.findNodeById(impEdge.targetId);
                 if (!impTarget) continue;
                 const localName = impTarget.properties.importedName as string;
                 if (!localName) continue;
-                // Resolve the module qn from the import target
                 const impModuleQN = this.computeModuleQN(project, impTarget.filePath);
                 importMap.push({ key: localName, val: impModuleQN });
             }
@@ -742,34 +754,41 @@ export class GraphToolHandlers {
             const importKeys = importMap.map((m) => m.key);
             const importVals = importMap.map((m) => m.val);
 
-            // Resolve using the 4-step strategy chain
-            const resolution = registry.resolve(
-                importedName,
-                moduleQN,
-                importKeys,
-                importVals,
-            );
+            // Resolve all edges for this source node
+            for (const edge of edges) {
+                const targetNode = graphBuffer.findNodeById(edge.targetId);
+                if (!targetNode) continue;
 
-            if (!resolution.qualifiedName) continue;
+                const importedName = targetNode.properties.importedName as string;
+                if (!importedName) continue;
 
-            // Find the resolved target node in the graph buffer
-            const resolvedNode = graphBuffer.findNodeByQN(resolution.qualifiedName);
-            if (!resolvedNode || resolvedNode.id === sourceNode.id) continue;
+                const resolution = registry.resolve(
+                    importedName,
+                    moduleQN,
+                    importKeys,
+                    importVals,
+                );
 
-            // Create CALLS edge with cross-file metadata
-            graphBuffer.insertEdge(sourceNode.id, resolvedNode.id, 'CALLS', {
-                crossFile: true,
-                importedName,
-                strategy: resolution.strategy,
-                confidence: resolution.confidence,
-                sourceFile: sourceNode.filePath,
-                targetFile: resolvedNode.filePath,
-            });
-            count++;
+                if (!resolution.qualifiedName) continue;
 
-            // Yield the event loop every 50 import edges so the MCP protocol
+                const resolvedNode = graphBuffer.findNodeByQN(resolution.qualifiedName);
+                if (!resolvedNode || resolvedNode.id === sourceId) continue;
+
+                graphBuffer.insertEdge(sourceId, resolvedNode.id, 'CALLS', {
+                    crossFile: true,
+                    importedName,
+                    strategy: resolution.strategy,
+                    confidence: resolution.confidence,
+                    sourceFile: sourceNode.filePath,
+                    targetFile: resolvedNode.filePath,
+                });
+                count++;
+            }
+
+            processed += edges.length;
+            // Yield the event loop every 50 source nodes so the MCP protocol
             // handler and vector index can continue running.
-            if (i % 50 === 0) {
+            if (bySource.size > 0 && processed % 50 === 0) {
                 await new Promise<void>(resolve => setImmediate(resolve));
             }
         }
@@ -879,7 +898,7 @@ export class GraphToolHandlers {
         // Try git ls-files first — respects .gitignore and is much faster
         try {
             const extPatterns = extensions.map((e) => `"*${e}"`).join(' ');
-            const output = execSync(`git - C "${dir}" ls - files--cached--others--exclude - standard-- ${extPatterns} `, {
+            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard -- ${extPatterns}`, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,
@@ -929,7 +948,7 @@ export class GraphToolHandlers {
         const results: string[] = [];
 
         try {
-            const output = execSync(`git - C "${dir}" ls - files--cached--others--exclude - standard`, {
+            const output = execSync(`git -C "${dir}" ls-files --cached --others --exclude-standard`, {
                 encoding: 'utf-8',
                 timeout: 10_000,
                 maxBuffer: 10 * 1024 * 1024,

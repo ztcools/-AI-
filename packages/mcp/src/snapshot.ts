@@ -604,7 +604,7 @@ export class SnapshotManager {
         console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath || identity} (identity: ${identity})`);
     }
 
-    public loadCodebaseSnapshot(): void {
+    public async loadCodebaseSnapshot(): Promise<void> {
         this.invalidateSnapshotCache();
         console.log('[SNAPSHOT-DEBUG] Loading codebase snapshot from:', this.snapshotFilePath);
 
@@ -626,7 +626,7 @@ export class SnapshotManager {
             }
 
             // Always save in v2 format after loading (migration)
-            this.saveCodebaseSnapshot();
+            await this.saveCodebaseSnapshot();
 
         } catch (error: any) {
             console.error('[SNAPSHOT-DEBUG] Error loading snapshot:', error);
@@ -634,7 +634,7 @@ export class SnapshotManager {
         }
     }
 
-    private acquireLock(maxRetries = 5, retryInterval = 100): boolean {
+    private async acquireLock(maxRetries = 5, retryInterval = 100): Promise<boolean> {
         const lockPath = this.snapshotFilePath + '.lock';
         for (let i = 0; i < maxRetries; i++) {
             try {
@@ -648,10 +648,8 @@ export class SnapshotManager {
                         continue;
                     }
                 } catch { }
-                // Use synchronous sleep via Atomics.wait for non-blocking CPU
-                const waitBuffer = new SharedArrayBuffer(4);
-                const waitArray = new Int32Array(waitBuffer);
-                Atomics.wait(waitArray, 0, 0, retryInterval);
+                // Async sleep — yield event loop instead of blocking it
+                await new Promise<void>(resolve => setTimeout(resolve, retryInterval));
             }
         }
         return false;
@@ -685,11 +683,11 @@ export class SnapshotManager {
         }
     }
 
-    public saveCodebaseSnapshot(): void {
+    public async saveCodebaseSnapshot(): Promise<void> {
         this.invalidateSnapshotCache();
         console.log('[SNAPSHOT-DEBUG] Saving codebase snapshot to:', this.snapshotFilePath);
 
-        const locked = this.acquireLock();
+        const locked = await this.acquireLock();
         if (!locked) {
             console.warn('[SNAPSHOT-DEBUG] Failed to acquire lock, saving without lock');
         }

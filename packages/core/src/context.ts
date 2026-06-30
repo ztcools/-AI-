@@ -389,7 +389,7 @@ export class Context {
      */
     async indexCodebase(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
         forceReindex: boolean = false,
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
@@ -464,7 +464,7 @@ export class Context {
 
     async reindexByChange(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
         additionalIgnorePatterns: string[] = [],
         additionalSupportedExtensions: string[] = [],
         requestSplitter?: Splitter
@@ -952,6 +952,7 @@ export class Context {
                     if (chunkBuffer.length >= EMBEDDING_BATCH_SIZE) {
                         try {
                             await this.processChunkBuffer(chunkBuffer, signal);
+                            chunkBuffer = []; // Clear on success
                         } catch (error) {
                             // Embedding errors (such as API having no quota) halt the entire indexing process and propagate upwards.
                             if (error instanceof EmbeddingError) {
@@ -962,11 +963,10 @@ export class Context {
                             if (error instanceof Error) {
                                 console.error('[Context] Stack trace:', error.stack);
                             }
-                        } finally {
                             if (chunkBuffer.length > 0) {
                                 console.warn(`[Context] Discarding ${chunkBuffer.length} chunks due to batch processing failure`);
                             }
-                            chunkBuffer = []; // Always clear buffer, even on failure
+                            chunkBuffer = []; // Clear buffer on failure
                         }
                     }
 

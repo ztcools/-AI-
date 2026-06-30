@@ -108,7 +108,7 @@ test("preserves request-level index options when interrupted indexing is loaded 
             requestCustomExtensions: ["astro"],
             requestIgnorePatterns: ["drafts/**"]
         });
-        firstSnapshotManager.saveCodebaseSnapshot();
+        await firstSnapshotManager.saveCodebaseSnapshot();
 
         const secondSnapshotManager = new SnapshotManager();
         secondSnapshotManager.loadCodebaseSnapshot();
