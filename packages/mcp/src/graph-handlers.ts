@@ -203,27 +203,93 @@ export class GraphToolHandlers {
 
             console.log(`[GraphIndex] Phase 2 done: ${crossEdges} cross-file call edges resolved`);
 
-            // Yield before Phase 3 (SQLite flush can be a single large transaction)
+            // Yield before Phase 3
             await new Promise<void>(resolve => setImmediate(resolve));
 
-            // ── Phase 3: Flush to SQLite ──────────────────────────
+            // ── Phase 3: Flush to SQLite (batched) ─────────────────
             console.log(`[GraphIndex] Phase 3: flushing ${nodeCount} nodes, ${edgeCount} edges to SQLite...`);
 
-            // For incremental: delete old nodes for specific files before flushing
-            // For full: delete the entire project
             const isIncremental = !!(specificFiles || mode === 'incremental');
-            const { nodes: writtenNodes, edges: writtenEdges } = graphBuffer.flushToStore(this.store, {
-                clearProject: !isIncremental,
-                deleteFiles: isIncremental ? [...new Set(graphBuffer.getAllFiles())] : undefined,
-            });
-            console.log(`[GraphIndex] Phase 3 done: ${writtenNodes} nodes, ${writtenEdges} edges written`);
+            const BATCH_SIZE = 1000;
+
+            if (isIncremental) {
+                const deleteFiles = [...new Set(graphBuffer.getAllFiles())];
+                for (const filePath of deleteFiles) {
+                    this.store.deleteNodesByFile(project, filePath);
+                }
+            } else {
+                this.store.deleteProject(project);
+            }
+
+            const allNodes = graphBuffer.getAllNodes();
+            const allEdges = graphBuffer.getAllEdges();
+            const idMap = new Map<number, number>();
+
+            // Flush nodes in batches, yielding the event loop between batches
+            for (let offset = 0; offset < allNodes.length; offset += BATCH_SIZE) {
+                const batch = allNodes.slice(offset, offset + BATCH_SIZE);
+                this.store.beginTransaction();
+                try {
+                    for (const node of batch) {
+                        const realId = this.store.upsertNode({
+                            project: node.project,
+                            label: node.label,
+                            name: node.name,
+                            qualifiedName: node.qualifiedName,
+                            filePath: node.filePath,
+                            startLine: node.startLine,
+                            endLine: node.endLine,
+                            properties: node.properties,
+                        });
+                        idMap.set(node.id, realId);
+                    }
+                    this.store.commitTransaction();
+                } catch (e) {
+                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                    throw e;
+                }
+                // Yield the event loop so the MCP protocol handler can respond
+                // to status/search requests and the vector index can continue.
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            // Flush edges in batches, yielding between batches
+            let writtenEdges = 0;
+            for (let offset = 0; offset < allEdges.length; offset += BATCH_SIZE) {
+                const batch = allEdges.slice(offset, offset + BATCH_SIZE);
+                this.store.beginTransaction();
+                try {
+                    for (const edge of batch) {
+                        const realSourceId = idMap.get(edge.sourceId);
+                        const realTargetId = idMap.get(edge.targetId);
+                        if (realSourceId === undefined || realTargetId === undefined) {
+                            continue;
+                        }
+                        this.store.upsertEdge({
+                            project: edge.project,
+                            sourceId: realSourceId,
+                            targetId: realTargetId,
+                            type: edge.type,
+                            properties: edge.properties,
+                        });
+                        writtenEdges++;
+                    }
+                    this.store.commitTransaction();
+                } catch (e) {
+                    try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+                    throw e;
+                }
+                await new Promise<void>(resolve => setImmediate(resolve));
+            }
+
+            console.log(`[GraphIndex] Phase 3 done: ${allNodes.length} nodes, ${writtenEdges} edges written`);
             this.indexingProgress.delete(project);
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
             return {
                 content: [{
                     type: 'text',
-                    text: `Indexed repository '${project}': ${writtenNodes} nodes, ${writtenEdges} edges in ${elapsed}s`,
+                    text: `Indexed repository '${project}': ${allNodes.length} nodes, ${writtenEdges} edges in ${elapsed}s`,
                 }],
             };
         } catch (error: any) {
