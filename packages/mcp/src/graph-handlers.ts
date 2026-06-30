@@ -11,6 +11,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
 import { execSync } from 'child_process';
+import { Worker } from 'worker_threads';
 import {
     SqliteGraphStore,
     InMemoryGraphBuffer,
@@ -23,6 +24,7 @@ import {
     GraphNodeLabel,
     GraphSearchOptions,
     TraceOptions,
+    parseWorkerPath,
 } from '@zilliz/claude-context-graph';
 import { getRepoIdentity } from '@zilliz/claude-context-core';
 
@@ -35,6 +37,21 @@ const IGNORE_DIRS = new Set([
     '.tox', '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
     '.svn', '.hg', 'bower_components', '.terraform', '.parcel-cache',
 ]);
+
+/** Result shape returned by parse-worker.ts via Worker Thread. */
+interface ParseWorkerResult {
+    filePath: string;
+    relPath: string;
+    nodes: Array<{
+        label: string; name: string; qualifiedName: string;
+        filePath: string; startLine: number; endLine: number;
+        properties: Record<string, unknown>;
+    }>;
+    edges: Array<{
+        sourceId: number; targetId: number; type: string;
+        properties: Record<string, unknown>;
+    }>;
+}
 
 export class GraphToolHandlers {
     private store: SqliteGraphStore;
@@ -111,67 +128,56 @@ export class GraphToolHandlers {
                 console.log(`[GraphIndex] Full indexing ${files.length} files for '${project}'`);
             }
 
-            // ── Phase 1: Extract into InMemoryGraphBuffer ─────────
+            // ── Phase 1: Extract into InMemoryGraphBuffer (worker threads) ─
             const graphBuffer = new InMemoryGraphBuffer(project);
             this.indexingProgress.set(project, { total: files.length, current: 0, startTime });
 
             let nodeCount = 0;
             let edgeCount = 0;
 
-            for (let i = 0; i < files.length; i++) {
-                const filePath = files[i];
-                const ext = path.extname(filePath);
-                const lang = GraphExtractor.extToLanguage(ext);
-                if (!lang) continue;
+            if (files.length > 0) {
+                const workerCount = Math.min(os.cpus().length, 8, files.length);
+                const chunkSize = Math.ceil(files.length / workerCount);
+                const workerPromises: Array<Promise<ParseWorkerResult[]>> = [];
 
-                const relPath = path.relative(repoPath, filePath);
-                // Use sync read — we yield the event loop every 100 files so the
-                // vector index's async callbacks still get CPU time. Avoiding
-                // per-file async dispatch saves ~9000 event-loop round-trips.
-                const source = fs.readFileSync(filePath, 'utf-8');
-
-                const result = this.extractor.extract(source, {
-                    project,
-                    filePath: relPath,
-                    language: lang,
-                });
-
-                // Insert nodes into graph buffer, mapping by array index (extractor uses
-                // nodes.length as nodeIndex, which is 0-based sequential)
-                const idMap = new Map<number, number>();
-                for (let nodeIndex = 0; nodeIndex < result.nodes.length; nodeIndex++) {
-                    const node = result.nodes[nodeIndex];
-                    const realId = graphBuffer.upsertNode(
-                        node.label,
-                        node.name,
-                        node.qualifiedName,
-                        node.filePath,
-                        node.startLine,
-                        node.endLine,
-                        node.properties,
-                    );
-                    idMap.set(nodeIndex, realId);
+                for (let w = 0; w < workerCount; w++) {
+                    const chunk = files.slice(w * chunkSize, (w + 1) * chunkSize);
+                    if (chunk.length === 0) continue;
+                    workerPromises.push(this.runParseWorker(chunk, repoPath, project));
                 }
-                nodeCount += result.nodes.length;
 
-                // Insert edges into graph buffer
-                for (const edge of result.edges) {
-                    const sourceId = idMap.get(edge.sourceId);
-                    const targetId = idMap.get(edge.targetId);
-                    if (sourceId !== undefined && targetId !== undefined) {
-                        graphBuffer.insertEdge(sourceId, targetId, edge.type, edge.properties);
-                        edgeCount++;
+                const allResults = await Promise.all(workerPromises);
+
+                for (const results of allResults) {
+                    for (const fileResult of results) {
+                        const idMap = new Map<number, number>();
+                        for (let nodeIndex = 0; nodeIndex < fileResult.nodes.length; nodeIndex++) {
+                            const node = fileResult.nodes[nodeIndex];
+                            const realId = graphBuffer.upsertNode(
+                                node.label as GraphNodeLabel,
+                                node.name,
+                                node.qualifiedName,
+                                node.filePath,
+                                node.startLine,
+                                node.endLine,
+                                node.properties,
+                            );
+                            idMap.set(nodeIndex, realId);
+                        }
+                        nodeCount += fileResult.nodes.length;
+
+                        for (const edge of fileResult.edges) {
+                            const sourceId = idMap.get(edge.sourceId);
+                            const targetId = idMap.get(edge.targetId);
+                            if (sourceId !== undefined && targetId !== undefined) {
+                                graphBuffer.insertEdge(sourceId, targetId, edge.type as any, edge.properties);
+                                edgeCount++;
+                            }
+                        }
                     }
                 }
 
-                // Update progress (every 100 files)
-                if (i % 100 === 0) {
-                    this.indexingProgress.set(project, { total: files.length, current: i + 1, startTime });
-                    // Yield the event loop every 100 files — the async readFile
-                    // above already yields naturally, so 100-file spacing is enough
-                    // to let the vector index's network I/O callbacks drain.
-                    await new Promise<void>(resolve => setImmediate(resolve));
-                }
+                this.indexingProgress.set(project, { total: files.length, current: files.length, startTime });
             }
 
             console.log(`[GraphIndex] Phase 1 done: ${nodeCount} nodes, ${edgeCount} intra-file edges for '${project}'`);
@@ -805,6 +811,38 @@ export class GraphToolHandlers {
         // Drop __init__ and index
         const filtered = parts.filter((p) => p !== '__init__' && p !== 'index');
         return [project, ...filtered].join('.');
+    }
+
+    /**
+     * Spawn a Worker Thread to parse a chunk of files in parallel.
+     * Each worker runs tree-sitter independently — the main thread's
+     * event loop stays free for the vector index's async I/O.
+     */
+    private runParseWorker(
+        filePaths: string[],
+        repoPath: string,
+        project: string,
+    ): Promise<ParseWorkerResult[]> {
+        return new Promise((resolve, reject) => {
+            const worker = new Worker(parseWorkerPath);
+            worker.on('message', (results: ParseWorkerResult[]) => {
+                resolve(results);
+                void worker.terminate();
+            });
+            worker.on('error', (err) => {
+                reject(err);
+                void worker.terminate();
+            });
+            worker.on('exit', (code) => {
+                if (code !== 0) {
+                    reject(new Error(`Parse worker stopped with exit code ${code}`));
+                }
+            });
+            worker.postMessage({
+                files: filePaths.map(f => ({ filePath: f, project })),
+                repoPath,
+            });
+        });
     }
 
     private langToExts(lang: string): string[] {
