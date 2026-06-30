@@ -181,6 +181,11 @@ export class GraphToolHandlers {
 
             console.log(`[GraphIndex] Phase 1 done: ${nodeCount} nodes, ${edgeCount} intra-file edges for '${project}'`);
 
+            // Yield the event loop before Phase 2 so the MCP protocol handler
+            // can respond to status/search requests and the vector index can
+            // continue its async callbacks.
+            await new Promise<void>(resolve => setImmediate(resolve));
+
             // ── Phase 2: Build FunctionRegistry & resolve cross-file calls ──
             const registry = new FunctionRegistry();
             graphBuffer.forEachNode((node: GraphNode) => {
@@ -197,6 +202,9 @@ export class GraphToolHandlers {
             edgeCount += crossEdges;
 
             console.log(`[GraphIndex] Phase 2 done: ${crossEdges} cross-file call edges resolved`);
+
+            // Yield before Phase 3 (SQLite flush can be a single large transaction)
+            await new Promise<void>(resolve => setImmediate(resolve));
 
             // ── Phase 3: Flush to SQLite ──────────────────────────
             console.log(`[GraphIndex] Phase 3: flushing ${nodeCount} nodes, ${edgeCount} edges to SQLite...`);

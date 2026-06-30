@@ -246,7 +246,7 @@ export class GraphExtractor {
 
             return { nodes, edges };
         } catch (error) {
-            console.warn(`[GraphExtractor] Failed to parse ${ctx.filePath}:`, error);
+            console.debug(`[GraphExtractor] Failed to parse ${ctx.filePath}:`, error);
             return { nodes: [], edges: [] };
         }
     }
