@@ -10,6 +10,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import { execSync } from 'child_process';
 import {
     SqliteGraphStore,
@@ -125,7 +126,11 @@ export class GraphToolHandlers {
                 if (!lang) continue;
 
                 const relPath = path.relative(repoPath, filePath);
-                const source = fs.readFileSync(filePath, 'utf-8');
+                // Use async read to avoid blocking the event loop — the vector
+                // index runs concurrently and needs the event loop to process
+                // Milvus/Embedding network callbacks. sync readFileSync would
+                // starve those callbacks for the entire 9000+-file loop.
+                const source = await fsPromises.readFile(filePath, 'utf-8');
 
                 const result = this.extractor.extract(source, {
                     project,
@@ -164,6 +169,13 @@ export class GraphToolHandlers {
                 // Update progress (every 10 files)
                 if (i % 10 === 0) {
                     this.indexingProgress.set(project, { total: files.length, current: i + 1, startTime });
+                }
+
+                // Yield the event loop every 50 files so the vector index
+                // (Milvus/Embedding async callbacks) gets CPU time between
+                // batches of CPU-bound tree-sitter parsing.
+                if (i % 50 === 0) {
+                    await new Promise<void>(resolve => setImmediate(resolve));
                 }
             }
 
