@@ -169,6 +169,7 @@ export interface GraphStore {
     getEdgesBySource(sourceId: number, type?: GraphEdgeType): GraphEdge[];
     getEdgesBySourceBatch(sourceIds: number[]): Map<number, GraphEdge[]>;
     getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[];
+    getEdgesByTargetBatch(targetIds: number[], type?: GraphEdgeType): Map<number, GraphEdge[]>;
     findEdges(project: string, types?: GraphEdgeType[], limit?: number): GraphEdge[];
 
     // Project operations

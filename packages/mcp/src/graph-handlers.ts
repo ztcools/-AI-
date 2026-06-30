@@ -739,10 +739,10 @@ export class GraphToolHandlers {
 
             const moduleQN = this.computeModuleQN(project, sourceNode.filePath);
 
-            // Build import map for this source ONCE
+            // Build import map for this source ONCE — reuse `edges` from bySource
+            // grouping instead of calling findEdgesBySourceType again (redundant query).
             const importMap: Array<{ key: string; val: string }> = [];
-            const sourceImports = graphBuffer.findEdgesBySourceType(sourceId, 'IMPORTS');
-            for (const impEdge of sourceImports) {
+            for (const impEdge of edges) {
                 const impTarget = graphBuffer.findNodeById(impEdge.targetId);
                 if (!impTarget) continue;
                 const localName = impTarget.properties.importedName as string;

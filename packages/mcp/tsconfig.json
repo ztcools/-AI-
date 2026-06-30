@@ -27,6 +27,9 @@
     "references": [
         {
             "path": "../core"
+        },
+        {
+            "path": "../graph"
         }
     ]
 }

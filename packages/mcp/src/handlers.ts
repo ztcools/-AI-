@@ -168,6 +168,74 @@ export class ToolHandlers {
      * - If local snapshot has extra directories (not in cloud), remove them
      * - If local snapshot is missing directories (exist in cloud), ignore them
      */
+
+    /**
+     * Extract the codebase path from a single collection. Tries description first,
+     * falls back to querying metadata. Returns null if extraction fails.
+     * Designed for parallel execution — catches all errors internally.
+     */
+    private async extractCodebaseFromCollection(
+        collectionName: string,
+        vectorDb: any,
+    ): Promise<{ codebasePath: string } | null> {
+        try {
+            console.log(`[SYNC-CLOUD] 🔍 Checking collection: ${collectionName}`);
+
+            // Try to extract codebasePath from collection description first (new format)
+            try {
+                const description = await vectorDb.getCollectionDescription(collectionName);
+                if (description && description.startsWith('codebasePath:')) {
+                    const codebasePath = description.substring('codebasePath:'.length);
+                    if (codebasePath.length > 0) {
+                        console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
+                        return { codebasePath };
+                    }
+                }
+            } catch (descError: any) {
+                console.warn(`[SYNC-CLOUD] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);
+            }
+
+            // Fallback: query document metadata for old collections without new description format
+            console.log(`[SYNC-CLOUD] 🔄 Falling back to query-based extraction for collection: ${collectionName}`);
+            try {
+                const results = await vectorDb.query(
+                    collectionName,
+                    undefined,
+                    ['metadata'],
+                    1
+                );
+
+                if (results && results.length > 0) {
+                    const firstResult = results[0];
+                    const metadataStr = firstResult.metadata;
+
+                    if (metadataStr) {
+                        const metadata = JSON.parse(metadataStr);
+                        const codebasePath = metadata.codebasePath;
+
+                        if (codebasePath && typeof codebasePath === 'string') {
+                            console.log(`[SYNC-CLOUD] 📍 Found codebase path from query: ${codebasePath} in collection: ${collectionName}`);
+                            return { codebasePath };
+                        } else {
+                            console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
+                        }
+                    } else {
+                        console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
+                    }
+                } else {
+                    console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
+                }
+            } catch (queryError: any) {
+                console.warn(`[SYNC-CLOUD] ⚠️  Fallback query failed for collection ${collectionName}:`, queryError.message || queryError);
+            }
+
+            return null;
+        } catch (collectionError: any) {
+            console.warn(`[SYNC-CLOUD] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
+            return null;
+        }
+    }
+
     private async syncIndexedCodebasesFromCloud(): Promise<void> {
         const now = Date.now();
         if (now - this.lastCloudSyncMs < ToolHandlers.CLOUD_SYNC_THROTTLE_MS) {
@@ -196,74 +264,33 @@ export class ToolHandlers {
             let codeCollectionsChecked = 0;
             let successfulExtractions = 0;
 
-            // Check each collection for codebase path
-            for (const collectionName of collections) {
-                try {
-                    // Skip collections that don't match the code_chunks pattern (support both legacy and new collections)
-                    if (!collectionName.startsWith('code_chunks_') && !collectionName.startsWith('hybrid_code_chunks_')) {
-                        console.log(`[SYNC-CLOUD] ⏭️  Skipping non-code collection: ${collectionName}`);
-                        continue;
-                    }
+            // Filter to code collections first
+            const codeCollections = collections.filter(
+                (c) => c.startsWith('code_chunks_') || c.startsWith('hybrid_code_chunks_')
+            );
 
-                    codeCollectionsChecked++;
-                    console.log(`[SYNC-CLOUD] 🔍 Checking collection: ${collectionName}`);
+            if (codeCollections.length === 0) {
+                console.log(`[SYNC-CLOUD] ✅ No code collections found in cloud.`);
+                return;
+            }
 
-                    // Try to extract codebasePath from collection description first (new format)
-                    let extracted = false;
-                    try {
-                        const description = await vectorDb.getCollectionDescription(collectionName);
-                        if (description && description.startsWith('codebasePath:')) {
-                            const codebasePath = description.substring('codebasePath:'.length);
-                            if (codebasePath.length > 0) {
-                                console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
-                                cloudCodebases.add(codebasePath);
-                                successfulExtractions++;
-                                extracted = true;
-                            }
-                        }
-                    } catch (descError: any) {
-                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);
-                    }
+            // Parallel extraction with concurrency limit (avoids overwhelming the API)
+            const CONCURRENCY = 5;
+            const results: Array<{ codebasePath: string } | null> = [];
 
-                    // Fallback: query document metadata for old collections without new description format
-                    if (!extracted) {
-                        console.log(`[SYNC-CLOUD] 🔄 Falling back to query-based extraction for collection: ${collectionName}`);
-                        try {
-                            const results = await vectorDb.query(
-                                collectionName,
-                                undefined,
-                                ['metadata'],
-                                1
-                            );
+            for (let i = 0; i < codeCollections.length; i += CONCURRENCY) {
+                const batch = codeCollections.slice(i, i + CONCURRENCY);
+                const batchResults = await Promise.all(
+                    batch.map((collectionName) => this.extractCodebaseFromCollection(collectionName, vectorDb))
+                );
+                results.push(...batchResults);
+            }
 
-                            if (results && results.length > 0) {
-                                const firstResult = results[0];
-                                const metadataStr = firstResult.metadata;
-
-                                if (metadataStr) {
-                                    const metadata = JSON.parse(metadataStr);
-                                    const codebasePath = metadata.codebasePath;
-
-                                    if (codebasePath && typeof codebasePath === 'string') {
-                                        console.log(`[SYNC-CLOUD] 📍 Found codebase path from query: ${codebasePath} in collection: ${collectionName}`);
-                                        cloudCodebases.add(codebasePath);
-                                        successfulExtractions++;
-                                    } else {
-                                        console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
-                                    }
-                                } else {
-                                    console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
-                                }
-                            } else {
-                                console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
-                            }
-                        } catch (queryError: any) {
-                            console.warn(`[SYNC-CLOUD] ⚠️  Fallback query failed for collection ${collectionName}:`, queryError.message || queryError);
-                        }
-                    }
-                } catch (collectionError: any) {
-                    console.warn(`[SYNC-CLOUD] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
-                    // Continue with next collection
+            for (const r of results) {
+                codeCollectionsChecked++;
+                if (r) {
+                    cloudCodebases.add(r.codebasePath);
+                    successfulExtractions++;
                 }
             }
 
@@ -1480,15 +1507,14 @@ export class ToolHandlers {
             }
         }
 
-        // Batch-collect all edges in one pass per direction
-        const allCallerEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
-        const allCalleeEdges = new Map<number, Array<{ sourceId: number; targetId: number; type: string }>>();
+        // Batch-collect all edges in one pass using batch queries
+        const nodeIdsArr = fileNodes.map(f => f.node.id);
+        const allCallerEdges = store.getEdgesByTargetBatch(nodeIdsArr, 'CALLS');
+        const allCalleeEdges = store.getEdgesBySourceBatch(nodeIdsArr);
 
         for (const { node } of fileNodes) {
-            allCallerEdges.set(node.id, store.getEdgesByTarget(node.id, 'CALLS'));
-            allCalleeEdges.set(node.id, store.getEdgesBySource(node.id, 'CALLS'));
-            for (const e of allCallerEdges.get(node.id)!) allNodeIds.add(e.sourceId);
-            for (const e of allCalleeEdges.get(node.id)!) allNodeIds.add(e.targetId);
+            for (const e of allCallerEdges.get(node.id) || []) allNodeIds.add(e.sourceId);
+            for (const e of allCalleeEdges.get(node.id) || []) allNodeIds.add(e.targetId);
         }
 
         // Single batch lookup for all referenced nodes

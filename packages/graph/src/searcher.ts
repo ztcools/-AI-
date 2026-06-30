@@ -52,10 +52,11 @@ export class GraphSearcher {
             limit = 10,
         } = options;
 
-        // 1. Find candidate files from the graph
+        // 1. Find candidate files from the graph, capped to avoid excessive I/O
+        const MAX_CANDIDATE_FILES = 500;
         const fileOptions: GraphSearchOptions = {
             project,
-            limit: 10000,
+            limit: MAX_CANDIDATE_FILES,
         };
         if (filePattern) {
             fileOptions.filePattern = filePattern;
@@ -67,21 +68,27 @@ export class GraphSearcher {
             uniqueFiles.add(r.node.filePath);
         }
 
-        // 2. Grep through files
+        // 2. Grep through files with early termination
+        const searchRegex = regex ? new RegExp(pattern, 'g') : new RegExp(escapeRegex(pattern), 'gi');
         const matches: Array<{ filePath: string; line: number; content: string }> = [];
+        // Collect enough raw matches to produce `limit` enriched results (each enriched
+        // result may collapse multiple raw matches, so collect limit * 3 as headroom).
+        const maxRawMatches = limit * 3;
+
         for (const filePath of uniqueFiles) {
             if (pathFilter && !new RegExp(pathFilter).test(filePath)) continue;
+            if (matches.length >= maxRawMatches) break; // Early termination
 
             try {
                 const content = fs.readFileSync(filePath, 'utf-8');
                 const lines = content.split('\n');
-                const searchRegex = regex ? new RegExp(pattern, 'g') : new RegExp(escapeRegex(pattern), 'gi');
 
                 for (let i = 0; i < lines.length; i++) {
                     // Reset lastIndex — g flag requires it for new strings per ECMAScript
                     searchRegex.lastIndex = 0;
                     if (searchRegex.test(lines[i])) {
                         matches.push({ filePath, line: i + 1, content: lines[i].trim() });
+                        if (matches.length >= maxRawMatches) break;
                     }
                 }
             } catch {

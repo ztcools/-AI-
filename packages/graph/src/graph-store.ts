@@ -95,6 +95,7 @@ export class SqliteGraphStore implements GraphStore {
     private deleteEdgesByFileStmt!: Database.Statement;
     private deleteProjectNodesStmt!: Database.Statement;
     private deleteProjectEdgesStmt!: Database.Statement;
+    private deleteNodesByFilePathStmt!: Database.Statement;
     private updateNodeFileStmt!: Database.Statement;
     private deleteNodeEdgesStmt!: Database.Statement;
 
@@ -134,13 +135,19 @@ export class SqliteGraphStore implements GraphStore {
             'SELECT id FROM nodes WHERE project = ? AND file_path = ?'
         );
         this.deleteEdgesByFileStmt = this.db.prepare(
-            'DELETE FROM edges WHERE project = ? AND source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)'
+            `DELETE FROM edges WHERE project = ? AND (
+                source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
+                OR target_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
+            )`
         );
         this.deleteProjectNodesStmt = this.db.prepare(
             'DELETE FROM nodes WHERE project = ?'
         );
         this.deleteProjectEdgesStmt = this.db.prepare(
             'DELETE FROM edges WHERE project = ?'
+        );
+        this.deleteNodesByFilePathStmt = this.db.prepare(
+            'DELETE FROM nodes WHERE project = ? AND file_path = ?'
         );
         this.updateNodeFileStmt = this.db.prepare(
             'UPDATE nodes SET file_path = ? WHERE project = ? AND qualified_name = ?'
@@ -357,25 +364,23 @@ export class SqliteGraphStore implements GraphStore {
         // Initialize all nodes with 0 degrees
         for (const id of nodeIds) degreeMap.set(id, { inDegree: 0, outDegree: 0 });
 
-        // Batch out-degree: one query per edge direction
-        const inRows = this.db.prepare(`
-            SELECT target_id as id, COUNT(*) as cnt FROM edges
-            WHERE target_id IN (${nodeIds.map(() => '?').join(',')})
+        const placeholders = nodeIds.map(() => '?').join(',');
+        // Single UNION ALL query instead of two separate queries
+        const rows = this.db.prepare(`
+            SELECT target_id as id, COUNT(*) as in_deg, 0 as out_deg FROM edges
+            WHERE target_id IN (${placeholders})
             GROUP BY target_id
-        `).all(...nodeIds) as Array<{ id: number; cnt: number }>;
-        for (const row of inRows) {
-            const entry = degreeMap.get(row.id);
-            if (entry) entry.inDegree = row.cnt;
-        }
-
-        const outRows = this.db.prepare(`
-            SELECT source_id as id, COUNT(*) as cnt FROM edges
-            WHERE source_id IN (${nodeIds.map(() => '?').join(',')})
+            UNION ALL
+            SELECT source_id as id, 0 as in_deg, COUNT(*) as out_deg FROM edges
+            WHERE source_id IN (${placeholders})
             GROUP BY source_id
-        `).all(...nodeIds) as Array<{ id: number; cnt: number }>;
-        for (const row of outRows) {
+        `).all(...nodeIds, ...nodeIds) as Array<{ id: number; in_deg: number; out_deg: number }>;
+        for (const row of rows) {
             const entry = degreeMap.get(row.id);
-            if (entry) entry.outDegree = row.cnt;
+            if (entry) {
+                entry.inDegree += row.in_deg;
+                entry.outDegree += row.out_deg;
+            }
         }
 
         return degreeMap;
@@ -433,6 +438,29 @@ export class SqliteGraphStore implements GraphStore {
         return resultMap;
     }
 
+    getEdgesByTargetBatch(targetIds: number[], type?: GraphEdgeType): Map<number, GraphEdge[]> {
+        const resultMap = new Map<number, GraphEdge[]>();
+        if (targetIds.length === 0) return resultMap;
+
+        for (const id of targetIds) resultMap.set(id, []);
+
+        const placeholders = targetIds.map(() => '?').join(',');
+        let query = `SELECT * FROM edges WHERE target_id IN (${placeholders})`;
+        const params: unknown[] = [...targetIds];
+        if (type) {
+            query += ' AND type = ?';
+            params.push(type);
+        }
+        const rows = this.db.prepare(query).all(...params) as Array<Record<string, unknown>>;
+
+        for (const row of rows) {
+            const edge = this.rowToEdge(row);
+            const list = resultMap.get(edge.targetId);
+            if (list) list.push(edge);
+        }
+        return resultMap;
+    }
+
     getEdgesByTarget(targetId: number, type?: GraphEdgeType): GraphEdge[] {
         let query = 'SELECT * FROM edges WHERE target_id = ?';
         const params: unknown[] = [targetId];
@@ -485,14 +513,9 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     deleteNodesByFile(project: string, filePath: string): void {
-        // Delete edges connected to nodes in this file first
-        this.db.prepare(`
-            DELETE FROM edges WHERE project = ? AND (
-                source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
-                OR target_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)
-            )
-        `).run(project, project, filePath, project, filePath);
-        this.db.prepare('DELETE FROM nodes WHERE project = ? AND file_path = ?').run(project, filePath);
+        // Delete edges connected to nodes in this file first (bidirectional: source + target)
+        this.deleteEdgesByFileStmt.run(project, project, filePath, project, filePath);
+        this.deleteNodesByFilePathStmt.run(project, filePath);
     }
 
     // ── Batch operations ─────────────────────────────────────────
