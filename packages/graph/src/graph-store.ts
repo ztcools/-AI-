@@ -87,6 +87,16 @@ END;
 export class SqliteGraphStore implements GraphStore {
     private db: Database.Database;
     private dbPath: string;
+    /** Cached prepared statements to avoid re-compiling SQL on every call. */
+    private upsertNodeStmt!: Database.Statement;
+    private upsertEdgeSelectStmt!: Database.Statement;
+    private upsertEdgeInsertStmt!: Database.Statement;
+    private deleteNodesByFileStmt!: Database.Statement;
+    private deleteEdgesByFileStmt!: Database.Statement;
+    private deleteProjectNodesStmt!: Database.Statement;
+    private deleteProjectEdgesStmt!: Database.Statement;
+    private updateNodeFileStmt!: Database.Statement;
+    private deleteNodeEdgesStmt!: Database.Statement;
 
     constructor(dbPath?: string) {
         if (dbPath) {
@@ -97,6 +107,47 @@ export class SqliteGraphStore implements GraphStore {
             this.dbPath = path.join(graphDir, 'knowledge-graph.db');
         }
         this.db = new Database(this.dbPath);
+        this._prepareStatements();
+    }
+
+    /** Pre-compile all hot-path statements once. */
+    private _prepareStatements(): void {
+        this.upsertNodeStmt = this.db.prepare(`
+            INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(project, qualified_name) DO UPDATE SET
+                label = excluded.label,
+                name = excluded.name,
+                file_path = excluded.file_path,
+                start_line = excluded.start_line,
+                end_line = excluded.end_line,
+                properties_json = excluded.properties_json
+        `);
+        this.upsertEdgeSelectStmt = this.db.prepare(
+            'SELECT id FROM edges WHERE project = ? AND source_id = ? AND target_id = ? AND type = ?'
+        );
+        this.upsertEdgeInsertStmt = this.db.prepare(`
+            INSERT INTO edges (project, source_id, target_id, type, properties_json)
+            VALUES (?, ?, ?, ?, ?)
+        `);
+        this.deleteNodesByFileStmt = this.db.prepare(
+            'SELECT id FROM nodes WHERE project = ? AND file_path = ?'
+        );
+        this.deleteEdgesByFileStmt = this.db.prepare(
+            'DELETE FROM edges WHERE project = ? AND source_id IN (SELECT id FROM nodes WHERE project = ? AND file_path = ?)'
+        );
+        this.deleteProjectNodesStmt = this.db.prepare(
+            'DELETE FROM nodes WHERE project = ?'
+        );
+        this.deleteProjectEdgesStmt = this.db.prepare(
+            'DELETE FROM edges WHERE project = ?'
+        );
+        this.updateNodeFileStmt = this.db.prepare(
+            'UPDATE nodes SET file_path = ? WHERE project = ? AND qualified_name = ?'
+        );
+        this.deleteNodeEdgesStmt = this.db.prepare(
+            'DELETE FROM edges WHERE project = ? AND source_id = ?'
+        );
     }
 
     initialize(): void {
@@ -114,18 +165,7 @@ export class SqliteGraphStore implements GraphStore {
     // ── Node operations ──────────────────────────────────────────
 
     upsertNode(node: Omit<GraphNode, 'id'>): number {
-        const stmt = this.db.prepare(`
-            INSERT INTO nodes (project, label, name, qualified_name, file_path, start_line, end_line, properties_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(project, qualified_name) DO UPDATE SET
-                label = excluded.label,
-                name = excluded.name,
-                file_path = excluded.file_path,
-                start_line = excluded.start_line,
-                end_line = excluded.end_line,
-                properties_json = excluded.properties_json
-        `);
-        const result = stmt.run(
+        const result = this.upsertNodeStmt.run(
             node.project,
             node.label,
             node.name,
@@ -339,20 +379,16 @@ export class SqliteGraphStore implements GraphStore {
     // ── Edge operations ──────────────────────────────────────────
 
     upsertEdge(edge: Omit<GraphEdge, 'id'>): number {
-        // Check for duplicate
-        const existing = this.db.prepare(
-            'SELECT id FROM edges WHERE project = ? AND source_id = ? AND target_id = ? AND type = ?'
-        ).get(edge.project, edge.sourceId, edge.targetId, edge.type) as { id: number } | undefined;
+        // Check for duplicate using cached statement
+        const existing = this.upsertEdgeSelectStmt.get(
+            edge.project, edge.sourceId, edge.targetId, edge.type
+        ) as { id: number } | undefined;
 
         if (existing) {
             return existing.id;
         }
 
-        const stmt = this.db.prepare(`
-            INSERT INTO edges (project, source_id, target_id, type, properties_json)
-            VALUES (?, ?, ?, ?, ?)
-        `);
-        const result = stmt.run(
+        const result = this.upsertEdgeInsertStmt.run(
             edge.project,
             edge.sourceId,
             edge.targetId,
@@ -439,8 +475,8 @@ export class SqliteGraphStore implements GraphStore {
     }
 
     deleteProject(project: string): void {
-        this.db.prepare('DELETE FROM edges WHERE project = ?').run(project);
-        this.db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
+        this.deleteProjectEdgesStmt.run(project);
+        this.deleteProjectNodesStmt.run(project);
     }
 
     deleteNodesByFile(project: string, filePath: string): void {
@@ -457,15 +493,15 @@ export class SqliteGraphStore implements GraphStore {
     // ── Batch operations ─────────────────────────────────────────
 
     beginTransaction(): void {
-        this.db.prepare('BEGIN TRANSACTION').run();
+        this.db.exec('BEGIN TRANSACTION');
     }
 
     commitTransaction(): void {
-        this.db.prepare('COMMIT').run();
+        this.db.exec('COMMIT');
     }
 
     rollbackTransaction(): void {
-        this.db.prepare('ROLLBACK').run();
+        this.db.exec('ROLLBACK');
     }
 
     // ── Schema ───────────────────────────────────────────────────
