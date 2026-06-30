@@ -81,9 +81,16 @@ export class MilvusVectorDatabase implements VectorDatabase {
     /**
      * Ensure collection is loaded before search/query operations
      */
+    /** Cache of already-loaded collections to avoid redundant getLoadState calls. */
+    private loadedCollections: Set<string> = new Set();
+
     protected async ensureLoaded(collectionName: string): Promise<void> {
         if (!this.client) {
             throw new Error('MilvusClient is not initialized. Call ensureInitialized() first.');
+        }
+
+        if (this.loadedCollections.has(collectionName)) {
+            return;
         }
 
         try {
@@ -98,6 +105,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
                     collection_name: collectionName,
                 });
             }
+            this.loadedCollections.add(collectionName);
         } catch (error) {
             console.error(`[MilvusDB] ❌ Failed to ensure collection '${collectionName}' is loaded:`, error);
             throw error;
@@ -301,6 +309,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         await this.client.describeCollection({
             collection_name: collectionName,
         });
+        this.loadedCollections.add(collectionName);
     }
 
     async dropCollection(collectionName: string): Promise<void> {
@@ -313,6 +322,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         await this.client.dropCollection({
             collection_name: collectionName,
         });
+        this.loadedCollections.delete(collectionName);
     }
 
     async hasCollection(collectionName: string): Promise<boolean> {
@@ -597,6 +607,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         await this.client.describeCollection({
             collection_name: collectionName,
         });
+        this.loadedCollections.add(collectionName);
     }
 
     async insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {

@@ -153,6 +153,9 @@ export class Context {
     private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
 
+    /** Cache for getRepoIdentity to avoid repeated git execSync calls in the hot path. */
+    private repoIdentityCache: Map<string, string> = new Map();
+
     constructor(config: ContextConfig = {}) {
         // Initialize services
         this.embedding = config.embedding || new OpenAIEmbedding({
@@ -300,12 +303,28 @@ export class Context {
     }
 
     /**
+     * Cached getRepoIdentity — avoids repeated git execSync calls in the
+     * hot path (processChunkBatch is called once per embedding batch,
+     * each call to getRepoIdentity runs 2 git commands).
+     */
+    private getRepoIdentityCached(codebasePath: string): string {
+        const resolved = path.resolve(codebasePath);
+        const cached = this.repoIdentityCache.get(resolved);
+        if (cached !== undefined) {
+            return cached;
+        }
+        const identity = getRepoIdentity(resolved);
+        this.repoIdentityCache.set(resolved, identity);
+        return identity;
+    }
+
+    /**
      * Generate collection name based on codebase path and hybrid mode
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        const identity = getRepoIdentity(codebasePath);
+        const identity = this.getRepoIdentityCached(codebasePath);
         const pathHash = crypto.createHash('md5').update(identity).digest('hex').substring(0, 8);
 
         // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
@@ -810,7 +829,7 @@ export class Context {
             await this.vectorDatabase.dropCollection(collectionName);
             console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
         }
-        const repoIdentity = getRepoIdentity(codebasePath);
+        const repoIdentity = this.getRepoIdentityCached(codebasePath);
 
         if (isHybrid === true) {
             await this.vectorDatabase.createHybridCollection(collectionName, dimension, `codebasePath:${repoIdentity}`);
@@ -1030,7 +1049,7 @@ export class Context {
      */
     private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
         const isHybrid = this.getIsHybrid();
-        const repoIdentity = getRepoIdentity(codebasePath); // 这里获取 url:branch
+        const repoIdentity = this.getRepoIdentityCached(codebasePath);
 
         // Generate embedding vectors
         const chunkContents = chunks.map(chunk => chunk.content);

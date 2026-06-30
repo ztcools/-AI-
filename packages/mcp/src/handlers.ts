@@ -20,6 +20,8 @@ export class ToolHandlers {
      */
     private graphToolHandlers: GraphToolHandlers | null = null;
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
+    private lastCloudSyncMs: number = 0;
+    private static readonly CLOUD_SYNC_THROTTLE_MS = 60_000;
 
     constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
@@ -167,6 +169,11 @@ export class ToolHandlers {
      * - If local snapshot is missing directories (exist in cloud), ignore them
      */
     private async syncIndexedCodebasesFromCloud(): Promise<void> {
+        const now = Date.now();
+        if (now - this.lastCloudSyncMs < ToolHandlers.CLOUD_SYNC_THROTTLE_MS) {
+            console.log(`[SYNC-CLOUD] ⏭️  Skipping cloud sync (throttled, last run ${Math.round((now - this.lastCloudSyncMs) / 1000)}s ago)`);
+            return;
+        }
         try {
             // Clear stale identity cache before syncing (handles remote URL/branch changes)
             this.snapshotManager.clearIdentityCache();
@@ -333,6 +340,7 @@ export class ToolHandlers {
             }
 
             console.log(`[SYNC-CLOUD] ✅ Cloud sync completed successfully`);
+            this.lastCloudSyncMs = Date.now();
         } catch (error: any) {
             console.error(`[SYNC-CLOUD] ❌ Error syncing codebases from cloud:`, error.message || error);
             // Don't throw - this is not critical for the main functionality
@@ -604,35 +612,14 @@ export class ToolHandlers {
             }
 
             // CRITICAL: Pre-index collection creation validation
-            try {
-                console.log(`[INDEX-VALIDATION] 🔍 Validating collection creation capability`);
-                const canCreateCollection = await this.context.getVectorDatabase().checkCollectionLimit();
-
-                if (!canCreateCollection) {
-                    console.error(`[INDEX-VALIDATION] ❌ Collection limit validation failed: ${absolutePath}`);
-
-                    // CRITICAL: Immediately return the COLLECTION_LIMIT_MESSAGE to MCP client
-                    return {
-                        content: [{
-                            type: "text",
-                            text: COLLECTION_LIMIT_MESSAGE
-                        }],
-                        isError: true
-                    };
-                }
-
-                console.log(`[INDEX-VALIDATION] ✅  Collection creation validation completed`);
-            } catch (validationError: any) {
-                // Handle other collection creation errors
-                console.error(`[INDEX-VALIDATION] ❌ Collection creation validation failed:`, validationError);
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error validating collection creation: ${validationError.message || validationError}`
-                    }],
-                    isError: true
-                };
-            }
+            // NOTE: Skipping checkCollectionLimit on self-hosted Milvus
+            // (it creates/drops a dummy collection, with 15s timeout).
+            // Re-enable only when using Zilliz Cloud with collection limits.
+            // try {
+            //     console.log(`[INDEX-VALIDATION] 🔍 Validating collection creation capability`);
+            //     const canCreateCollection = await this.context.getVectorDatabase().checkCollectionLimit();
+            // ...
+            console.log(`[INDEX-VALIDATION] ✅  Collection creation validation skipped (self-hosted Milvus)`);
 
             if (customFileExtensions.length > 0) {
                 console.log(`[CUSTOM-EXTENSIONS] Using ${customFileExtensions.length} request-scoped custom extensions: ${customFileExtensions.join(', ')}`);
