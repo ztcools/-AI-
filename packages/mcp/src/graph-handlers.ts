@@ -61,6 +61,14 @@ export class GraphToolHandlers {
     private architecture: ArchitectureAnalyzer;
     /** Track in-progress graph indexing per project (project → {total, current, startTime}) */
     private indexingProgress: Map<string, { total: number; current: number; startTime: number }> = new Map();
+    /**
+     * Projects with an in-flight indexing run. Set synchronously at entry to
+     * handleIndexRepository so concurrent calls for the same project (e.g. an
+     * explicit `index` racing the search-triggered auto-build) can't interleave
+     * bulk-load transactions on the single SQLite connection. indexingProgress
+     * is only set after the file scan, so it can't serve as the lock.
+     */
+    private activeIndexing: Set<string> = new Set();
 
     constructor(dbPath?: string) {
         this.store = new SqliteGraphStore(dbPath);
@@ -103,6 +111,14 @@ export class GraphToolHandlers {
 
         const project = getRepoIdentity(repoPath);
         const startTime = Date.now();
+
+        // Concurrency guard: refuse to run two indexing passes for the same
+        // project at once — they'd interleave transactions on the shared SQLite
+        // connection and corrupt the bulk load.
+        if (this.activeIndexing.has(project)) {
+            return { content: [{ type: 'text', text: `Graph indexing already in progress for '${project}', skipping concurrent request.` }] };
+        }
+        this.activeIndexing.add(project);
 
         try {
             const supportedExts = this.extractor.getSupportedLanguages()
@@ -345,6 +361,8 @@ export class GraphToolHandlers {
             return {
                 content: [{ type: 'text', text: `Error indexing repository: ${error.message}` }],
             };
+        } finally {
+            this.activeIndexing.delete(project);
         }
     }
 

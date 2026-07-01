@@ -22,6 +22,14 @@ export class ToolHandlers {
     private indexingTasks: Map<string, { controller: AbortController; promise: Promise<void> }> = new Map();
     private lastCloudSyncMs: number = 0;
     private static readonly CLOUD_SYNC_THROTTLE_MS = 60_000;
+    /**
+     * Projects for which we've already kicked off an automatic local graph
+     * build this session. The vector index is shared via the cloud, but the
+     * knowledge graph is local — so a repo indexed by a teammate arrives with
+     * an empty local graph. We lazily build it on first use; this set prevents
+     * re-triggering on every subsequent search.
+     */
+    private autoGraphBuildTriggered: Set<string> = new Set();
 
     constructor(context: Context, snapshotManager: SnapshotManager, graphToolHandlers?: GraphToolHandlers) {
         this.context = context;
@@ -909,6 +917,11 @@ export class ToolHandlers {
                 }
             }
 
+            // The vector index exists (shared cloud); make sure the local graph
+            // is being built too, so results get graph enrichment. No-op if the
+            // graph is already present or building. Non-blocking.
+            this.maybeAutoBuildGraphIndex(absolutePath);
+
             // Show indexing status if codebase is being indexed
             let indexingStatusMessage = '';
             if (isIndexing) {
@@ -1002,8 +1015,23 @@ export class ToolHandlers {
                 };
             }
 
+            // Dedup overlapping/duplicate snippets from the same file. Vector
+            // chunking can surface several chunks covering the same lines; since
+            // results are already rank-ordered (best first), drop any later
+            // result whose line range intersects an already-kept range in the
+            // same file. This keeps the result budget on diverse code instead of
+            // repeats — higher signal density when replacing manual file reads.
+            const dedupedResults: any[] = [];
+            for (const r of searchResults) {
+                const overlaps = dedupedResults.some((k: any) =>
+                    k.relativePath === r.relativePath &&
+                    r.startLine <= k.endLine && r.endLine >= k.startLine
+                );
+                if (!overlaps) dedupedResults.push(r);
+            }
+
             // Format results
-            const formattedResults = searchResults.map((result: any, index: number) => {
+            const formattedResults = dedupedResults.map((result: any, index: number) => {
                 const location = `${result.relativePath}:${result.startLine}-${result.endLine}`;
                 const context = truncateContent(result.content, 5000);
                 const codebaseInfo = path.basename(searchCodebasePath);
@@ -1014,7 +1042,10 @@ export class ToolHandlers {
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
 
-            let resultMessage = `Found ${searchResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${indexingStatusMessage}`;
+            const dupNote = dedupedResults.length < searchResults.length
+                ? ` (${searchResults.length - dedupedResults.length} overlapping snippet(s) merged)`
+                : '';
+            let resultMessage = `Found ${dedupedResults.length} results for query: "${query}" in codebase '${searchCodebasePath}'${dupNote}${indexingStatusMessage}`;
             if (searchCodebasePath !== absolutePath) {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
@@ -1024,7 +1055,7 @@ export class ToolHandlers {
             if (this.graphToolHandlers) {
                 try {
                     resultMessage += this.enrichWithGraphContextDeep(
-                        searchResults,
+                        dedupedResults,
                         searchCodebasePath,
                     );
                 } catch (graphErr: any) {
@@ -1241,8 +1272,15 @@ export class ToolHandlers {
                 const store = this.graphToolHandlers.getStore();
                 const stats = store.getProjectStats(project);
 
+                // If the graph is empty (e.g. repo vector-indexed by a teammate),
+                // start a background build so it catches up to the vector index.
+                this.maybeAutoBuildGraphIndex(absolutePath);
+
                 lines.push('## Graph Index (SQLite)');
                 lines.push(`  Nodes: ${stats.nodes} | Edges: ${stats.edges}`);
+                if (stats.nodes === 0) {
+                    lines.push('  (empty — building in background to match the shared vector index; check again shortly)');
+                }
 
                 // Graph indexing progress (if in progress)
                 const graphProgress = this.graphToolHandlers.getIndexingProgress(project);
@@ -1467,6 +1505,55 @@ export class ToolHandlers {
      * callers, callees, architectural position, and dead code detection.
      * Returns a formatted string to append to the result message.
      */
+    /**
+     * Lazily bring the LOCAL knowledge graph up to date with the SHARED cloud
+     * vector index. The vector index is reused across the team (keyed by repo
+     * URL+branch), but the graph lives in local SQLite — so a repo indexed by a
+     * teammate (or on another machine) shows up here with an empty graph and no
+     * graph enrichment. When we detect that, we fire a background full graph
+     * build. Non-blocking; guarded to run at most once per project per session
+     * and skipped if a build is already in progress or the graph already exists.
+     */
+    private maybeAutoBuildGraphIndex(codebasePath: string): void {
+        if (!this.graphToolHandlers) return;
+
+        let project: string;
+        try {
+            project = getRepoIdentity(codebasePath);
+        } catch {
+            return; // Not a resolvable repo — nothing to key a graph on.
+        }
+
+        if (this.autoGraphBuildTriggered.has(project)) return;
+        // A build is already running (via handleIndex or an earlier trigger).
+        if (this.graphToolHandlers.getIndexingProgress(project)) return;
+
+        let stats: { nodes: number; edges: number };
+        try {
+            stats = this.graphToolHandlers.getStore().getProjectStats(project);
+        } catch {
+            return;
+        }
+        if (stats.nodes > 0) return; // Local graph already present.
+
+        // Mark before firing so concurrent searches never double-trigger. We
+        // intentionally keep it marked even on failure: retrying every search
+        // would hammer a genuinely unindexable repo. A new session retries.
+        this.autoGraphBuildTriggered.add(project);
+        console.log(`[GRAPH-AUTO] Local graph empty for '${project}', building in background to match the shared vector index...`);
+        setImmediate(async () => {
+            try {
+                await this.graphToolHandlers!.handleIndexRepository({
+                    repo_path: codebasePath,
+                    mode: 'full',
+                });
+                console.log(`[GRAPH-AUTO] Background graph build complete for '${project}'`);
+            } catch (e: any) {
+                console.warn(`[GRAPH-AUTO] Background graph build failed for '${project}': ${e?.message || e}`);
+            }
+        });
+    }
+
     private enrichWithGraphContextDeep(
         searchResults: any[],
         codebasePath: string,
@@ -1646,93 +1733,5 @@ export class ToolHandlers {
         }
 
         return lines.length > 0 ? '\n\n' + lines.join('\n') : '';
-    }
-
-    /**
-     * @deprecated Use enrichWithGraphContextDeep for 3-layer enhancement.
-     * Kept for backward compatibility.
-     */
-    private enrichWithGraphContext(
-        searchResults: any[],
-        codebasePath: string,
-        _existingMessage: string,
-        maxContextFiles: number = 10,
-    ): string {
-        const store = this.graphToolHandlers!.getStore();
-        const project = getRepoIdentity(codebasePath);
-        const lines: string[] = [];
-        const seenSymbols = new Set<string>();
-
-        // Collect all unique file paths from search results
-        const seenFiles = new Set<string>();
-        for (const result of searchResults.slice(0, maxContextFiles)) {
-            seenFiles.add(result.relativePath);
-        }
-
-        // For each file, find containing functions and enrich
-        for (const filePath of seenFiles) {
-            // Normalize path: strip leading slash and prefix for exact match
-            const normalizedPath = filePath.replace(/^\/+/, '');
-            let nodeResult = store.findNodes({
-                project,
-                exactFilePath: normalizedPath,
-                limit: 20,
-            });
-
-            // Fallback: try without exact path match if nothing found
-            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
-                nodeResult = store.findNodes({
-                    project,
-                    exactFilePath: filePath,
-                    limit: 20,
-                });
-            }
-
-            if (nodeResult.results.length === 0) continue;
-
-            for (const r of nodeResult.results) {
-                const n = r.node;
-                const key = n.qualifiedName;
-                if (seenSymbols.has(key)) continue;
-                seenSymbols.add(key);
-
-                // Get callers and callees
-                const callerEdges = store.getEdgesByTarget(n.id, 'CALLS');
-                const calleeEdges = store.getEdgesBySource(n.id, 'CALLS');
-
-                const callerNames = callerEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
-                    const caller = store.getNodeById(e.sourceId);
-                    return caller ? caller.name : '?';
-                });
-                const calleeNames = calleeEdges.slice(0, 3).map((e: { sourceId: number; targetId: number; type: string }) => {
-                    const callee = store.getNodeById(e.targetId);
-                    return callee ? callee.name : '?';
-                });
-
-                // Build a compact line
-                let line = `${n.label} \`${n.name}\``;
-                if (callerNames.length > 0) {
-                    line += ` ← ${callerNames.join(', ')}`;
-                    if (callerEdges.length > 3) line += ` +${callerEdges.length - 3}`;
-                }
-                if (calleeNames.length > 0) {
-                    line += ` → ${calleeNames.join(', ')}`;
-                    if (calleeEdges.length > 3) line += ` +${calleeEdges.length - 3}`;
-                }
-                // Dead code detection
-                if (callerEdges.length === 0 && calleeEdges.length === 0) {
-                    line += ` [unused]`;
-                } else if (callerEdges.length === 0 && n.label === 'Function') {
-                    line += ` [entry]`;
-                }
-                line += ` (${n.filePath}:${n.startLine})`;
-
-                lines.push(line);
-            }
-        }
-
-        if (lines.length === 0) return '';
-
-        return `\n\n## Related Graph Context\n` + lines.map(l => `  - ${l}`).join('\n');
     }
 } 

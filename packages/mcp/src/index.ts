@@ -86,22 +86,28 @@ class ContextMcpServer {
 
     private setupTools() {
         const index_description = `
-Index a codebase for intelligent code search. One call builds both vector index (Milvus) and knowledge graph (SQLite). Codebases are identified by git remote URL + branch, so team members sharing the same repo+branch reuse each other's indexes.
+Index a codebase for intelligent code search. One call builds both the vector index (Milvus, shared with your team via git remote URL + branch) and the local knowledge graph (SQLite). Team members on the same repo+branch reuse each other's vector index.
 
-⚠️ **First-time setup**: User MUST call this manually once per project. After that, incremental updates are automatic.
+⚠️ **First-time setup**: call this once per project. Afterwards, incremental updates happen automatically, and the local graph auto-builds on your first \`search\` if a teammate already indexed the repo.
 `;
 
+        // NOTE: this description is the primary lever for how often the model
+        // reaches for search instead of falling back to manual file reads. It is
+        // deliberately directive. Keep the guidance honest — every claim here is
+        // backed by the handler (hybrid vector+BM25 ranking, graph enrichment).
         const search_description = `
-Search the indexed codebase with natural language. Returns matched code snippets enriched with graph context (callers, callees, call chains, architecture, dead code).
+Semantic + knowledge-graph search over the indexed codebase. This is the FASTEST and most reliable way to understand THIS project — prefer it over reading files, grepping, or guessing. A single call returns the most relevant code snippets ranked across the whole repo, each enriched with graph context: callers, callees, call chains, architectural role, and dead-code flags.
 
-🎯 **When to call** (call BEFORE reading files):
-- User asks how something works or where it's implemented
-- Before modifying code — check existing patterns
-- Debugging a bug
-- Understanding unfamiliar code or reviewing PRs
-- Refactoring — find all related code and callers
+🎯 **Call this FIRST — before reading files — whenever you need to:**
+- Locate where something is implemented, or how a feature/flow works
+- Understand code BEFORE editing it (find existing patterns, conventions, related logic to stay consistent)
+- Trace a bug to its root cause (you get the full call chain, not a single file)
+- Judge blast radius before refactoring (who calls this? what does it call?)
+- Answer any "where / how / why" question about the codebase
 
-💡 Prefer search over reading files directly. One call returns the code, its call chain, and architecture context.
+💡 **Why prefer it:** one search replaces many file reads. It ranks by *meaning* across the entire repository (not just filename or exact-token matches) and attaches the call graph, so you get the code AND how it connects — context that would otherwise take many tool calls to reconstruct. Reach for it liberally; a quick search at the start of a task keeps your edits grounded in how the project actually works.
+
+Use natural-language queries describing intent (e.g. "how are auth tokens refreshed", "where is the vector DB connection configured"), not bare keywords. Run several focused searches for a multi-part task.
 `;
 
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
