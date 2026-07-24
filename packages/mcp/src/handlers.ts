@@ -466,6 +466,35 @@ export class ToolHandlers {
                 }
             }
 
+            // Pre-index guard: only allow indexing repositories that have a server-side
+            // root collection (managed by git-index-service). This prevents team members
+            // from consuming shared Milvus resources with personal projects.
+            // LOCAL_FULL_INDEX_ENABLED=true bypasses this guard (admin/testing only).
+            {
+                const rootCollectionName = this.context.getRootCollectionName(absolutePath);
+                const rootExists = await this.context.getVectorDatabase().hasCollection(rootCollectionName).catch(() => false);
+                const localFullIndexEnabled = String(envManager.get('LOCAL_FULL_INDEX_ENABLED') || '').trim().toLowerCase();
+                if (!rootExists && localFullIndexEnabled !== 'true') {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Error: Local full indexing is disabled for repositories without a server-side root index.\n\n` +
+                                `No shared root index was found for '${absolutePath}'.\n` +
+                                `Only repositories managed by the server-side git-index-service can be indexed locally (delta mode).\n\n` +
+                                `Options:\n` +
+                                `1. Contact your administrator to add this repository to the server-side index.\n` +
+                                `2. If you are authorized, set LOCAL_FULL_INDEX_ENABLED=true to bypass this restriction.`
+                        }],
+                        isError: true
+                    };
+                }
+                if (rootExists) {
+                    console.log(`[INDEX-GUARD] ✅ Root collection exists — delta indexing allowed.`);
+                } else {
+                    console.log(`[INDEX-GUARD] ⚠️  LOCAL_FULL_INDEX_ENABLED=true — full local index allowed (no root).`);
+                }
+            }
+
             // CRITICAL: Pre-index collection creation validation
             // NOTE: Skipping checkCollectionLimit on self-hosted Milvus
             // (it creates/drops a dummy collection, with 15s timeout).

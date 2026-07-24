@@ -1427,6 +1427,22 @@ export class Context {
                         // Fall through: added/modified stay as rawAdded/rawModified
                     }
                 }
+            } else {
+                // No root collection exists — reject full local indexing to protect
+                // shared server resources. Only server-managed repos (with a root
+                // collection) can be indexed locally. Administrators can override
+                // this guard with LOCAL_FULL_INDEX_ENABLED=true.
+                const localFullIndexEnabled = String(envManager.get('LOCAL_FULL_INDEX_ENABLED') || '').trim().toLowerCase();
+                if (localFullIndexEnabled !== 'true') {
+                    throw new Error(
+                        `Local full indexing is disabled for repositories without a server-side root index. ` +
+                        `No shared root index was found for this repository. ` +
+                        `Only repositories managed by the server-side git-index-service can be indexed locally (delta mode). ` +
+                        `Please contact your administrator to add this repository to the server-side index, ` +
+                        `or set LOCAL_FULL_INDEX_ENABLED=true if you are authorized to create standalone indexes.`
+                    );
+                }
+                console.log('[Context] ⚠️  LOCAL_FULL_INDEX_ENABLED=true — proceeding with full local index (no root available).');
             }
         } else {
             // Subsequent index: update devChangedFiles to match what's actually indexed
@@ -1445,7 +1461,7 @@ export class Context {
             if (isDeltaIndex) {
                 console.log(`[Context] 🆕 First index for this dev+branch — delta mode (${added.length} changed files vs root, ${rawAdded.length - added.length} from root layer)`);
             } else {
-                console.log('[Context] 🆕 First index for this dev+branch — full Merkle-based index (no root available).');
+                console.log('[Context] 🆕 First index for this dev+branch — full local index (LOCAL_FULL_INDEX_ENABLED=true, no root available).');
             }
         } else {
             console.log(`[Context] 🔄 Merkle changes: +${rawAdded.length}/~${rawModified.length}/-${rawRemoved.length}, delta=${isDeltaIndex}`);

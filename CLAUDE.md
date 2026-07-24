@@ -214,6 +214,7 @@ else:
 - `CLAUDE_CONTEXT_DEV_ID` — **可选**，显式设置开发者身份（未设置时自动使用 git email）
 - `RRF_K` — RRF 融合 k 参数（默认 100）
 - `INDEX_CHUNK_LIMIT` — 单次索引 chunk 上限（默认 450000）
+- `LOCAL_FULL_INDEX_ENABLED` — 允许无服务端 root collection 时本地全量索引（默认 false，设为 `true` 仅管理员/测试）
 - `SEARCH_DEFAULT_LIMIT`, `SEARCH_THRESHOLD`, `SEARCH_SNIPPET_MAX_CHARS`, `SEARCH_SCORE_RATIO` — 搜索调优
 - `GIT_ROOT_BRANCHES` — root 分支名（默认 main,master，仅服务端使用）
 - `GIT_INCREMENTAL_ENABLED`, `GIT_LAYERED_ENABLED` — 服务端索引开关
@@ -364,6 +365,12 @@ pnpm --filter @seeway/claude-context-mcp test
 
 ## 最近开发重点（2026-07）
 
+- **本地全量索引禁用**（2026-07-24）：
+  - 本地 MCP 端不再允许无服务端 root collection 时的全量索引（防止团队成员占用公司 Milvus 资源索引私人项目）
+  - `syncIndexByMerkle()` 无 root 时抛错（不再回退到全量模式）
+  - `handleIndexCodebase()` 增加 root collection 前置检查，提前拦截
+  - 新增环境变量 `LOCAL_FULL_INDEX_ENABLED`（默认 false），设为 `true` 可恢复全量索引能力（管理员/测试）
+  - git reset/rebase 后的增量索引更新已确认正常：Merkle 内容哈希追踪与 git commit SHA 解耦
 - **Delta 索引 + 搜索 masking**（2026-07-24）：
   - 首次索引：云端 root 集合存在 → `git diff --name-only origin/main` → 只索引变更文件
   - dev 集合从全量副本改为 delta（仅存变更文件），root 层补充未修改文件
