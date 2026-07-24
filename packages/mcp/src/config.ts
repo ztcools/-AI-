@@ -60,6 +60,7 @@ export interface CodebaseInfoIndexed extends CodebaseInfoBase {
     indexedFiles: number;        // Number of files indexed
     totalChunks: number;         // Total number of chunks generated
     indexStatus: 'completed' | 'limit_reached';  // Status from indexing result
+    indexMode?: 'full' | 'delta' | 'incremental' | 'up-to-date';  // Indexing mode
 }
 
 // Index failed state - when indexing failed

@@ -1275,6 +1275,13 @@ export class ToolHandlers {
                         const indexedInfo = info as CodebaseInfoIndexed;
                         statusMessage = `✅ Codebase '${statusCodebasePath}' is fully indexed and ready for search.`;
                         statusMessage += `\n📊 Statistics: ${indexedInfo.indexedFiles} files, ${indexedInfo.totalChunks} chunks`;
+                        if (indexedInfo.indexMode === 'delta') {
+                            statusMessage += `\n📋 Mode: delta (dev ⊕ root) — ${indexedInfo.indexedFiles} changed files in dev layer, unchanged files served from root collection`;
+                        } else if (indexedInfo.indexMode === 'incremental') {
+                            statusMessage += `\n📋 Mode: incremental — ${indexedInfo.indexedFiles} changed files indexed since last sync`;
+                        } else if (indexedInfo.indexMode === 'up-to-date') {
+                            statusMessage += `\n📋 Mode: up-to-date — no changes detected, index is current`;
+                        }
                         statusMessage += `\n📅 Status: ${indexedInfo.indexStatus}`;
                         statusMessage += `\n🕐 Last updated: ${new Date(indexedInfo.lastUpdated).toLocaleString()}`;
                     } else {

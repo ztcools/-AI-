@@ -418,10 +418,11 @@ export class SnapshotManager {
      */
     public setCodebaseIndexed(
         codebasePath: string,
-        stats: { indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' },
+        stats: { indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached'; mode?: 'full' | 'delta' | 'incremental' | 'up-to-date' },
         indexOptions?: CodebaseIndexOptions
     ): void {
-        if (stats.indexedFiles === 0 && stats.totalChunks === 0 && stats.status === 'completed') {
+        // Allow 0/0 only for up-to-date mode (no files changed since last index).
+        if (stats.indexedFiles === 0 && stats.totalChunks === 0 && stats.status === 'completed' && stats.mode !== 'up-to-date') {
             console.error(`[SNAPSHOT] Refusing to write 0/0+completed for '${codebasePath}' — invalid state. Stack trace:`);
             console.trace();
             return;
@@ -444,6 +445,7 @@ export class SnapshotManager {
             indexedFiles: stats.indexedFiles,
             totalChunks: stats.totalChunks,
             indexStatus: stats.status,
+            indexMode: stats.mode,
             ...resolvedIndexOptions,
             lastUpdated: new Date().toISOString()
         };
