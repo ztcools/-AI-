@@ -280,141 +280,7 @@ export class ToolHandlers {
     }
 
     private async syncCollectionState(): Promise<void> {
-        const now = Date.now();
-        if (now - this.lastCollectionSyncMs < ToolHandlers.COLLECTION_SYNC_THROTTLE_MS) {
-            console.log(`[COLLECTION-SYNC] ⏭️  Skipping sync (throttled, last run ${Math.round((now - this.lastCollectionSyncMs) / 1000)}s ago)`);
-            return;
-        }
-        try {
-            this.snapshotManager.clearIdentityCache();
-            console.log(`[COLLECTION-SYNC] 🔄 Syncing indexed codebases from collections...`);
-
-            // Get all collections using the interface method
-            const vectorDb = this.context.getVectorDatabase();
-
-            // Use the new listCollections method from the interface
-            const collections = await vectorDb.listCollections();
-
-            console.log(`[COLLECTION-SYNC] 📋 Found ${collections.length} collections in collection`);
-
-            if (collections.length === 0) {
-                console.log(`[COLLECTION-SYNC] ✅ No collections found. Skipping deletion of local codebases.`);
-                return;
-            }
-
-            const cloudCodebases = new Set<string>();
-            let codeCollectionsChecked = 0;
-            let successfulExtractions = 0;
-
-            // Filter to code collections first
-            const codeCollections = collections.filter(
-                (c) => c.startsWith('cc_') || c.startsWith('hcc_')
-                    || c.startsWith('code_chunks_') || c.startsWith('hybrid_code_chunks_')
-            );
-
-            if (codeCollections.length === 0) {
-                console.log(`[COLLECTION-SYNC] ✅ No code collections found.`);
-                return;
-            }
-
-            // Parallel extraction with concurrency limit (avoids overwhelming the API)
-            const CONCURRENCY = 5;
-            const results: Array<{ codebasePath: string } | null> = [];
-
-            for (let i = 0; i < codeCollections.length; i += CONCURRENCY) {
-                const batch = codeCollections.slice(i, i + CONCURRENCY);
-                const batchResults = await Promise.all(
-                    batch.map((collectionName) => this.extractCodebaseFromCollection(collectionName, vectorDb))
-                );
-                results.push(...batchResults);
-            }
-
-            for (const r of results) {
-                codeCollectionsChecked++;
-                if (r) {
-                    cloudCodebases.add(r.codebasePath);
-                    successfulExtractions++;
-                }
-            }
-
-            console.log(`[COLLECTION-SYNC] 📊 Found ${cloudCodebases.size} valid codebases in collections (checked ${codeCollectionsChecked} code collections, ${successfulExtractions} successfully extracted)`);
-
-            // Safety guard: if we checked code collections but none returned results,
-            // treat this as an extraction failure rather than "cloud is empty".
-            // This prevents deleting all local codebases due to transient errors.
-            if (codeCollectionsChecked > 0 && successfulExtractions === 0) {
-                console.warn(`[COLLECTION-SYNC] ⚠️  All ${codeCollectionsChecked} code collection extractions failed. Skipping sync to avoid accidental deletion of local codebases.`);
-                return;
-            }
-
-            // Get current local codebases with their identities.
-            // getIndexedCodebases() now returns identities (url:branch).
-            const localIdentities = this.snapshotManager.getIndexedCodebases();
-            const localIdentityMap = new Map<string, string>(); // identity -> localPath
-            for (const identity of localIdentities) {
-                const info = this.snapshotManager.getCodebaseInfo(identity);
-                if (info?.localPath) {
-                    localIdentityMap.set(identity, info.localPath);
-                }
-            }
-            console.log(`[COLLECTION-SYNC] 📊 Found ${localIdentities.length} local codebases in snapshot`);
-
-            let hasChanges = false;
-
-            // Remove local codebases whose identity is not in the cloud set.
-            // Compare by identity (url:branch) rather than raw filesystem path,
-            // so team members sharing the same repo+branch are recognized.
-            for (const [identity, localPath] of localIdentityMap) {
-                if (!cloudCodebases.has(identity)) {
-                    this.snapshotManager.removeCodebaseByIdentity(identity, localPath);
-                    hasChanges = true;
-
-                    try {
-                        await FileSynchronizer.deleteSnapshot(localPath);
-                    } catch (error: any) {
-                        console.warn(`[COLLECTION-SYNC] ⚠️  Failed to delete local merkle snapshot for removed codebase '${localPath}':`, error?.message || error);
-                    }
-
-                    console.log(`[COLLECTION-SYNC] ➖ Removed local codebase (not in collections): ${localPath} (identity: ${identity})`);
-                }
-            }
-
-            // Add cloud codebases that are missing from local snapshot (recovery).
-            // We can only recover if the cloud identity maps to a local checkout.
-            // Otherwise we rely on the Milvus fallback in search/status handlers.
-            for (const cloudIdentity of cloudCodebases) {
-                if (!localIdentityMap.has(cloudIdentity)) {
-                    console.log(`[COLLECTION-SYNC] ⏭️  Cloud codebase '${cloudIdentity}' has no local checkout — will be resolved via Milvus fallback on demand`);
-                    continue;
-                }
-
-                const localPath = localIdentityMap.get(cloudIdentity)!;
-                const stats = await this.queryCollectionStats(localPath);
-                if (stats) {
-                    this.snapshotManager.setCodebaseIndexed(localPath, {
-                        ...stats,
-                        status: 'completed' as const
-                    });
-                    hasChanges = true;
-                    console.log(`[COLLECTION-SYNC] ➕ Recovered codebase from collections: ${localPath} (identity: ${cloudIdentity}, rows=${stats.totalChunks})`);
-                } else {
-                    console.log(`[COLLECTION-SYNC] ⏭️  Skipped recovery for ${localPath} (row count unknown or zero)`);
-                }
-            }
-
-            if (hasChanges) {
-                await this.snapshotManager.saveCodebaseSnapshot();
-                console.log(`[COLLECTION-SYNC] 💾 Updated snapshot to match collection state`);
-            } else {
-                console.log(`[COLLECTION-SYNC] ✅ Local snapshot already matches cloud state`);
-            }
-
-            console.log(`[COLLECTION-SYNC] ✅ Collection sync completed successfully`);
-            this.lastCollectionSyncMs = Date.now();
-        } catch (error: any) {
-            console.error(`[COLLECTION-SYNC] ❌ Error syncing codebases from collections:`, error.message || error);
-            // Don't throw - this is not critical for the main functionality
-        }
+        this.lastCollectionSyncMs = Date.now();
     }
 
     // ── Unified Index: Vector + Graph ─────────────────────────────
@@ -514,10 +380,6 @@ export class ToolHandlers {
         const customIgnorePatterns = ignorePatterns || [];
 
         try {
-            // Sync collection state in background — don't block indexing
-            void this.syncCollectionState().catch(err =>
-                console.warn('[COLLECTION-SYNC] Background sync failed:', err?.message || err)
-            );
 
             // Validate splitter parameter
             if (!isRequestSplitterType(requestedSplitter)) {
@@ -740,7 +602,9 @@ export class ToolHandlers {
             await this.snapshotManager.saveCodebaseSnapshot();
 
             let message = `Background indexing completed for '${absolutePath}' using ${splitterType.toUpperCase()} splitter (${stats.mode} mode).`;
-            if (stats.mode === 'incremental') {
+            if (stats.mode === 'delta') {
+                message += `\nDelta index (dev ⊕ root): ${stats.indexedFiles} changed files indexed, ${stats.totalChunks} chunks. Unchanged files served from root collection.`;
+            } else if (stats.mode === 'incremental') {
                 message += `\nGit incremental: ${stats.added} added, ${stats.modified} modified, ${stats.removed} removed. Indexed ${stats.indexedFiles} files, ${stats.totalChunks} chunks.`;
             } else if (stats.mode === 'up-to-date') {
                 message += `\nAlready up to date — no changes since last indexed commit.`;
@@ -877,7 +741,7 @@ export class ToolHandlers {
                 filterExpr = `fileExtension in [${quoted}]`;
             }
 
-            // ── Dev-aware search: dev collection (full copy) → root collection (fallback) ──
+            // ── Dev-aware search: dev collection (changed files) ⊕ root collection (masked) ──
             const devCollectionName = this.context.getDevCollectionName(absolutePath);
             const rootCollectionName = this.context.getRootCollectionName(absolutePath);
             const vdb = this.context.getVectorDatabase();
@@ -890,21 +754,32 @@ export class ToolHandlers {
             let searchSourceNote = '';
             let resultMessage = '';
 
-            // Build the layer chain. Dev collection is always primary (full
-            // working-tree snapshot). Root collection is secondary — it
-            // supplements files the developer hasn't touched, and RRF + dedup
-            // naturally resolve overlaps (dev wins on identical content, root
-            // fills gaps). No mask needed: the global RRF ranks across layers,
-            // and deduplicateResults drops overlapping line ranges.
+            // Build the layer chain with masking.
+            // Dev collection holds files changed vs root (or all files if no root).
+            // Root layer is masked by the dev-owned file list so stale root copies
+            // of changed files never surface — the dev's version always wins.
             const layers: Array<{ collectionName: string; mask?: string[] }> = [];
 
             if (devExists) {
                 layers.push({ collectionName: devCollectionName });
             }
             if (rootExists) {
-                // Only add root if we have dev (two-layer) or as sole fallback.
-                // When both exist, root supplements files not in dev.
-                layers.push({ collectionName: rootCollectionName });
+                // Compute mask: files the dev collection owns → exclude from root layer.
+                // RRF + dedup handle overlaps as a safety net, but the mask guarantees
+                // correctness: a dev-changed file that scores lower than its root copy
+                // won't be displaced by the stale version.
+                let devOwnedFiles: string[] = [];
+                if (devExists) {
+                    const synchronizers = this.context.getSynchronizers();
+                    const synchronizer = synchronizers.get(devCollectionName);
+                    if (synchronizer) {
+                        devOwnedFiles = synchronizer.getDevChangedFiles();
+                    }
+                }
+                layers.push({
+                    collectionName: rootCollectionName,
+                    mask: devOwnedFiles.length > 0 ? devOwnedFiles : undefined,
+                });
             }
 
             if (layers.length === 0) {
@@ -1309,18 +1184,9 @@ export class ToolHandlers {
                 };
             }
 
-            await this.syncCollectionState();
-
-            // Check indexing status using new status system.
-            //
-            // Resolve the tracked path with the same disk-backed lookups that
-            // search uses (findIndexedCodebasePath/findIndexingCodebasePath read
-            // the JSON file), falling back to the in-memory tracked path. This
-            // matters because getCodebaseStatus/getCodebaseInfo read the in-memory
-            // codebaseInfoMap, which can lag behind the on-disk snapshot when the
-            // repo was indexed by another process/MCP client, or when this process
-            // loaded its map before the entry was written — exactly the case where
-            // search succeeds but status falsely reports "not indexed".
+            // Check snapshot first, then fall back to Milvus.
+            // No syncCollectionState — it was designed for Zilliz Cloud multi-user
+            // collection discovery and corrupts local state in self-hosted Milvus.
             let statusCodebasePath =
                 this.snapshotManager.findIndexedCodebasePath(absolutePath)
                 || this.snapshotManager.findIndexingCodebasePath(absolutePath)
@@ -1342,9 +1208,10 @@ export class ToolHandlers {
                 }
             }
 
-            // Dev-aware fallback: check the developer's personal collection
-            // and the shared root collection in Milvus.
-            if (status === 'not_found') {
+            // Dev-aware fallback: when the snapshot says not_found or indexfailed,
+            // check the real Milvus state. The collection may have been indexed
+            // successfully but the snapshot was corrupted by a race.
+            if (status === 'not_found' || status === 'indexfailed') {
                 const devCol = this.context.getDevCollectionName(absolutePath);
                 const rootCol = this.context.getRootCollectionName(absolutePath);
                 const vdbStatus = this.context.getVectorDatabase();

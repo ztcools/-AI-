@@ -90,8 +90,13 @@ export class AstCodeSplitter implements Splitter {
             // Extract chunks based on AST nodes
             const chunks = this.extractChunks(tree.rootNode, code, langConfig.nodeTypes, language, filePath);
 
-            // If chunks are too large, split them further
-            const refinedChunks = await this.refineChunks(chunks, code);
+            // AST-extracted chunks are semantic units (functions/methods/classes).
+            // Character-splitting them destroys the boundary between "real code" and
+            // "embedded string literal" (e.g. MCP tool description templates), causing
+            // noise chunks like `"search" keyword → index.ts:90 search_description string`.
+            // Each unit stays whole; overlap provides cross-chunk continuity without
+            // breaking semantics.
+            const refinedChunks = this.addOverlap(chunks);
 
             return refinedChunks;
         } catch (error) {
@@ -145,7 +150,6 @@ export class AstCodeSplitter implements Splitter {
         filePath?: string
     ): CodeChunk[] {
         const chunks: CodeChunk[] = [];
-        const codeLines = code.split('\n');
 
         const traverse = (currentNode: Parser.SyntaxNode) => {
             // Check if this node type should be split into a chunk
@@ -176,84 +180,7 @@ export class AstCodeSplitter implements Splitter {
 
         traverse(node);
 
-        // If no meaningful chunks found, create a single chunk with the entire code
-        if (chunks.length === 0) {
-            chunks.push({
-                content: code,
-                metadata: {
-                    startLine: 1,
-                    endLine: codeLines.length,
-                    language,
-                    filePath,
-                }
-            });
-        }
-
         return chunks;
-    }
-
-    private async refineChunks(chunks: CodeChunk[], originalCode: string): Promise<CodeChunk[]> {
-        const refinedChunks: CodeChunk[] = [];
-
-        for (const chunk of chunks) {
-            if (chunk.content.length <= this.chunkSize) {
-                refinedChunks.push(chunk);
-            } else {
-                // Split large chunks using character-based splitting
-                const subChunks = this.splitLargeChunk(chunk, originalCode);
-                refinedChunks.push(...subChunks);
-            }
-        }
-
-        return this.addOverlap(refinedChunks);
-    }
-
-    private splitLargeChunk(chunk: CodeChunk, originalCode: string): CodeChunk[] {
-        const lines = chunk.content.split('\n');
-        const subChunks: CodeChunk[] = [];
-        let currentChunk = '';
-        let currentStartLine = chunk.metadata.startLine;
-        let currentLineCount = 0;
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i];
-            const lineWithNewline = i === lines.length - 1 ? line : line + '\n';
-
-            if (currentChunk.length + lineWithNewline.length > this.chunkSize && currentChunk.length > 0) {
-                // Create a sub-chunk
-                subChunks.push({
-                    content: currentChunk.trim(),
-                    metadata: {
-                        startLine: currentStartLine,
-                        endLine: currentStartLine + currentLineCount - 1,
-                        language: chunk.metadata.language,
-                        filePath: chunk.metadata.filePath,
-                    }
-                });
-
-                currentChunk = lineWithNewline;
-                currentStartLine = chunk.metadata.startLine + i;
-                currentLineCount = 1;
-            } else {
-                currentChunk += lineWithNewline;
-                currentLineCount++;
-            }
-        }
-
-        // Add the last sub-chunk
-        if (currentChunk.trim().length > 0) {
-            subChunks.push({
-                content: currentChunk.trim(),
-                metadata: {
-                    startLine: currentStartLine,
-                    endLine: currentStartLine + currentLineCount - 1,
-                    language: chunk.metadata.language,
-                    filePath: chunk.metadata.filePath,
-                }
-            });
-        }
-
-        return subChunks;
     }
 
     private addOverlap(chunks: CodeChunk[]): CodeChunk[] {

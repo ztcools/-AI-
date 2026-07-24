@@ -20,6 +20,13 @@ export class FileSynchronizer {
     private identityOverride?: string;
     /** Whether the snapshot is in a "dirty" state (indexing not yet completed). */
     private dirty: boolean = false;
+    /**
+     * Files this dev has changed relative to the root (main) branch.
+     * Used for search-time masking: root layer excludes these paths so the
+     * dev's version always wins. Empty when operating in full-index mode
+     * (no root available), meaning all files are in dev collection.
+     */
+    private devChangedFiles: Set<string> = new Set();
 
     constructor(
         rootDir: string,
@@ -357,6 +364,20 @@ export class FileSynchronizer {
         return this.fileHashes.get(filePath);
     }
 
+    /** Get the list of files this dev has changed relative to root (for search masking). */
+    getDevChangedFiles(): string[] {
+        return Array.from(this.devChangedFiles);
+    }
+
+    /**
+     * Set the list of files this dev has changed relative to root.
+     * Called after a delta index completes. When root is unavailable
+     * (full-index mode), this is empty — root layer is fully masked.
+     */
+    setDevChangedFiles(files: string[]): void {
+        this.devChangedFiles = new Set(files);
+    }
+
     /** Mark the snapshot as clean after successful indexing. */
     async markClean(): Promise<void> {
         if (!this.dirty) return;
@@ -381,10 +402,12 @@ export class FileSynchronizer {
             fileHashesArray.push([key, this.fileHashes.get(key)!]);
         });
 
+        const devChangedFilesArray = Array.from(this.devChangedFiles);
         const data = JSON.stringify({
             fileHashes: fileHashesArray,
             merkleDAG: this.merkleDAG.serialize(),
             status: this.dirty ? 'dirty' : 'clean',
+            devChangedFiles: devChangedFilesArray,
         });
         await fs.writeFile(this.snapshotPath, data, 'utf-8');
         console.log(`Saved snapshot to ${this.snapshotPath} (status: ${this.dirty ? 'dirty' : 'clean'})`);
@@ -410,6 +433,11 @@ export class FileSynchronizer {
             this.fileHashes = new Map();
             for (const [key, value] of obj.fileHashes) {
                 this.fileHashes.set(key, value);
+            }
+
+            // Restore dev-changed file list
+            if (obj.devChangedFiles && Array.isArray(obj.devChangedFiles)) {
+                this.devChangedFiles = new Set(obj.devChangedFiles);
             }
 
             if (obj.merkleDAG) {

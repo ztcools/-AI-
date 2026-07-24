@@ -1284,7 +1284,7 @@ export class Context {
         requestSplitter?: Splitter,
         signal?: AbortSignal,
     ): Promise<{
-        mode: 'full' | 'incremental' | 'up-to-date';
+        mode: 'full' | 'delta' | 'incremental' | 'up-to-date';
         indexedFiles: number;
         totalChunks: number;
         added: number;
@@ -1323,8 +1323,8 @@ export class Context {
         progressCallback?.({ phase: 'Checking for file changes (Merkle)...', current: 0, total: 100, percentage: 0 });
 
         // Merkle comparison: what changed in the working tree?
-        const { added, removed, modified } = await synchronizer.checkForChanges();
-        const totalChanges = added.length + removed.length + modified.length;
+        const { added: rawAdded, removed: rawRemoved, modified: rawModified } = await synchronizer.checkForChanges();
+        const totalChanges = rawAdded.length + rawRemoved.length + rawModified.length;
 
         if (totalChanges === 0 && !isFirstIndex) {
             progressCallback?.({ phase: 'Already up to date', current: 100, total: 100, percentage: 100 });
@@ -1340,12 +1340,122 @@ export class Context {
             };
         }
 
-        // First index: all files are "added"
+        // ── Delta mode: on first index, check if a shared root (main) index exists.
+        // If it does, only index files that differ from root — the rest come from
+        // the root layer at search time. Masks ensure the dev's version always wins.
+        let added = rawAdded;
+        let modified = rawModified;
+        const removed = rawRemoved;
+        let isDeltaIndex = false;
+        /** Files that this dev's collection owns (changed vs root). Empty → full-index mode. */
+        let devOwnedFiles: string[] = [];
+
         if (isFirstIndex) {
-            console.log('[Context] 🆕 First index for this dev+branch — full Merkle-based index.');
+            // Check if root collection exists (shared server-side index on main/master)
+            let rootExists = false;
+            try {
+                const rootCollectionName = this.getRootCollectionName(codebasePath);
+                rootExists = await this.vectorDatabase.hasCollection(rootCollectionName).catch(() => false);
+            } catch { /* root check shouldn't block indexing */ }
+
+            if (rootExists) {
+                // Resolve the root branch name to diff the working tree against
+                const rootBranchesStr = String(envManager.get('GIT_ROOT_BRANCHES') || 'main,master');
+                const rootBranchCandidates = rootBranchesStr.split(',').map(s => s.trim()).filter(Boolean);
+
+                let rootRef: string | null = null;
+                for (const branch of rootBranchCandidates) {
+                    try {
+                        execSync(`git -C "${codebasePath}" rev-parse --verify origin/${branch}`, {
+                            encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+                        });
+                        rootRef = `origin/${branch}`;
+                        break;
+                    } catch {
+                        try {
+                            execSync(`git -C "${codebasePath}" rev-parse --verify ${branch}`, {
+                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+                            });
+                            rootRef = branch;
+                            break;
+                        } catch { /* try next candidate */ }
+                    }
+                }
+
+                if (rootRef) {
+                    try {
+                        // Compute merge-base so we diff against the fork point, not the
+                        // potentially-diverged root tip — this captures only the dev's own work.
+                        let baseRef = rootRef;
+                        try {
+                            const mergeBase = execSync(`git -C "${codebasePath}" merge-base HEAD ${rootRef}`, {
+                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000,
+                            }).trim();
+                            if (mergeBase) baseRef = mergeBase;
+                        } catch { /* merge-base unavailable, diff against rootRef directly */ }
+
+                        // git diff --name-only gives files changed in working tree vs base.
+                        // --diff-filter=ACMR excludes deleted files (they don't exist in the
+                        // working tree and wouldn't be in the synchronizer's added list).
+                        const diffOutput = execSync(
+                            `git -C "${codebasePath}" diff --name-only --diff-filter=ACMR ${baseRef}`,
+                            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
+                        );
+                        const gitChangedFiles = new Set(
+                            diffOutput.trim().split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/'))
+                        );
+
+                        if (gitChangedFiles.size > 0) {
+                            // Filter `added` to only files that actually differ from root.
+                            // Files NOT in gitChangedFiles are identical to root — they'll be
+                            // served from the root layer at search time (not indexed into dev).
+                            added = rawAdded.filter(f => gitChangedFiles.has(f));
+                            modified = rawModified.filter(f => gitChangedFiles.has(f));
+
+                            const skippedCount = rawAdded.length - added.length;
+                            if (skippedCount > 0) {
+                                console.log(`[Context] 🌿 Delta mode: root collection exists, skipping ${skippedCount} unchanged files (available from root layer)`);
+                            }
+                            devOwnedFiles = [...added, ...modified];
+                        } else {
+                            console.log('[Context] 🌿 No changes vs root — all results come from root layer');
+                            devOwnedFiles = [];
+                        }
+                        isDeltaIndex = true;
+                    } catch (diffErr: any) {
+                        console.warn(`[Context] ⚠️  git diff vs ${rootRef} failed (${diffErr.message}), falling back to full index`);
+                        // Fall through: added/modified stay as rawAdded/rawModified
+                    }
+                }
+            }
         } else {
-            console.log(`[Context] 🔄 Merkle changes: +${added.length}/~${modified.length}/-${removed.length}`);
+            // Subsequent index: update devChangedFiles to match what's actually indexed
+            const prevDevFiles = new Set(synchronizer.getDevChangedFiles());
+            isDeltaIndex = prevDevFiles.size > 0; // was previously delta-indexed
+            if (isDeltaIndex) {
+                // Remove deleted files from owned set, add newly changed ones
+                for (const f of removed) prevDevFiles.delete(f);
+                for (const f of added) prevDevFiles.add(f);
+                for (const f of modified) prevDevFiles.add(f);
+                devOwnedFiles = Array.from(prevDevFiles);
+            }
         }
+
+        if (isFirstIndex) {
+            if (isDeltaIndex) {
+                console.log(`[Context] 🆕 First index for this dev+branch — delta mode (${added.length} changed files vs root, ${rawAdded.length - added.length} from root layer)`);
+            } else {
+                console.log('[Context] 🆕 First index for this dev+branch — full Merkle-based index (no root available).');
+            }
+        } else {
+            console.log(`[Context] 🔄 Merkle changes: +${rawAdded.length}/~${rawModified.length}/-${rawRemoved.length}, delta=${isDeltaIndex}`);
+        }
+
+        // Persist the dev-owned file list for search-time masking BEFORE indexing,
+        // so that even if indexing crashes, the next search uses the previous mask
+        // (stale is better than none — stale masks the same or fewer files, so root
+        // results may temporarily surface but dev results still win on RRF + dedup).
+        synchronizer.setDevChangedFiles(devOwnedFiles);
 
         // Delete chunks for removed + modified files (batch query + batch delete).
         await this.deleteFileChunksBatch(devCollectionName, [...removed, ...modified], signal);
@@ -1381,18 +1491,22 @@ export class Context {
         }
 
         if (isFirstIndex) {
-            console.log(`[Context] ✅ Dev-aware first index complete: ${processedFiles} files, ${totalChunks} chunks`);
+            if (isDeltaIndex) {
+                console.log(`[Context] ✅ Dev-aware delta index complete: ${processedFiles} changed files, ${totalChunks} chunks (root provides ${rawAdded.length - added.length} unchanged files)`);
+            } else {
+                console.log(`[Context] ✅ Dev-aware first index complete: ${processedFiles} files, ${totalChunks} chunks`);
+            }
         } else {
-            console.log(`[Context] ✅ Dev-aware Merkle sync complete: +${added.length}/~${modified.length}/-${removed.length}, ${processedFiles} files, ${totalChunks} chunks`);
+            console.log(`[Context] ✅ Dev-aware Merkle sync complete: +${rawAdded.length}/~${rawModified.length}/-${rawRemoved.length}, ${processedFiles} files, ${totalChunks} chunks`);
         }
 
         return {
-            mode: isFirstIndex ? 'full' : 'incremental',
+            mode: isFirstIndex ? (isDeltaIndex ? 'delta' as const : 'full' as const) : 'incremental',
             indexedFiles: processedFiles,
             totalChunks,
-            added: added.length,
-            modified: modified.length,
-            removed: removed.length,
+            added: rawAdded.length,
+            modified: rawModified.length,
+            removed: rawRemoved.length,
             status: limitReached ? 'limit_reached' : 'completed',
         };
     }
