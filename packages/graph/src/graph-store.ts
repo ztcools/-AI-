@@ -441,13 +441,14 @@ export class SqliteGraphStore implements GraphStore {
       const allRows: Array<Record<string, unknown>> = [];
       let totalCount = 0;
 
-      // First pass: FTS (BM25 ranked)
+      // First pass: FTS (BM25 ranked). bm25() returns negative values
+      // (closer to 0 = better), so we use -bm25() for a positive descending score.
       try {
         const ftsRows = rdb.prepare(`
-          SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
+          SELECT n.*, -bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
           FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
           WHERE nodes_fts MATCH ? AND ${whereClause}
-          ORDER BY score LIMIT ?
+          ORDER BY score DESC LIMIT ?
         `).all(ftsQuery, ...params, limit * 2) as Array<Record<string, unknown>>;
         for (const row of ftsRows) {
           if (!seenIds.has(row.id as number)) {
@@ -465,7 +466,8 @@ export class SqliteGraphStore implements GraphStore {
         // FTS failed — skip
       }
 
-      // Second pass: LIKE substring (supplements FTS with substring matching)
+      // Second pass: LIKE substring (supplements, not replaces, FTS).
+      // Only match callable symbols (function/method/class) to reduce noise.
       const words = options.query
         .replace(/([a-z])([A-Z])/g, '$1 $2')
         .split(/[\s_\-.:/]+/)
@@ -474,13 +476,18 @@ export class SqliteGraphStore implements GraphStore {
         const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
         const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
         const { conditions: baseConds, params: baseParams } = this.buildFindConditions(options);
-        const allConds = [...baseConds, ...likeConds.map(c => `(${c})`)];
+        // Only match callable kinds to avoid variable/interface/file noise
+        const allConds = [
+          ...baseConds,
+          ...likeConds.map(c => `(${c})`),
+          "(n.kind IN ('function','method','class'))",
+        ];
         const allP = [...baseParams, ...likeParams];
-        const whereSQL = allConds.length > 0 ? allConds.join(' AND ') : '1=1';
+        const whereSQL = allConds.join(' AND ');
 
         try {
           const likeRows = rdb.prepare(
-            `SELECT n.*, 0.3 AS score FROM nodes n WHERE ${whereSQL} ORDER BY n.name LIMIT ?`
+            `SELECT n.*, 0.1 AS score FROM nodes n WHERE ${whereSQL} ORDER BY n.name LIMIT ?`
           ).all(...allP, limit * 2) as Array<Record<string, unknown>>;
           for (const row of likeRows) {
             if (!seenIds.has(row.id as number)) {
@@ -488,10 +495,6 @@ export class SqliteGraphStore implements GraphStore {
               allRows.push(row);
             }
           }
-          const likeCount = rdb.prepare(
-            `SELECT COUNT(*) as total FROM nodes n WHERE ${whereSQL}`
-          ).get(...allP) as { total: number };
-          totalCount += likeCount.total;
         } catch {
           // LIKE failed — skip
         }

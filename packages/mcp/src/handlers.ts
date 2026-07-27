@@ -58,7 +58,7 @@ export class ToolHandlers {
      *                           below ratio×topScore. 0 disables. Works in both
      *                           dense and hybrid/RRF modes since it's relative. (default 0)
      */
-    private getSearchTuning(): { defaultLimit: number; threshold: number; snippetMaxChars: number; scoreRatio: number; perFileCap: number } {
+    private getSearchTuning(): { defaultLimit: number; threshold: number; snippetMaxChars: number; scoreRatio: number } {
         const num = (name: string, fallback: number): number => {
             const raw = envManager.get(name);
             if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
@@ -66,18 +66,15 @@ export class ToolHandlers {
             return Number.isFinite(v) ? v : fallback;
         };
         return {
-            // max results returned (clamped 1-50, default 10)
+            // max results (1-50, default 10)
             defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
-            // relative score cutoff: keep results with score >= topScore * threshold
-            // 0.4 drops ~30% more noise than 0.3 while keeping key matches
+            // relative cutoff: keep results with score >= topScore * threshold
+            // 0.4 means drop everything < 40% of the top score
             threshold: num('SEARCH_THRESHOLD', 0.4),
             // per-snippet max characters
             snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 4000)),
-            // tail cutoff: drop results with score < topScore * ratio (0 = disabled)
-            scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0.1))),
-            // max results per file (0 = no cap). Prevents one noisy file from
-            // crowding out more relevant files in the top results.
-            perFileCap: Math.max(0, num('SEARCH_PER_FILE_CAP', 3)),
+            // tail cutoff ratio: 0 = disabled. When enabled, drops below topScore * ratio
+            scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
         };
     }
 
