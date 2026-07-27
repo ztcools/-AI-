@@ -250,6 +250,8 @@ export class ReferenceResolver {
   private importMappingsCache: LRUCache<string, ImportMapping[]>;
   private nodesByNameCache: LRUCache<string, GraphNode[]>;
   private knownNames: Set<string> | null = null;
+  /** Suffix-clean names: "Calc.multiply" → we add "multiply" for O(1) intra-class call check. */
+  private knownSuffixNames: Set<string> | null = null;
 
   // Tracking for batch operations
   private nodeCache: Map<number, GraphNode> = new Map();
@@ -281,20 +283,25 @@ export class ReferenceResolver {
    * and pre-loads the knownNames Set for O(1) pre-filtering.
    */
   initialize(): void {
-    // Pre-load known names (cheap — just loads the name column)
     this.knownNames = new Set(this.store.getAllNodeNames(this.project));
-
-    // Detect framework patterns (placeholder — extendable)
+    this._buildSuffixIndex();
     this.detectFrameworkPatterns();
   }
 
-  /**
-   * Pre-load caches for all known files and names.
-   * Call before batch resolution for best performance.
-   */
+  private _buildSuffixIndex(): void {
+    if (!this.knownNames) return;
+    this.knownSuffixNames = new Set();
+    for (const name of this.knownNames) {
+      const dotIdx = name.lastIndexOf('.');
+      if (dotIdx > 0) this.knownSuffixNames.add(name.slice(dotIdx + 1));
+    }
+  }
+
+  /** Pre-load caches for all known files and names. */
   warmCaches(): void {
     if (!this.knownNames) {
       this.knownNames = new Set(this.store.getAllNodeNames(this.project));
+      this._buildSuffixIndex();
     }
 
     // Pre-fetch all file paths
@@ -312,6 +319,7 @@ export class ReferenceResolver {
     this.nodesByNameCache.clear();
     this.nodeCache.clear();
     this.knownNames = null;
+    this.knownSuffixNames = null;
   }
 
   // ── Resolution ───────────────────────────────────────────────────────
@@ -344,6 +352,7 @@ export class ReferenceResolver {
     // Pre-load known names if not already loaded
     if (!this.knownNames) {
       this.knownNames = new Set(this.store.getAllNodeNames(this.project));
+      this._buildSuffixIndex();
     }
 
     // Group refs by file to batch import extraction
@@ -366,15 +375,33 @@ export class ReferenceResolver {
 
         // Step 1: Pre-filter — skip if name doesn't exist at all
         if (this.knownNames && !this.knownNames.has(refName)) {
-          // For dotted names, try the base name
+          // For dotted names, try the base name/member
           const dotIndex = refName.indexOf('.');
-          const baseName = dotIndex > 0 ? refName.slice(0, dotIndex) : refName;
-          if (!this.knownNames.has(baseName) && !this.knownNames.has(refName.slice(dotIndex + 1))) {
-            unresolved.push(ref);
-            incrementStat(byMethod, 'pre-filter');
-            continue;
+          if (dotIndex > 0) {
+            const baseName = refName.slice(0, dotIndex);
+            const memberName = refName.slice(dotIndex + 1);
+            if (!this.knownNames.has(baseName) && !this.knownNames.has(memberName)) {
+              // Check suffix: ClassName.methodName → methodName
+              let suffixFound = false;
+              for (const kn of this.knownNames) {
+                if (kn.endsWith('.' + refName) || kn.endsWith('.' + baseName)) {
+                  suffixFound = true; break;
+                }
+              }
+              if (!suffixFound) {
+                unresolved.push(ref);
+                incrementStat(byMethod, 'pre-filter');
+                continue;
+              }
+            }
+          } else {
+            // Simple name — O(1) suffix check: "multiply" → Calc.multiply
+            if (!this.knownSuffixNames || !this.knownSuffixNames.has(refName)) {
+              unresolved.push(ref);
+              incrementStat(byMethod, 'pre-filter');
+              continue;
+            }
           }
-          // Fall through: the base name exists, try further resolution
         }
 
         // Step 2: Import resolution
@@ -511,6 +538,7 @@ export class ReferenceResolver {
   ): Promise<ResolutionResult['stats']> {
     if (!this.knownNames) {
       this.knownNames = new Set(this.store.getAllNodeNames(this.project));
+      this._buildSuffixIndex();
     }
 
     // Reset stats

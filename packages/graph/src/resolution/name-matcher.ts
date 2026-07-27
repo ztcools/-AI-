@@ -247,6 +247,11 @@ export function matchReference(
   const uniqueName = matchUniqueName(ref, context);
   if (uniqueName) return uniqueName;
 
+  // Strategy 2.5: Suffix name match — for intra-class calls like `this.calculateOrderTotal()`
+  // The node is stored as "OrderService.calculateOrderTotal" but the ref has "calculateOrderTotal"
+  const suffixName = matchSuffixName(ref, context);
+  if (suffixName) return suffixName;
+
   // Strategy 3: Qualified suffix match
   const suffixMatch = matchQualifiedSuffix(ref, context);
   if (suffixMatch) return suffixMatch;
@@ -458,6 +463,61 @@ function matchUniqueName(
       targetNodeId: candidates[0].id,
       resolvedBy: 'unique-name-any-kind',
       confidence: 0.60,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Strategy 2.5: Suffix name match for intra-class method calls.
+ *
+ * `this.calculateOrderTotal()` → ref name "calculateOrderTotal"
+ * DB stores "OrderService.calculateOrderTotal" → try suffix match.
+ * Only for simple names (no dots / ::).
+ */
+function matchSuffixName(
+  ref: UnresolvedReference,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const refName = ref.referenceName;
+  if (refName.includes('.') || refName.includes('::')) return null;
+
+  // Try ref's own file first (intra-class calls are always same-file)
+  const matches: GraphNode[] = [];
+  if (ref.filePath) {
+    const ownNodes = context.getNodesInFile(ref.filePath);
+    for (const node of ownNodes) {
+      if (
+        DEFINITION_KINDS.has(node.kind) &&
+        (node.name === refName || node.name.endsWith('.' + refName))
+      ) {
+        matches.push(node);
+      }
+    }
+  }
+
+  // Fallback: scan all files (for cross-file same-class calls)
+  if (matches.length === 0) {
+    for (const file of context.getAllFiles()) {
+      const nodes = context.getNodesInFile(file);
+      for (const node of nodes) {
+        if (
+          DEFINITION_KINDS.has(node.kind) &&
+          (node.name === refName || node.name.endsWith('.' + refName))
+        ) {
+          matches.push(node);
+        }
+      }
+    }
+  }
+
+  if (matches.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: matches[0].id,
+      resolvedBy: 'suffix-name',
+      confidence: 0.70,
     };
   }
 
