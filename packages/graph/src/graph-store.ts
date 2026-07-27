@@ -437,31 +437,71 @@ export class SqliteGraphStore implements GraphStore {
 
     if (options.query && options.query.trim().length > 0) {
       const ftsQuery = this.buildFtsQuery(options.query);
-      let rows: Array<Record<string, unknown>> = [];
-      let countRow: { total: number } = { total: 0 };
+      const seenIds = new Set<number>();
+      const allRows: Array<Record<string, unknown>> = [];
+      let totalCount = 0;
 
+      // First pass: FTS (BM25 ranked)
       try {
-        rows = rdb.prepare(`
+        const ftsRows = rdb.prepare(`
           SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
           FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
           WHERE nodes_fts MATCH ? AND ${whereClause}
-          ORDER BY score LIMIT ? OFFSET ?
-        `).all(ftsQuery, ...params, limit, offset) as Array<Record<string, unknown>>;
-        countRow = rdb.prepare(`
+          ORDER BY score LIMIT ?
+        `).all(ftsQuery, ...params, limit * 2) as Array<Record<string, unknown>>;
+        for (const row of ftsRows) {
+          if (!seenIds.has(row.id as number)) {
+            seenIds.add(row.id as number);
+            allRows.push(row);
+          }
+        }
+        const ftsCount = rdb.prepare(`
           SELECT COUNT(*) as total
           FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
           WHERE nodes_fts MATCH ? AND ${whereClause}
         `).get(ftsQuery, ...params) as { total: number };
+        totalCount += ftsCount.total;
       } catch {
-        // FTS failed (e.g. special chars) — fall through to LIKE
+        // FTS failed — skip
       }
 
-      if (rows.length === 0) {
-        const r = this.fallbackLikeSearch(options);
-        return r;
+      // Second pass: LIKE substring (supplements FTS with substring matching)
+      const words = options.query
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .split(/[\s_\-.:/]+/)
+        .filter((t: string) => t.length > 1);
+      if (words.length > 0) {
+        const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
+        const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
+        const { conditions: baseConds, params: baseParams } = this.buildFindConditions(options);
+        const allConds = [...baseConds, ...likeConds.map(c => `(${c})`)];
+        const allP = [...baseParams, ...likeParams];
+        const whereSQL = allConds.length > 0 ? allConds.join(' AND ') : '1=1';
+
+        try {
+          const likeRows = rdb.prepare(
+            `SELECT n.*, 0.3 AS score FROM nodes n WHERE ${whereSQL} ORDER BY n.name LIMIT ?`
+          ).all(...allP, limit * 2) as Array<Record<string, unknown>>;
+          for (const row of likeRows) {
+            if (!seenIds.has(row.id as number)) {
+              seenIds.add(row.id as number);
+              allRows.push(row);
+            }
+          }
+          const likeCount = rdb.prepare(
+            `SELECT COUNT(*) as total FROM nodes n WHERE ${whereSQL}`
+          ).get(...allP) as { total: number };
+          totalCount += likeCount.total;
+        } catch {
+          // LIKE failed — skip
+        }
       }
 
-      return this.buildNodeResults(rows, countRow, options, offset);
+      // Apply offset/limit after merging
+      const start = offset || 0;
+      const sliced = allRows.slice(start, start + limit);
+      const mergedCount = { total: seenIds.size };
+      return this.buildNodeResults(sliced, mergedCount, options, offset);
     } else {
       const query = `
         SELECT n.*, 0 AS score
@@ -1099,8 +1139,10 @@ export class SqliteGraphStore implements GraphStore {
     const tokens = query
       .replace(/([a-z])([A-Z])/g, '$1 $2')
       .split(/[\s_\-.:/]+/)
-      .filter(t => t.length > 0);
-    return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+      .filter(t => t.length > 1); // skip single chars — too noisy
+    // Prefix matching: "order*" matches "createOrder" when FTS tokenizer
+    // sees the whole camelCase word as one token
+    return tokens.map(t => `"${t.replace(/"/g, '""')}"*`).join(' OR ');
   }
 
   private regexToLike(pattern: string): string {
