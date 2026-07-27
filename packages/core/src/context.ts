@@ -1273,7 +1273,7 @@ export class Context {
         // the root layer at search time. Masks ensure the dev's version always wins.
         let added = rawAdded;
         let modified = rawModified;
-        const removed = rawRemoved;
+        let removed = rawRemoved;
         let isDeltaIndex = false;
         /** Files that this dev's collection owns (changed vs root). Empty → full-index mode. */
         let devOwnedFiles: string[] = [];
@@ -1373,6 +1373,80 @@ export class Context {
                 console.log('[Context] ⚠️  LOCAL_FULL_INDEX_ENABLED=true — proceeding with full local index (no root available).');
             }
         } else {
+            // ── Rebase/reset reconciliation ─────────────────────────────
+            // The Merkle approach tracks file CONTENTS, so file changes from
+            // rebase/reset are detected naturally. But devChangedFiles — the
+            // set of files this dev "owns" vs root — can become stale after
+            // a rebase: files that WERE different may now be identical to the
+            // new root, and files that newly diverge need to be added.
+            //
+            // We detect this by tracking the merge-base commit hash. When it
+            // changes, we recompute devChangedFiles from git diff and force
+            // re-index all previously-owned files (their delta status may have
+            // changed vs the new root).
+            let rebaseCnt = 0;
+            try {
+                const rootBranchesStr = String(envManager.get('GIT_ROOT_BRANCHES') || 'main,master');
+                const rootBranchCandidates = rootBranchesStr.split(',').map(s => s.trim()).filter(Boolean);
+                let rootRef: string | null = null;
+                for (const branch of rootBranchCandidates) {
+                    try {
+                        execSync(`git -C "${codebasePath}" rev-parse --verify origin/${branch}`, {
+                            encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+                        });
+                        rootRef = `origin/${branch}`;
+                        break;
+                    } catch {
+                        try {
+                            execSync(`git -C "${codebasePath}" rev-parse --verify ${branch}`, {
+                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+                            });
+                            rootRef = branch;
+                            break;
+                        } catch { /* try next */ }
+                    }
+                }
+                if (rootRef) {
+                    const mergeBase = execSync(`git -C "${codebasePath}" merge-base HEAD ${rootRef}`, {
+                        encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000,
+                    }).trim();
+                    const rebaseDetected = synchronizer.setLastMergeBase(mergeBase);
+                    if (rebaseDetected) {
+                        console.log(`[Context] 🔄 Rebase detected (merge-base changed). Recomputing dev-owned files.`);
+                        // Recompute devChangedFiles: which files differ from the new root?
+                        const diffOutput = execSync(
+                            `git -C "${codebasePath}" diff --name-only --diff-filter=ACMR ${mergeBase}`,
+                            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
+                        );
+                        const newChangedFiles = new Set(
+                            diffOutput.trim().split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/'))
+                        );
+                        // Old dev-owned files that became identical to root → remove from devChangedFiles
+                        // Old dev-owned files that are still different → keep, but force re-index
+                        const oldDevFiles = new Set(synchronizer.getDevChangedFiles());
+                        for (const f of oldDevFiles) {
+                            if (!newChangedFiles.has(f)) {
+                                removed.push(f);
+                                rebaseCnt++;
+                            }
+                        }
+                        // Files that newly diverge but Merkle didn't detect (content same on disk)
+                        for (const f of newChangedFiles) {
+                            if (!oldDevFiles.has(f) && !added.includes(f) && !modified.includes(f)) {
+                                modified.push(f);
+                                rebaseCnt++;
+                            }
+                        }
+                        // Update devOwnedFiles to the new reality
+                        devOwnedFiles = Array.from(newChangedFiles);
+                        console.log(`[Context] 🔄 Rebase reconciliation: ${rebaseCnt} files adjusted to match new root.`);
+                    }
+                }
+            } catch (rebaseErr: any) {
+                console.warn(`[Context] ⚠️  Rebase detection failed: ${rebaseErr.message}`);
+            }
+            // ── End rebase reconciliation ──────────────────────────────
+
             // Subsequent index: update devChangedFiles to match what's actually indexed
             const prevDevFiles = new Set(synchronizer.getDevChangedFiles());
             isDeltaIndex = prevDevFiles.size > 0; // was previously delta-indexed
@@ -1381,7 +1455,12 @@ export class Context {
                 for (const f of removed) prevDevFiles.delete(f);
                 for (const f of added) prevDevFiles.add(f);
                 for (const f of modified) prevDevFiles.add(f);
-                devOwnedFiles = Array.from(prevDevFiles);
+                // Only override if rebase didn't already set it
+                if (rebaseCnt === 0) {
+                    devOwnedFiles = Array.from(prevDevFiles);
+                } else {
+                    // Rebase already set devOwnedFiles; keep it
+                }
             }
         }
 

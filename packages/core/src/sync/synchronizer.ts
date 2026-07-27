@@ -31,6 +31,12 @@ export class FileSynchronizer {
      * (no root available), meaning all files are in dev collection.
      */
     private devChangedFiles: Set<string> = new Set();
+    /**
+     * Last-known git merge-base commit between HEAD and origin/main.
+     * Tracked so we can detect rebase/reset and recompute devChangedFiles.
+     * Null when git is unavailable or this is a full-index project.
+     */
+    private lastMergeBase: string | null = null;
 
     constructor(
         rootDir: string,
@@ -363,6 +369,22 @@ export class FileSynchronizer {
         this.devChangedFiles = new Set(files);
     }
 
+    /** Get the last-known merge-base commit hash (null if git unavailable). */
+    getLastMergeBase(): string | null {
+        return this.lastMergeBase;
+    }
+
+    /**
+     * Set the last-known merge-base. If different from the stored value,
+     * returns true (signaling that a rebase/reset happened) and the caller
+     * must recompute devChangedFiles.
+     */
+    setLastMergeBase(hash: string): boolean {
+        const changed = this.lastMergeBase !== null && this.lastMergeBase !== hash;
+        this.lastMergeBase = hash;
+        return changed;
+    }
+
     /** Mark the snapshot as clean after successful indexing. */
     async markClean(): Promise<void> {
         if (!this.dirty) return;
@@ -393,6 +415,7 @@ export class FileSynchronizer {
             merkleDAG: this.merkleDAG.serialize(),
             status: this.dirty ? 'dirty' : 'clean',
             devChangedFiles: devChangedFilesArray,
+            lastMergeBase: this.lastMergeBase,
         });
         await fs.writeFile(this.snapshotPath, data, 'utf-8');
         console.log(`Saved snapshot to ${this.snapshotPath} (status: ${this.dirty ? 'dirty' : 'clean'})`);
@@ -423,6 +446,11 @@ export class FileSynchronizer {
             // Restore dev-changed file list
             if (obj.devChangedFiles && Array.isArray(obj.devChangedFiles)) {
                 this.devChangedFiles = new Set(obj.devChangedFiles);
+            }
+
+            // Restore last-known merge-base for rebase detection
+            if (typeof obj.lastMergeBase === 'string') {
+                this.lastMergeBase = obj.lastMergeBase;
             }
 
             if (obj.merkleDAG) {
