@@ -653,14 +653,16 @@ export class GraphExtractor {
   ): void {
     const nodeKind = config.nodeTypes[node.type];
 
-    // Track current parent definition for scoping calls
+    // Track current parent definition for scoping calls.
+    // Only function/method/class nodes create scope — variable declarations
+    // (e.g. const sum = add(x,y)) must NOT shadow the parent scope.
     let currentDefIdx: number | undefined = parentDefIdx;
 
     if (nodeKind) {
       const name = this.extractName(node, source, config);
       if (name) {
         const entry = registry.get(name);
-        if (entry) {
+        if (entry && (nodeKind === 'function' || nodeKind === 'method' || nodeKind === 'class')) {
           currentDefIdx = entry.nodeIndex;
         }
       }
