@@ -1415,60 +1415,48 @@ export class ToolHandlers {
         query: string,
     ): string {
         const store = this.graphToolHandlers!.getStore();
+        const traverser = this.graphToolHandlers!.getTraverser();
         const project = getRepoIdentity(codebasePath);
         const lines: string[] = [];
         const seenSymbols = new Set<string>();
 
         // Extract query keywords for symbol relevance filtering.
         const queryWords = query.toLowerCase().split(/[\s_\-.,:;!?/\\()\[\]{}]+/).filter((w: string) => w.length > 1);
-        // heuristics for the top N matched files (reduced from 10 to avoid noise)
         const maxFiles = 5;
         const perFileLimit = 12;
 
-        // Collect unique file paths
+        // Collect unique file paths from top results
         const seenFiles = new Set<string>();
         for (const result of searchResults.slice(0, maxFiles)) {
             seenFiles.add(result.relativePath);
         }
 
-        // === Layer 1: Direct call relationships (query-keyword filtered) ===
+        // === Layer 1: Resolve symbols in hit files ===
         const allNodeIds = new Set<number>();
         const fileNodes: Array<{ node: any; filePath: string }> = [];
 
         for (const filePath of seenFiles) {
             const normalizedPath = filePath.replace(/^\/+/, '');
-            let nodeResult = store.findNodes({
+            const nodeResult = store.findNodes({
                 project,
                 exactFilePath: normalizedPath,
                 limit: perFileLimit,
             });
-            if (nodeResult.results.length === 0 && normalizedPath !== filePath) {
-                nodeResult = store.findNodes({
-                    project,
-                    exactFilePath: filePath,
-                    limit: perFileLimit,
-                });
-            }
             for (const r of nodeResult.results) {
                 const kind = r.node.kind;
-                // Drop noise: interfaces, types, variables — only keep callable symbols
                 if (kind !== 'function' && kind !== 'method' && kind !== 'class') continue;
-                // Drop unused symbols entirely
-                const nodeId = r.node.id;
-                // Quick check: if the symbol name contains any query keyword, or if
-                // it's in a hit file from search (always top-N results context)
                 const nameLower = r.node.name.toLowerCase();
                 const relevant = queryWords.length === 0 || queryWords.some((w: string) => nameLower.includes(w));
                 if (relevant) {
                     fileNodes.push({ node: r.node, filePath: normalizedPath });
-                    allNodeIds.add(nodeId);
+                    allNodeIds.add(r.node.id);
                 }
             }
         }
 
         if (fileNodes.length === 0) return '';
 
-        // Batch edges
+        // === Layer 2: Batch fetch callers/callees for all hit symbols ===
         const nodeIdsArr = fileNodes.map(f => f.node.id);
         const allCallerEdges = store.getEdgesByTargetBatch(nodeIdsArr, 'calls');
         const allCalleeEdges = store.getEdgesBySourceBatch(nodeIdsArr);
@@ -1480,6 +1468,7 @@ export class ToolHandlers {
 
         const nodeMap = store.getNodesById(Array.from(allNodeIds));
 
+        // === Layer 2a: Direct call graph (single-depth, with signatures) ===
         const directRelations: string[] = [];
         for (const { node } of fileNodes) {
             const key = node.qualifiedName;
@@ -1489,44 +1478,69 @@ export class ToolHandlers {
             const callerEdges = allCallerEdges.get(node.id) || [];
             const calleeEdges = allCalleeEdges.get(node.id) || [];
 
-            const callerNames = callerEdges.slice(0, 2).map((e) => {
+            if (callerEdges.length === 0 && calleeEdges.length === 0) continue;
+
+            const callerNames = callerEdges.slice(0, 3).map((e) => {
                 const caller = nodeMap.get(e.sourceId);
-                return caller ? caller.name : '?';
+                return caller ? `\`${caller.name}\`` : '?';
             });
-            const calleeNames = calleeEdges.slice(0, 2).map((e) => {
+            const calleeNames = calleeEdges.slice(0, 3).map((e) => {
                 const callee = nodeMap.get(e.targetId);
-                return callee ? callee.name : '?';
+                return callee ? `\`${callee.name}\`` : '?';
             });
 
             let line = `\`${node.name}\``;
+            if (node.signature) line += node.signature;
             if (callerNames.length > 0) line += ` ← ${callerNames.join(', ')}`;
             if (calleeNames.length > 0) line += ` → ${calleeNames.join(', ')}`;
-            if (callerEdges.length === 0 && calleeEdges.length === 0) continue; // skip truly isolated
             line += `  (${node.filePath}:${node.startLine})`;
             directRelations.push(line);
         }
 
         if (directRelations.length > 0) {
-            lines.push('### Calls');
-            lines.push(...directRelations.map(l => `- ${l}`));
+            lines.push('### Call Graph');
+            lines.push(...directRelations.slice(0, 15).map(l => `- ${l}`));
+            if (directRelations.length > 15) {
+                lines.push(`- ... and ${directRelations.length - 15} more`);
+            }
             lines.push('');
         }
 
-        // === Layer 2: Architecture (compact, once per session) ===
+        // === Layer 3: Impact analysis for top matched symbols ===
+        const topNodes = fileNodes.slice(0, 3);
+        const impactEntries: string[] = [];
+        for (const { node } of topNodes) {
+            try {
+                const impact = traverser.getImpactRadius(node.id, 2);
+                if (impact.nodes.size > 1) {
+                    const impactedNames = Array.from(impact.nodes.values())
+                        .filter(n => n.id !== node.id)
+                        .slice(0, 5)
+                        .map(n => `\`${n.name}\``);
+                    if (impactedNames.length > 0) {
+                        impactEntries.push(`- \`${node.name}\` impacts: ${impactedNames.join(', ')}`);
+                    }
+                }
+            } catch { /* non-critical */ }
+        }
+        if (impactEntries.length > 0) {
+            lines.push('### Change Impact');
+            lines.push(...impactEntries);
+            lines.push('');
+        }
+
+        // === Layer 4: Architecture (compact, once per search session) ===
         if (!this.architectureEmitted.has(project)) {
           try {
             const archResult = this.graphToolHandlers!.handleGetArchitecture({ project });
             const archText = archResult.content[0]?.text || '';
             const archLines = archText.split('\n');
             const summary: string[] = [];
-            let inEntry = false, inCluster = false, entryCount = 0, clusterCount = 0;
+            let inEntry = false, entryCount = 0;
             for (const line of archLines) {
                 if (line.startsWith('Entry points')) { inEntry = true; summary.push(line); continue; }
                 if (inEntry && line.startsWith('  -') && entryCount < 5) { summary.push(line); entryCount++; continue; }
                 if (inEntry && !line.startsWith('  -')) inEntry = false;
-                if (line.startsWith('Clusters')) { inCluster = true; summary.push(line); continue; }
-                if (inCluster && line.startsWith('  ') && clusterCount < 3) { summary.push(line); clusterCount++; continue; }
-                if (inCluster && clusterCount >= 3) inCluster = false;
             }
             if (summary.length > 0) {
                 lines.push('### Architecture');

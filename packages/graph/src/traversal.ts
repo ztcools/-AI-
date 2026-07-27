@@ -531,34 +531,42 @@ export class GraphTraverser {
     direction: 'outgoing' | 'incoming' | 'both',
     edgeKinds: GraphEdgeKind[] = [],
   ): GraphEdge[] {
-    const getOut = (kinds?: GraphEdgeKind[]): GraphEdge[] => {
-      if (!kinds || kinds.length === 0) {
-        return this.store.getEdgesBySource(nodeId);
-      }
-      const all: GraphEdge[] = [];
-      for (const k of kinds) {
-        all.push(...this.store.getEdgesBySource(nodeId, k));
-      }
-      return all;
-    };
-    const getIn = (kinds?: GraphEdgeKind[]): GraphEdge[] => {
-      if (!kinds || kinds.length === 0) {
-        return this.store.getEdgesByTarget(nodeId);
-      }
-      const all: GraphEdge[] = [];
-      for (const k of kinds) {
-        all.push(...this.store.getEdgesByTarget(nodeId, k));
-      }
-      return all;
-    };
-
     const filter = edgeKinds.length > 0 ? edgeKinds : undefined;
 
-    if (direction === 'outgoing') return getOut(filter);
-    if (direction === 'incoming') return getIn(filter);
+    if (direction === 'outgoing') {
+      return (this.store as any).getEdgesBySourceKinds?.(nodeId, filter)
+        ?? this.getAdjacentEdgesLegacy(nodeId, direction, filter);
+    }
+    if (direction === 'incoming') {
+      return (this.store as any).getEdgesByTargetKinds?.(nodeId, filter)
+        ?? this.getAdjacentEdgesLegacy(nodeId, direction, filter);
+    }
 
-    // Both directions
-    return [...getOut(filter), ...getIn(filter)];
+    return [
+      ...this.getAdjacentEdges(nodeId, 'outgoing', edgeKinds),
+      ...this.getAdjacentEdges(nodeId, 'incoming', edgeKinds),
+    ];
+  }
+
+  /** Fallback for stores without getEdgesBySourceKinds/getEdgesByTargetKinds. */
+  private getAdjacentEdgesLegacy(
+    nodeId: number,
+    direction: 'outgoing' | 'incoming',
+    kinds?: GraphEdgeKind[],
+  ): GraphEdge[] {
+    if (!kinds || kinds.length === 0) {
+      return direction === 'outgoing'
+        ? this.store.getEdgesBySource(nodeId)
+        : this.store.getEdgesByTarget(nodeId);
+    }
+    const all: GraphEdge[] = [];
+    for (const k of kinds) {
+      const edges = direction === 'outgoing'
+        ? this.store.getEdgesBySource(nodeId, k)
+        : this.store.getEdgesByTarget(nodeId, k);
+      all.push(...edges);
+    }
+    return all;
   }
 }
 

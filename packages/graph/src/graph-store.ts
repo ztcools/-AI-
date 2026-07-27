@@ -599,6 +599,26 @@ export class SqliteGraphStore implements GraphStore {
     return rows.map(r => this.rowToEdge(r));
   }
 
+  getEdgesBySourceKinds(sourceId: number, kinds?: GraphEdgeKind[]): GraphEdge[] {
+    if (!kinds || kinds.length === 0) {
+      return this.getEdgesBySource(sourceId);
+    }
+    const placeholders = kinds.map(() => '?').join(',');
+    const sql = `SELECT * FROM edges WHERE source_id = ? AND kind IN (${placeholders})`;
+    const rows = this.readDB.prepare(sql).all(sourceId, ...kinds) as Array<Record<string, unknown>>;
+    return rows.map(r => this.rowToEdge(r));
+  }
+
+  getEdgesByTargetKinds(targetId: number, kinds?: GraphEdgeKind[]): GraphEdge[] {
+    if (!kinds || kinds.length === 0) {
+      return this.getEdgesByTarget(targetId);
+    }
+    const placeholders = kinds.map(() => '?').join(',');
+    const sql = `SELECT * FROM edges WHERE target_id = ? AND kind IN (${placeholders})`;
+    const rows = this.readDB.prepare(sql).all(targetId, ...kinds) as Array<Record<string, unknown>>;
+    return rows.map(r => this.rowToEdge(r));
+  }
+
   getEdgesBySourceBatch(sourceIds: number[], kind?: GraphEdgeKind): Map<number, GraphEdge[]> {
     const resultMap = new Map<number, GraphEdge[]>();
     if (sourceIds.length === 0) return resultMap;
