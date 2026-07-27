@@ -67,3 +67,6 @@ repos
 
 evaluation/retrieval_results*
 .venv/test-repos/
+
+# Graph index data (per-developer, rebuilt locally)
+.context/
