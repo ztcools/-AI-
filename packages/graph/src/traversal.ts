@@ -53,6 +53,12 @@ interface TraversalStep {
 
 export class GraphTraverser {
   private store: SqliteGraphStore;
+  /** Node kinds to exclude from traversal results (noise). */
+  private static NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
+
+  private isNoise(node: GraphNode): boolean {
+    return GraphTraverser.NOISE_KINDS.has(node.kind);
+  }
 
   constructor(store: SqliteGraphStore) {
     this.store = store;
@@ -218,7 +224,7 @@ export class GraphTraverser {
 
     for (const edge of incoming) {
       const callerNode = callerNodes.get(edge.sourceId);
-      if (callerNode && !visited.has(callerNode.id)) {
+      if (callerNode && !visited.has(callerNode.id) && !this.isNoise(callerNode)) {
         result.push({ node: callerNode, edge });
         this.getCallersRecursive(callerNode.id, maxDepth, currentDepth + 1, result, visited);
       }
@@ -251,7 +257,7 @@ export class GraphTraverser {
 
     for (const edge of outgoing) {
       const calleeNode = calleeNodes.get(edge.targetId);
-      if (calleeNode && !visited.has(calleeNode.id)) {
+      if (calleeNode && !visited.has(calleeNode.id) && !this.isNoise(calleeNode)) {
         result.push({ node: calleeNode, edge });
         this.getCalleesRecursive(calleeNode.id, maxDepth, currentDepth + 1, result, visited);
       }

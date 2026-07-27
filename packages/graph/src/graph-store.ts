@@ -131,12 +131,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 const FTS_TRIGGERS_SQL = `
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
     INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (
-      new.id,
-      replace(replace(replace(new.name, '_', ' '), '-', ' '), '::', ' '),
-      replace(replace(replace(new.qualified_name, '_', ' '), '-', ' '), '.', ' ') ,
-      replace(replace(new.file_path, '/', ' '), '_', ' ')
-    );
+    VALUES (new.id, new.name, new.qualified_name, new.file_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
@@ -148,12 +143,7 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
     VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
     INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (
-      new.id,
-      replace(replace(replace(new.name, '_', ' '), '-', ' '), '::', ' '),
-      replace(replace(replace(new.qualified_name, '_', ' '), '-', ' '), '.', ' ') ,
-      replace(replace(new.file_path, '/', ' '), '_', ' ')
-    );
+    VALUES (new.id, new.name, new.qualified_name, new.file_path);
 END;
 `;
 
@@ -272,6 +262,9 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   endBulkLoad(): void {
+    // Rebuild FTS index from the content table. FTS5 'rebuild' command
+    // repopulates from nodes columns exactly as they are stored.
+    // CamelCase matching is handled by the LIKE fallback in findNodes.
     this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
     this.db.exec(FTS_TRIGGERS_SQL);
     this.db.pragma('foreign_keys = ON');
@@ -467,23 +460,24 @@ export class SqliteGraphStore implements GraphStore {
       }
 
       // Second pass: LIKE substring (supplements, not replaces, FTS).
-      // Only match callable symbols (function/method/class) to reduce noise.
-      const words = options.query
+      // For multi-word queries (>2 words), require only majority words to match
+      // (AND semantics for ≤2 words, at-least-floor(N/2+1) for 3+ words).
+      // This prevents a single non-matching word from zeroing out results.
+      const words = (options.query || '')
         .replace(/([a-z])([A-Z])/g, '$1 $2')
         .split(/[\s_\-.:/]+/)
         .filter((t: string) => t.length > 1);
       if (words.length > 0) {
-        const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
+        const minMatch = words.length <= 2 ? words.length : Math.floor(words.length / 2) + 1;
         const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
+        const likeExprs = words.map(() => `(CASE WHEN n.name LIKE ? OR n.qualified_name LIKE ? THEN 1 ELSE 0 END)`);
         const { conditions: baseConds, params: baseParams } = this.buildFindConditions(options);
-        // Only match callable kinds to avoid variable/interface/file noise
-        const allConds = [
-          ...baseConds,
-          ...likeConds.map(c => `(${c})`),
-          "(n.kind IN ('function','method','class'))",
+        const allConds = [...baseConds, ...(baseConds.length > 0 ? [] : []),
+          `(n.kind IN ('function','method','class'))`,
+          `(${likeExprs.join(' + ')}) >= ${minMatch}`,
         ];
         const allP = [...baseParams, ...likeParams];
-        const whereSQL = allConds.join(' AND ');
+        const whereSQL = allConds.filter(c => c).join(' AND ');
 
         try {
           const likeRows = rdb.prepare(
@@ -1128,9 +1122,8 @@ export class SqliteGraphStore implements GraphStore {
     const tokens = query
       .replace(/([a-z])([A-Z])/g, '$1 $2')
       .split(/[\s_\-.:/]+/)
-      .filter(t => t.length > 1); // skip single chars — too noisy
-    // Prefix matching: "order*" matches "createOrder" when FTS tokenizer
-    // sees the whole camelCase word as one token
+      .filter(t => t.length > 1);
+    // Prefix matching: "ord"* matches "OrderService" stored as single token
     return tokens.map(t => `"${t.replace(/"/g, '""')}"*`).join(' OR ');
   }
 
