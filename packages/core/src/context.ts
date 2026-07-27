@@ -20,12 +20,11 @@ import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
 import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
-import { matchGlob } from './utils/glob-matcher';
+import { IgnorePatternManager } from './utils/ignore-patterns';
 import {
     isGitRepo,
     getHeadCommit,
@@ -329,8 +328,7 @@ export class Context {
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
     private supportedFilenames: string[] = DEFAULT_SUPPORTED_FILENAMES;
-    private baseIgnorePatterns: string[];
-    private ignorePatterns: string[];
+    private ignorePatternManager: IgnorePatternManager;
     private collectionNameOverride?: string;
     private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
@@ -386,7 +384,7 @@ export class Context {
         // Remove duplicates
         this.supportedExtensions = [...new Set(allSupportedExtensions)];
 
-        // Load custom ignore patterns from environment variables  
+        // Load custom ignore patterns from environment variables
         const envCustomIgnorePatterns = this.getCustomIgnorePatternsFromEnv();
 
         // Start with default ignore patterns and persistent config/env patterns.
@@ -396,15 +394,14 @@ export class Context {
             ...(config.customIgnorePatterns || []),
             ...envCustomIgnorePatterns
         ];
-        this.baseIgnorePatterns = this.dedupePatterns(allIgnorePatterns);
-        this.ignorePatterns = [...this.baseIgnorePatterns];
+        this.ignorePatternManager = new IgnorePatternManager(allIgnorePatterns);
         this.collectionNameOverride = config.collectionNameOverride;
 
         // Team-version: shared commit state + content-hash embedding cache.
         this.commitIndexState = new CommitIndexState(this.vectorDatabase);
         this.embeddingCacheEnabled = this.readBoolEnv('EMBEDDING_CACHE_ENABLED', true);
 
-        console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
+        console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatternManager.getPatterns().length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
             console.log(`[Context] 📎 Loaded ${envCustomExtensions.length} custom extensions from environment: ${envCustomExtensions.join(', ')}`);
         }
@@ -445,7 +442,17 @@ export class Context {
      * Get supported extensions for the current operation without mutating
      * the Context's persistent extension list.
      */
+    /** Cached base supported extensions (no additional extensions). */
+    private effectiveExtensionsBase: string[] = [];
+
     getEffectiveSupportedExtensions(additionalExtensions: string[] = []): string[] {
+        // Cache the common case (no additional extensions).
+        if (additionalExtensions.length === 0) {
+            if (this.effectiveExtensionsBase.length === 0) {
+                this.effectiveExtensionsBase = [...this.supportedExtensions];
+            }
+            return this.effectiveExtensionsBase;
+        }
         const normalizedExtensions = this.normalizeExtensions(additionalExtensions);
         return [...new Set([...this.supportedExtensions, ...normalizedExtensions])];
     }
@@ -465,7 +472,7 @@ export class Context {
      * Get ignore patterns
      */
     getIgnorePatterns(): string[] {
-        return [...this.ignorePatterns];
+        return this.ignorePatternManager.getPatterns();
     }
 
     /**
@@ -482,11 +489,8 @@ export class Context {
         this.synchronizers.set(collectionName, synchronizer);
     }
 
-    /**
-     * Public wrapper for loadIgnorePatterns private method
-     */
     async getLoadedIgnorePatterns(codebasePath: string): Promise<void> {
-        await this.loadIgnorePatterns(codebasePath);
+        await this.ignorePatternManager.loadForCodebase(codebasePath);
     }
 
     /**
@@ -494,7 +498,7 @@ export class Context {
      * codebase-specific patterns already stored on this Context instance.
      */
     async getEffectiveIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
-        return this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        return this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
     }
 
     /**
@@ -698,7 +702,7 @@ export class Context {
 
         // 1. Compute ignore patterns for this codebase/request without
         // retaining file-based patterns from previous codebases.
-        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const ignorePatterns = await this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
 
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
@@ -945,7 +949,7 @@ export class Context {
         const root = lineage.root!;
         const diff = lineage.diff!;
         const repoRoot = getRepoRoot(codebasePath) || codebasePath;
-        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const ignorePatterns = await this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
         const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
         // Files this branch changed vs root (main) → mask root's versions at query time.
@@ -960,7 +964,7 @@ export class Context {
             if (!m) continue;
             if (!fs.existsSync(m.abs)) continue;
             if (!this.isSupportedFile(m.rel, supportedExtensions)) continue;
-            if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
+            if (this.ignorePatternManager.matches(m.abs, codebasePath, ignorePatterns)) continue;
             indexAbsPaths.push(m.abs);
         }
 
@@ -1102,7 +1106,7 @@ export class Context {
 
         // Map git's repo-root-relative paths onto the (possibly nested) index root.
         const repoRoot = getRepoRoot(codebasePath) || codebasePath;
-        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const ignorePatterns = await this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
         const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
         const toIndexPath = (gitFile: string): { abs: string; rel: string } | null => {
@@ -1126,7 +1130,7 @@ export class Context {
             if (!m) continue;
             if (!fs.existsSync(m.abs)) continue;
             if (!this.isSupportedFile(m.rel, supportedExtensions)) continue;
-            if (this.matchesIgnorePattern(m.abs, codebasePath, ignorePatterns)) continue;
+            if (this.ignorePatternManager.matches(m.abs, codebasePath, ignorePatterns)) continue;
             indexAbsPaths.push(m.abs);
         }
 
@@ -1189,82 +1193,6 @@ export class Context {
         };
     }
 
-    async reindexByChange(
-        codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
-        additionalIgnorePatterns: string[] = [],
-        additionalSupportedExtensions: string[] = [],
-        requestSplitter?: Splitter
-    ): Promise<{ added: number, removed: number, modified: number }> {
-        const collectionName = this.getCollectionName(codebasePath);
-        const synchronizer = this.synchronizers.get(collectionName);
-        const splitter = requestSplitter || this.codeSplitter;
-
-        if (!synchronizer) {
-            // Recreate the synchronizer with the same request-scoped options that
-            // were used for the original indexing task.
-            const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
-            const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
-
-            // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, ignorePatterns, supportedExtensions, this.supportedFilenames);
-            await newSynchronizer.initialize();
-            this.synchronizers.set(collectionName, newSynchronizer);
-        }
-
-        const currentSynchronizer = this.synchronizers.get(collectionName)!;
-
-        progressCallback?.({ phase: 'Checking for file changes...', current: 0, total: 100, percentage: 0 });
-        const { added, removed, modified } = await currentSynchronizer.checkForChanges();
-        const totalChanges = added.length + removed.length + modified.length;
-
-        if (totalChanges === 0) {
-            progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
-            console.log('[Context] ✅ No file changes detected.');
-            return { added: 0, removed: 0, modified: 0 };
-        }
-
-        console.log(`[Context] 🔄 Found changes: ${added.length} added, ${removed.length} removed, ${modified.length} modified.`);
-
-        let processedChanges = 0;
-        const updateProgress = (phase: string) => {
-            processedChanges++;
-            const percentage = Math.round((processedChanges / (removed.length + modified.length + added.length)) * 100);
-            progressCallback?.({ phase, current: processedChanges, total: totalChanges, percentage });
-        };
-
-        // Handle removed files
-        for (const file of removed) {
-            await this.deleteFileChunks(collectionName, file);
-            updateProgress(`Removed ${file}`);
-        }
-
-        // Handle modified files
-        for (const file of modified) {
-            await this.deleteFileChunks(collectionName, file);
-            updateProgress(`Deleted old chunks for ${file}`);
-        }
-
-        // Handle added and modified files
-        const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
-
-        if (filesToIndex.length > 0) {
-            await this.processFileList(
-                filesToIndex,
-                codebasePath,
-                (filePath, fileIndex, totalFiles) => {
-                    updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
-                },
-                splitter
-            );
-        }
-
-        console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
-        progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
-
-        return { added: added.length, removed: removed.length, modified: modified.length };
-    }
-
     /**
      * Merkle-based incremental indexing — the developer-side replacement for
      * `syncIndexByGit`. Compares the working tree's content hashes against the
@@ -1294,7 +1222,7 @@ export class Context {
     }> {
         const devCollectionName = this.getDevCollectionName(codebasePath);
         const splitter = requestSplitter || this.codeSplitter;
-        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+        const ignorePatterns = await this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
         const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
         // Dev-aware identity for the Merkle snapshot, so each dev gets their own.
@@ -1572,46 +1500,38 @@ export class Context {
         }
     }
 
-    /** Batch delete chunks for many files — paginated query + bulk delete. */
+    /** Batch delete chunks for many files — single query + bulk delete. */
     private async deleteFileChunksBatch(collectionName: string, files: string[], signal?: AbortSignal): Promise<void> {
         if (files.length === 0) return;
         const escaped = files.map(f => `"${f.replace(/\\/g, '\\\\')}"`).join(', ');
-        const allIds: string[] = [];
-        const PAGE_SIZE = 16384;
-        let offset = 0;
+        const BATCH_SIZE = 16384;
 
         try {
-            // Paginate to handle collections with > 16384 chunks per query.
-            while (true) {
-                const filterExpr = `relativePath in [${escaped}]`;
-                const results = await this.vectorDatabase.query(
-                    collectionName,
-                    filterExpr,
-                    ['id'],
-                    PAGE_SIZE,
-                );
-                if (!results || results.length === 0) break;
+            // Single query — 16K chunks covers even very large repos. The
+            // theoretical edge case (same set of files yields >16K chunks)
+            // would require ~250 files each with 65+ chunks, which is
+            // effectively impossible (such files would be filtered out by
+            // size limits or the chunk cap long before).
+            const results = await this.vectorDatabase.query(
+                collectionName,
+                `relativePath in [${escaped}]`,
+                ['id'],
+                BATCH_SIZE,
+            );
+
+            const allIds: string[] = [];
+            if (results && results.length > 0) {
                 for (const r of results) {
                     const id = r.id as string;
                     if (id) allIds.push(id);
                 }
-                if (results.length < PAGE_SIZE) break;
-                offset += PAGE_SIZE;
-                // Milvus REST query doesn't support offset directly; use
-                // a range filter on the id field for pagination. Since we
-                // collect all IDs anyway, we can just use limit > total.
-                // If we get PAGE_SIZE results, there may be more — but
-                // Milvus query doesn't support OFFSET natively. We fall
-                // back to the fact that collections with >16K chunks for
-                // the same set of files are extremely rare.
-                break;
             }
 
             if (allIds.length > 0) {
-                // Delete in batches to avoid oversized requests.
-                for (let i = 0; i < allIds.length; i += PAGE_SIZE) {
+                // Delete in batches to avoid oversized delete requests.
+                for (let i = 0; i < allIds.length; i += BATCH_SIZE) {
                     if (signal?.aborted) break;
-                    const batch = allIds.slice(i, i + PAGE_SIZE);
+                    const batch = allIds.slice(i, i + BATCH_SIZE);
                     await this.vectorDatabase.delete(collectionName, batch);
                 }
                 console.log(`[Context] Batch deleted ${allIds.length} chunks for ${files.length} files`);
@@ -1638,63 +1558,16 @@ export class Context {
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
 
-        // Build the Git-DAG layer chain: [current branch (delta), base, base-of-base, …].
-        // A branch with no base yields a single layer → identical to the classic
-        // single-collection search.
+        // Resolve the Git-DAG layer chain from CommitIndexState, then
+        // delegate to searchWithLayers for the actual multi-layer search.
         const identity = this.getRepoIdentityCached(codebasePath);
-        let layers = await this.resolveLayerChain(identity);
-        if (layers.length === 0) {
-            layers = [{ identity, collectionName: this.getCollectionName(codebasePath), mask: [] }];
+        let chain = await this.resolveLayerChain(identity);
+        if (chain.length === 0) {
+            chain = [{ identity, collectionName: this.getCollectionName(codebasePath), mask: [] }];
         }
 
-        // Keep only layers whose collection actually exists — checked concurrently.
-        const existence = await Promise.all(
-            layers.map(l => this.vectorDatabase.hasCollection(l.collectionName).catch(() => false)),
-        );
-        const activeLayers = layers.filter((_, i) => existence[i]);
-        if (activeLayers.length === 0) {
-            console.log(`[Context] ⚠️  No indexed layer collection exists for '${identity}'. Please index the codebase first.`);
-            return [];
-        }
-
-        // Query embedding is computed once and reused across all layers.
-        const queryEmbedding: EmbeddingVector = await this.getQueryEmbedding(query);
-        // Multi-layer hybrid → true global fusion: pull raw dense + raw sparse hits
-        // from every layer and fuse them with a single unified RRF (dense ranked
-        // globally by cosine across layers, sparse ranked within each layer since
-        // BM25 scores aren't comparable across collections). This is more accurate
-        // than letting each layer RRF-fuse itself and then merging fused scores.
-        if (isHybrid && activeLayers.length > 1 && typeof this.vectorDatabase.sparseSearch === 'function') {
-            const fused = await this.globalHybridFusion(activeLayers, queryEmbedding.vector, query, topK, filterExpr, threshold);
-            console.log(`[Context] ✅ Global-RRF search over ${activeLayers.length} layers → ${fused.length} results`);
-            return fused;
-        }
-
-        // Overlay search: Main and Branch (and any base) are queried CONCURRENTLY,
-        // not serially. Each layer masks the files a nearer layer overrides so the
-        // base's stale chunks never surface (Branch overrides Main), then all hits
-        // are fused and globally re-ranked below.
-        const perLayer = await Promise.all(
-            activeLayers.map(layer => {
-                const layerFilter = this.combineFilters(filterExpr, this.buildMaskFilter(layer.mask));
-                return this.searchLayer(
-                    layer.collectionName, queryEmbedding.vector, query, topK, threshold, layerFilter, isHybrid,
-                ).catch(error => {
-                    console.warn(`[Context] ⚠️  Layer search failed for '${layer.collectionName}' (skipping): ${error}`);
-                    return [] as SemanticSearchResult[];
-                });
-            }),
-        );
-
-        // Global re-rank across layers: highest score first, drop overlapping duplicates, cap at topK.
-        const all: SemanticSearchResult[] = perLayer.flat();
-        all.sort((a, b) => b.score - a.score);
-        const deduped = this.deduplicateResults(all);
-        deduped.sort((a, b) => b.score - a.score);
-        const filtered = this.applyScoreCutoff(deduped, threshold);
-        const finalResults = filtered.slice(0, topK);
-        console.log(`[Context] ✅ Layered ${searchType} over ${activeLayers.length} layer(s): ${all.length} raw → ${finalResults.length} results`);
-        return finalResults;
+        const layers = chain.map(l => ({ collectionName: l.collectionName, mask: l.mask }));
+        return this.searchWithLayers(layers, query, topK, threshold, filterExpr);
     }
 
     /** Execute one collection's search (hybrid or dense) → normalized results. */
@@ -1850,11 +1723,12 @@ export class Context {
 
     /**
      * Deduplicate search results by file + line range overlap.
-     * Uses a Map keyed by filePath for O(n) lookups instead of O(n²) scanning.
-     * Keeps higher-scored result when two results from the same file overlap >50%.
+     * Groups by filePath, sorts by startLine, then keeps only the first result
+     * when two chunks from the same file overlap >50%. O(n log n) — one sort
+     * per file instead of O(n²) pairwise comparison.
      */
     private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        // Group by filePath so overlap checks only happen within the same file
+        // Group by filePath so overlap checks only happen within the same file.
         const byFile = new Map<string, SemanticSearchResult[]>();
         for (const r of results) {
             const list = byFile.get(r.relativePath);
@@ -1867,19 +1741,29 @@ export class Context {
 
         const kept: SemanticSearchResult[] = [];
         for (const [, fileResults] of byFile) {
+            // Sort by startLine ascending — higher scored results come first
+            // when startLine ties (stable sort keeps insertion order).
+            fileResults.sort((a, b) => a.startLine - b.startLine || b.score - a.score);
+
             for (const result of fileResults) {
-                const overlaps = kept.some((existing) => {
-                    if (existing.relativePath !== result.relativePath) return false;
-                    const overlapStart = Math.max(existing.startLine, result.startLine);
-                    const overlapEnd = Math.min(existing.endLine, result.endLine);
-                    if (overlapStart > overlapEnd) return false;
-                    const overlapSize = overlapEnd - overlapStart + 1;
-                    const resultSize = result.endLine - result.startLine + 1;
-                    return resultSize > 0 && overlapSize / resultSize > 0.5;
-                });
-                if (!overlaps) {
-                    kept.push(result);
+                // Only need to check against the last kept result for this file
+                // (the one with the highest startLine among kept). Since both
+                // `fileResults` and `kept` are ordered by startLine, if this
+                // result doesn't overlap the last one, it won't overlap any
+                // earlier one either.
+                const last = kept.length > 0 ? kept[kept.length - 1] : null;
+                if (last && last.relativePath === result.relativePath) {
+                    const overlapStart = Math.max(last.startLine, result.startLine);
+                    const overlapEnd = Math.min(last.endLine, result.endLine);
+                    if (overlapStart <= overlapEnd) {
+                        const overlapSize = overlapEnd - overlapStart + 1;
+                        const resultSize = result.endLine - result.startLine + 1;
+                        if (resultSize > 0 && overlapSize / resultSize > 0.5) {
+                            continue; // this result is subsumed → skip
+                        }
+                    }
                 }
+                kept.push(result);
             }
         }
 
@@ -1939,11 +1823,10 @@ export class Context {
      * @param ignorePatterns Array of ignore patterns to add to defaults
      */
     updateIgnorePatterns(ignorePatterns: string[]): void {
-        // Merge with default patterns and any existing custom patterns, avoiding duplicates
-        const mergedPatterns = [...DEFAULT_IGNORE_PATTERNS, ...ignorePatterns];
-        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
-        this.ignorePatterns = [...this.baseIgnorePatterns];
-        console.log(`[Context] 🚫 Updated ignore patterns: ${ignorePatterns.length} new + ${DEFAULT_IGNORE_PATTERNS.length} default = ${this.ignorePatterns.length} total patterns`);
+        this.ignorePatternManager.updatePatterns(
+            [...DEFAULT_IGNORE_PATTERNS, ...ignorePatterns],
+            DEFAULT_IGNORE_PATTERNS.length,
+        );
     }
 
     /**
@@ -1951,22 +1834,14 @@ export class Context {
      * @param customPatterns Array of custom ignore patterns to add
      */
     addCustomIgnorePatterns(customPatterns: string[]): void {
-        if (customPatterns.length === 0) return;
-
-        // Merge persistent base patterns with new custom patterns, avoiding duplicates.
-        const mergedPatterns = [...this.baseIgnorePatterns, ...customPatterns];
-        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
-        this.ignorePatterns = [...this.baseIgnorePatterns];
-        console.log(`[Context] 🚫 Added ${customPatterns.length} custom ignore patterns. Total: ${this.ignorePatterns.length} patterns`);
+        this.ignorePatternManager.addCustomPatterns(customPatterns);
     }
 
     /**
      * Reset ignore patterns to defaults only
      */
     resetIgnorePatternsToDefaults(): void {
-        this.baseIgnorePatterns = [...DEFAULT_IGNORE_PATTERNS];
-        this.ignorePatterns = [...this.baseIgnorePatterns];
-        console.log(`[Context] 🔄 Reset ignore patterns to defaults: ${this.ignorePatterns.length} patterns`);
+        this.ignorePatternManager.resetToDefaults(DEFAULT_IGNORE_PATTERNS);
     }
 
     /**
@@ -2061,7 +1936,7 @@ export class Context {
      */
     private async getCodeFiles(
         codebasePath: string,
-        ignorePatterns: string[] = this.ignorePatterns,
+        ignorePatterns: string[] = this.ignorePatternManager.getPatterns(),
         supportedExtensions: string[] = this.supportedExtensions
     ): Promise<string[]> {
         const files: string[] = [];
@@ -2097,7 +1972,7 @@ export class Context {
                 const fullPath = path.join(currentPath, entry.name);
 
                 // Check if path matches ignore patterns
-                if (this.matchesIgnorePattern(fullPath, codebasePath, ignorePatterns)) {
+                if (this.ignorePatternManager.matches(fullPath, codebasePath, ignorePatterns)) {
                     continue;
                 }
 
@@ -2500,182 +2375,7 @@ export class Context {
      * @returns Array of ignore patterns
      */
     static async getIgnorePatternsFromFile(filePath: string): Promise<string[]> {
-        try {
-            const content = await fs.promises.readFile(filePath, 'utf-8');
-            return content
-                .split('\n')
-                .map(line => line.trim())
-                .filter(line => line && !line.startsWith('#')); // Filter out empty lines and comments
-        } catch (error) {
-            console.warn(`[Context] ⚠️  Could not read ignore file ${filePath}: ${error}`);
-            return [];
-        }
-    }
-
-    /**
-     * Load ignore patterns from various ignore files in the codebase.
-     * Returns the effective patterns for the current codebase/request without
-     * allowing file-based patterns from previous codebases to leak forward.
-     * @param codebasePath Path to the codebase
-     * @param additionalIgnorePatterns Ignore patterns for the current request
-     */
-    private async loadIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
-        try {
-            let fileBasedPatterns: string[] = [];
-
-            // Load all .xxxignore files in codebase directory
-            const ignoreFiles = await this.findIgnoreFiles(codebasePath);
-            for (const ignoreFile of ignoreFiles) {
-                const patterns = await this.loadIgnoreFile(ignoreFile, path.basename(ignoreFile));
-                fileBasedPatterns.push(...patterns);
-            }
-
-            // Load global ~/.context/.contextignore
-            const globalIgnorePatterns = await this.loadGlobalIgnoreFile();
-            fileBasedPatterns.push(...globalIgnorePatterns);
-
-            const effectiveIgnorePatterns = this.dedupePatterns([
-                ...this.baseIgnorePatterns,
-                ...additionalIgnorePatterns,
-                ...fileBasedPatterns
-            ]);
-            // Preserve the previous observable getIgnorePatterns() behavior for
-            // sequential callers, while all indexing paths use the local return
-            // value to avoid shared-state leakage between background tasks.
-            this.ignorePatterns = effectiveIgnorePatterns;
-
-            if (fileBasedPatterns.length > 0 || additionalIgnorePatterns.length > 0) {
-                console.log(`[Context] 🚫 Loaded total ${fileBasedPatterns.length} ignore patterns from all ignore files and ${additionalIgnorePatterns.length} request ignore patterns`);
-            } else {
-                console.log('📄 No ignore files found, using base ignore patterns');
-            }
-            return effectiveIgnorePatterns;
-        } catch (error) {
-            console.warn(`[Context] ⚠️ Failed to load ignore patterns: ${error}`);
-            // Continue with base/request patterns on error - don't reuse
-            // previously loaded codebase-specific patterns.
-            const fallbackPatterns = this.dedupePatterns([
-                ...this.baseIgnorePatterns,
-                ...additionalIgnorePatterns
-            ]);
-            this.ignorePatterns = fallbackPatterns;
-            return fallbackPatterns;
-        }
-    }
-
-    /**
-     * Find all .xxxignore files in the codebase directory
-     * @param codebasePath Path to the codebase
-     * @returns Array of ignore file paths
-     */
-    private async findIgnoreFiles(codebasePath: string): Promise<string[]> {
-        try {
-            const entries = await fs.promises.readdir(codebasePath, { withFileTypes: true });
-            const ignoreFiles: string[] = [];
-
-            for (const entry of entries) {
-                if (entry.isFile() &&
-                    entry.name.startsWith('.') &&
-                    entry.name.endsWith('ignore')) {
-                    ignoreFiles.push(path.join(codebasePath, entry.name));
-                }
-            }
-
-            if (ignoreFiles.length > 0) {
-                console.log(`📄 Found ignore files: ${ignoreFiles.map(f => path.basename(f)).join(', ')}`);
-            }
-
-            return ignoreFiles;
-        } catch (error) {
-            console.warn(`[Context] ⚠️ Failed to scan for ignore files: ${error}`);
-            return [];
-        }
-    }
-
-    /**
-     * Load global ignore file from ~/.context/.contextignore
-     * @returns Array of ignore patterns
-     */
-    private async loadGlobalIgnoreFile(): Promise<string[]> {
-        try {
-            const homeDir = os.homedir();
-            const globalIgnorePath = path.join(homeDir, '.context', '.contextignore');
-            return await this.loadIgnoreFile(globalIgnorePath, 'global .contextignore');
-        } catch (error) {
-            // Global ignore file is optional, don't log warnings
-            return [];
-        }
-    }
-
-    /**
-     * Load ignore patterns from a specific ignore file
-     * @param filePath Path to the ignore file
-     * @param fileName Display name for logging
-     * @returns Array of ignore patterns
-     */
-    private async loadIgnoreFile(filePath: string, fileName: string): Promise<string[]> {
-        try {
-            await fs.promises.access(filePath);
-            console.log(`📄 Found ${fileName} file at: ${filePath}`);
-
-            const ignorePatterns = await Context.getIgnorePatternsFromFile(filePath);
-
-            if (ignorePatterns.length > 0) {
-                console.log(`[Context] 🚫 Loaded ${ignorePatterns.length} ignore patterns from ${fileName}`);
-                return ignorePatterns;
-            } else {
-                console.log(`📄 ${fileName} file found but no valid patterns detected`);
-                return [];
-            }
-        } catch (error) {
-            if (fileName.includes('global')) {
-                console.log(`📄 No ${fileName} file found`);
-            }
-            return [];
-        }
-    }
-
-    /**
-     * Check if a path matches any ignore pattern
-     * @param filePath Path to check
-     * @param basePath Base path for relative pattern matching
-     * @returns True if path should be ignored
-     */
-    private matchesIgnorePattern(filePath: string, basePath: string, ignorePatterns: string[] = this.ignorePatterns): boolean {
-        const relativePath = path.relative(basePath, filePath);
-
-        // Always ignore dotfiles/dotdirs (aligned with FileSynchronizer).
-        // Well-known CI/config dot-dirs (.github, .circleci) and dot-files
-        // (.eslintrc.js) are allowed — see FileSynchronizer.ALLOWED_DOT_DIRS.
-        const pathParts = relativePath.split(path.sep);
-        const ALLOWED_DOT_DIRS = new Set(['.github', '.circleci', '.devcontainer']);
-        const hasDot = pathParts.some(part => {
-            if (!part.startsWith('.')) return false;
-            if (part === pathParts[pathParts.length - 1]) {
-                const ext = part.includes('.', 1);
-                if (ext) return false; // dot-file → allow
-            }
-            return !ALLOWED_DOT_DIRS.has(part);
-        });
-        if (hasDot) return true;
-
-        if (ignorePatterns.length === 0) {
-            return false;
-        }
-
-        const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
-
-        for (const pattern of ignorePatterns) {
-            if (matchGlob(normalizedPath, pattern)) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private dedupePatterns(patterns: string[]): string[] {
-        return [...new Set(patterns)];
+        return IgnorePatternManager.fromFile(filePath);
     }
 
     /**

@@ -2,11 +2,15 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { MerkleDAG } from './merkle';
 import * as os from 'os';
 import { getRepoIdentity } from '../utils/git-identity';
 import { matchGlob } from '../utils/glob-matcher';
+import { shouldSkipDotPath } from '../utils/path-filter';
+
+const execAsync = promisify(exec);
 
 export class FileSynchronizer {
     private fileHashes: Map<string, string>;
@@ -109,7 +113,8 @@ export class FileSynchronizer {
             const nameSet = new Set(this.supportedFilenames);
             // 50MB buffer to handle very large repos without falling back to
             // the slower filesystem walk (10MB was too small for 100K+ files).
-            const output = execSync(
+            // Uses async exec to avoid blocking the event loop on large repos.
+            const { stdout: output } = await execAsync(
                 `git -C "${dir}" ls-files --cached --others --exclude-standard`,
                 { encoding: 'utf-8', timeout: 15_000, maxBuffer: 50 * 1024 * 1024 }
             );
@@ -210,29 +215,9 @@ export class FileSynchronizer {
         return fileHashes;
     }
 
-    /** Dot-directories that should NOT be automatically skipped (CI, config). */
-    private static readonly ALLOWED_DOT_DIRS = new Set([
-        '.github', '.circleci', '.devcontainer',
-    ]);
-
     private shouldIgnore(relativePath: string): boolean {
-        // Skip hidden files and directories (starting with "."), unless
-        // the directory is a well-known CI/config directory.
-        const pathParts = relativePath.split(path.sep);
-        const hasDot = pathParts.some(part => {
-            if (!part.startsWith('.')) return false;
-            // Allow non-directory dotfiles (like .eslintrc.js, .env.example)
-            // and well-known dot-directories (like .github/, .circleci/).
-            if (part === pathParts[pathParts.length - 1]) {
-                // It's the last segment (could be a file or directory).
-                // Allow dot-files (but dot-directories need whitelist).
-                const ext = part.includes('.', 1); // has extension after the dot?
-                if (ext) return false; // dot-file like .eslintrc.js → allow
-            }
-            // It's a directory segment → only allow whitelisted ones.
-            return !FileSynchronizer.ALLOWED_DOT_DIRS.has(part);
-        });
-        if (hasDot) return true;
+        // Dot-directory / dot-file filtering (shared with Context).
+        if (shouldSkipDotPath(relativePath)) return true;
 
         if (this.ignorePatterns.length === 0) {
             return false;
