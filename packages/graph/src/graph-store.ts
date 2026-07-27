@@ -74,11 +74,12 @@ CREATE TABLE IF NOT EXISTS edges (
     source_id INTEGER NOT NULL,
     target_id INTEGER NOT NULL,
     kind TEXT NOT NULL,
-    line INTEGER,
-    col INTEGER,
+    line INTEGER NOT NULL DEFAULT -1,
+    col INTEGER NOT NULL DEFAULT -1,
     provenance TEXT DEFAULT 'tree-sitter',
     metadata_json TEXT,
-    properties_json TEXT NOT NULL DEFAULT '{}'
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(source_id, target_id, kind, line, col)
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_project ON edges(project);
@@ -145,12 +146,7 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
 END;
 `;
 
-// ── Edge identity index (for OR IGNORE dedup — separate from kind-keyed reads) ──
-
-const EDGE_IDENTITY_INDEX_SQL = `
-CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
-ON edges(source_id, target_id, kind, COALESCE(line, -1), COALESCE(col, -1));
-`;
+// ── Edge dedup: handled by UNIQUE constraint on (source_id, target_id, kind, line, col) ──
 
 // ── Implementation ──────────────────────────────────────────────────
 
@@ -221,7 +217,6 @@ export class SqliteGraphStore implements GraphStore {
     this.db.pragma('cache_size = -64000'); // 64MB
     this.db.exec(SCHEMA_SQL);
     this.db.exec(FTS_TRIGGERS_SQL);
-    this.db.exec(EDGE_IDENTITY_INDEX_SQL);
   }
 
   initialize(): void {
@@ -572,6 +567,8 @@ export class SqliteGraphStore implements GraphStore {
 
   upsertEdge(edge: Omit<GraphEdge, 'id'>): number {
     const kind = edge.kind || edge.type;
+    const line = edge.line ?? -1;
+    const col = edge.column ?? -1;
     const result = this.stmt(`
       INSERT OR IGNORE INTO edges (project, source_id, target_id, kind, line, col, provenance, metadata_json, properties_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -580,17 +577,17 @@ export class SqliteGraphStore implements GraphStore {
       edge.sourceId,
       edge.targetId,
       kind,
-      edge.line ?? null,
-      edge.column ?? null,
+      line,
+      col,
       edge.provenance ?? 'tree-sitter',
       edge.metadata ? JSON.stringify(edge.metadata) : null,
       JSON.stringify(edge.properties || {}),
     );
     if (result.changes > 0) return Number(result.lastInsertRowid);
-    // On conflict, return existing ID
+    // On conflict, return existing ID (line/col now have -1 defaults)
     const existing = this.readDB.prepare(
-      'SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND kind = ? AND COALESCE(line, -1) = ? AND COALESCE(col, -1) = ?'
-    ).get(edge.sourceId, edge.targetId, kind, edge.line ?? -1, edge.column ?? -1) as { id: number } | undefined;
+      'SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND kind = ? AND line = ? AND col = ?'
+    ).get(edge.sourceId, edge.targetId, kind, line, col) as { id: number } | undefined;
     return existing ? existing.id : 0;
   }
 
@@ -708,16 +705,14 @@ export class SqliteGraphStore implements GraphStore {
     }));
   }
 
-  insertUnresolvedRefs(refs: UnresolvedReference[]): void {
+  insertUnresolvedRefs(project: string, refs: UnresolvedReference[]): void {
     const stmt = this.stmt(`
       INSERT INTO unresolved_refs (project, from_node_id, reference_name, reference_kind, line, col, file_path, language, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     `);
-    // Extract project from first ref's filePath or use empty
-    // In practice, project is threaded through the indexer, not the refs
     for (const ref of refs) {
       stmt.run(
-        '', // project will be set by caller via a separate mechanism
+        project,
         ref.fromNodeId,
         ref.referenceName,
         ref.referenceKind,
@@ -1020,8 +1015,8 @@ export class SqliteGraphStore implements GraphStore {
       targetId: row.target_id as number,
       kind,
       type: kind, // backward compat
-      line: (row.line as number) ?? undefined,
-      column: (row.col as number) ?? undefined,
+      line: (row.line as number) >= 0 ? (row.line as number) : undefined,
+      column: (row.col as number) >= 0 ? (row.col as number) : undefined,
       provenance: (row.provenance as any) ?? 'tree-sitter',
       metadata: row.metadata_json ? JSON.parse(row.metadata_json as string) : undefined,
       properties: JSON.parse((row.properties_json as string) || '{}'),

@@ -120,18 +120,44 @@ export class InMemoryGraphBuffer {
         startLine: number,
         endLine: number,
         properties: Record<string, unknown> = {},
+        meta?: {
+          language?: string;
+          signature?: string;
+          visibility?: string;
+          isExported?: boolean;
+          isAsync?: boolean;
+          isStatic?: boolean;
+          isAbstract?: boolean;
+          decorators?: string[];
+          typeParameters?: string[];
+          returnType?: string;
+          docstring?: string;
+        },
     ): number {
         const existing = this.nodeByQN.get(qualifiedName);
         if (existing) {
-            // Update existing node fields (src wins). Intern the same repetitive
-            // fields as on insert so updates don't reintroduce duplicate strings.
             existing.label = this.intern(label) as GraphNodeLabel;
             existing.name = name;
             existing.filePath = this.intern(filePath);
             existing.startLine = startLine;
             existing.endLine = endLine;
             existing.properties = properties;
-            // label/name may have changed → stale any built secondary indexes.
+            if (meta) {
+              existing.signature = meta.signature;
+              existing.visibility = meta.visibility as any;
+              existing.isExported = meta.isExported;
+              existing.isAsync = meta.isAsync;
+              existing.isStatic = meta.isStatic;
+              existing.isAbstract = meta.isAbstract;
+              existing.decorators = meta.decorators;
+              existing.typeParameters = meta.typeParameters;
+              existing.returnType = meta.returnType;
+              existing.docstring = meta.docstring;
+              if (meta.language) existing.language = meta.language as any;
+              // Update properties with language info
+              if (!existing.properties) existing.properties = {};
+              if (meta.language) existing.properties.language = meta.language;
+            }
             this.invalidateSecondaryIndexes();
             return existing.id;
         }
@@ -140,9 +166,6 @@ export class InMemoryGraphBuffer {
         const kind = this.intern(label) as GraphNodeKind;
         const node: GraphNode = {
             id,
-            // Only intern highly-repetitive fields. name/qualifiedName are
-            // effectively unique per node, so interning them just bloats the
-            // intern pool with one entry each and saves nothing.
             project: this.intern(this.project),
             kind,
             label: kind,
@@ -151,7 +174,18 @@ export class InMemoryGraphBuffer {
             filePath: this.intern(filePath),
             startLine,
             endLine,
-            properties,
+            language: meta?.language as any,
+            signature: meta?.signature,
+            visibility: meta?.visibility as any,
+            isExported: meta?.isExported,
+            isAsync: meta?.isAsync,
+            isStatic: meta?.isStatic,
+            isAbstract: meta?.isAbstract,
+            decorators: meta?.decorators,
+            typeParameters: meta?.typeParameters,
+            returnType: meta?.returnType,
+            docstring: meta?.docstring,
+            properties: { ...properties, ...(meta?.language ? { language: meta.language } : {}) },
         };
 
         this.nodeByQN.set(node.qualifiedName, node);
@@ -180,7 +214,7 @@ export class InMemoryGraphBuffer {
         if (kind === 'label' || kind === 'name') {
             const map = kind === 'label' ? this.nodesByLabel : this.nodesByName;
             for (const [, node] of this.nodeByQN) {
-                const key = kind === 'label' ? node.label : node.name;
+                const key = kind === 'label' ? node.kind : node.name;
                 let arr = map.get(key);
                 if (!arr) { arr = []; map.set(key, arr); }
                 arr.push(node);
@@ -190,9 +224,10 @@ export class InMemoryGraphBuffer {
                 : kind === 'tgtType' ? this.edgesByTargetType
                     : this.edgesByType;
             for (const [, edge] of this.edgeByKey) {
-                const key = kind === 'srcType' ? makeSrcTypeKey(edge.sourceId, edge.type)
-                    : kind === 'tgtType' ? makeTgtTypeKey(edge.targetId, edge.type)
-                        : edge.type;
+                const edgeKind = edge.kind || edge.type;
+                const key = kind === 'srcType' ? makeSrcTypeKey(edge.sourceId, edgeKind)
+                    : kind === 'tgtType' ? makeTgtTypeKey(edge.targetId, edgeKind)
+                        : edgeKind;
                 let arr = map.get(key);
                 if (!arr) { arr = []; map.set(key, arr); }
                 arr.push(edge);
@@ -294,38 +329,47 @@ export class InMemoryGraphBuffer {
     // ── Edge operations ───────────────────────────────────────────
 
     /**
-     * Insert an edge. Deduplicates by (sourceId, targetId, type).
+     * Insert an edge. Deduplicates by (sourceId, targetId, kind, line, col).
      * On duplicate, merges properties (later wins).
      * Returns the edge temp ID.
-     * Mirrors cbm_gbuf_insert_edge.
      */
     insertEdge(
         sourceId: number,
         targetId: number,
-        type: GraphEdgeType,
+        kind: GraphEdgeKind,
         properties: Record<string, unknown> = {},
+        meta?: {
+          line?: number;
+          column?: number;
+          provenance?: string;
+          metadata?: Record<string, unknown>;
+        },
     ): number {
-        const key = makeEdgeKey(sourceId, targetId, type);
+        const kindStr = this.intern(kind) as GraphEdgeKind;
+        const line = meta?.line ?? -1;
+        const col = meta?.column ?? -1;
+        const key = `${sourceId}:${targetId}:${kindStr}:${line}:${col}`;
 
         // Check dedup
         const existing = this.edgeByKey.get(key);
         if (existing) {
-            // Merge properties (later wins)
             existing.properties = { ...existing.properties, ...properties };
+            if (meta?.metadata) existing.metadata = { ...existing.metadata, ...meta.metadata };
             return existing.id;
         }
 
         const id = this.nextId++;
-        const kind = this.intern(type) as GraphEdgeKind;
         const edge: GraphEdge = {
             id,
             project: this.intern(this.project),
             sourceId,
             targetId,
-            // Edge types come from a tiny fixed set — interning collapses them
-            // to a single shared string across all edges.
-            kind,
-            type: kind,
+            kind: kindStr,
+            type: kindStr,
+            line: meta?.line,
+            column: meta?.column,
+            provenance: (meta?.provenance as any) || 'tree-sitter',
+            metadata: meta?.metadata,
             properties,
         };
 
@@ -498,16 +542,18 @@ export class InMemoryGraphBuffer {
     getLabelCounts(): Record<string, number> {
         const counts: Record<string, number> = {};
         for (const [, node] of this.nodeByQN) {
-            counts[node.label] = (counts[node.label] ?? 0) + 1;
+            const k = node.kind || node.label;
+            counts[k] = (counts[k] ?? 0) + 1;
         }
         return counts;
     }
 
-    /** Get distinct edge types and their counts. */
+    /** Get distinct edge kinds and their counts. */
     getEdgeTypeCounts(): Record<string, number> {
         const counts: Record<string, number> = {};
         for (const [, edge] of this.edgeByKey) {
-            counts[edge.type] = (counts[edge.type] ?? 0) + 1;
+            const k = edge.kind || edge.type;
+            counts[k] = (counts[k] ?? 0) + 1;
         }
         return counts;
     }

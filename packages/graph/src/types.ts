@@ -420,7 +420,7 @@ export interface GraphStore {
   // Unresolved reference operations
   getUnresolvedRefsCount(project: string): number;
   getUnresolvedRefsBatch(project: string, limit: number, afterRowId?: number): UnresolvedReference[];
-  insertUnresolvedRefs(refs: UnresolvedReference[]): void;
+  insertUnresolvedRefs(project: string, refs: UnresolvedReference[]): void;
   deleteResolvedRefsByRowIds(rowIds: number[]): number;
   markRefsFailedByRowIds(rowIds: number[] | Array<{ rowId: number; referenceName: string }>): number;
 

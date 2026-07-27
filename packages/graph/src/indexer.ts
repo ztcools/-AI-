@@ -9,10 +9,10 @@
  *   5. Phase 4: Edge kind promotion (calls → instantiates, etc.)
  */
 import * as fs from 'fs';
+import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
 import { execSync } from 'child_process';
-import { Worker } from 'worker_threads';
 import {
   GraphNode,
   GraphEdge,
@@ -128,7 +128,7 @@ export class GraphIndexer {
 
     let processed = 0;
 
-    // Process files in parallel using chunks of workers
+    // Process files in parallel batches
     const parseChunk = async (chunk: FileToIndex[]): Promise<void> => {
       for (const file of chunk) {
         if (options.signal?.aborted) return;
@@ -137,7 +137,7 @@ export class GraphIndexer {
           const absPath = file.absolutePath;
           if (!fs.existsSync(absPath)) continue;
 
-          const content = fs.readFileSync(absPath, 'utf-8');
+          const content = await fsp.readFile(absPath, 'utf-8');
           const result = this.extractor.extract(content, {
             project: this.project,
             filePath: file.relativePath,
@@ -150,7 +150,7 @@ export class GraphIndexer {
             continue;
           }
 
-          // Add nodes to buffer
+          // Add nodes to buffer, remapping temp indices
           const idMap = new Map<number, number>();
           for (let i = 0; i < result.nodes.length; i++) {
             const n = result.nodes[i];
@@ -162,15 +162,34 @@ export class GraphIndexer {
               n.startLine,
               n.endLine,
               n.properties || {},
+              {
+                language: file.language,
+                signature: n.signature,
+                visibility: n.visibility,
+                isExported: n.isExported,
+                isAsync: n.isAsync,
+                isStatic: n.isStatic,
+                isAbstract: n.isAbstract,
+                decorators: n.decorators,
+                docstring: n.docstring,
+              }
             );
             idMap.set(i, realId);
           }
 
-          // Add edges to buffer
+          // Add structural edges (CONTAINS, IMPORTS) with remapped IDs
           for (const e of result.edges) {
-            // Edges use temp indices — remap through idMap
-            // For now, skip edges that reference temp indices (from old extractor)
-            // The extractor v2 puts node IDs directly
+            // Edges from extractor use temp array indices
+            const srcId = idMap.get(e.sourceId as unknown as number);
+            const tgtId = idMap.get(e.targetId as unknown as number);
+            if (srcId != null && tgtId != null) {
+              graphBuffer.insertEdge(srcId, tgtId, e.kind || e.type, e.properties || {}, {
+                line: e.line,
+                column: e.column,
+                provenance: e.provenance || 'tree-sitter',
+                metadata: e.metadata,
+              });
+            }
           }
 
           // Collect unresolved refs (remap fromNodeId through idMap)
@@ -304,18 +323,14 @@ export class GraphIndexer {
       }
 
       // Also remap and insert unresolved refs
-      const remappedRefs = allUnresolvedRefs.map(ref => ({
-        ...ref,
-        fromNodeId: idMap.get(ref.fromNodeId) ?? ref.fromNodeId,
-      }));
+      const remappedRefs = allUnresolvedRefs
+        .map(ref => ({
+          ...ref,
+          fromNodeId: idMap.get(ref.fromNodeId) ?? ref.fromNodeId,
+        }))
+        .filter(ref => ref.fromNodeId != null && ref.fromNodeId > 0);
       if (remappedRefs.length > 0) {
-        const stmt = this.store as any;
-        // Use direct insert — the store has the method
-        for (const ref of remappedRefs) {
-          if (ref.fromNodeId != null) {
-            this.store['insertUnresolvedRefs']?.([ref]);
-          }
-        }
+        this.store.insertUnresolvedRefs(this.project, remappedRefs);
       }
     } finally {
       this.store.endBulkLoad();
