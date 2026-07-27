@@ -414,6 +414,16 @@ export class GraphExtractor {
             ? this.extractVisibility(node, source, ctx.language)
             : undefined;
 
+        // Detect export: walk up parent chain (max 3 levels) to find export_statement
+        let isExported = node.type.startsWith('export_');
+        if (!isExported) {
+          let p: any = node;
+          for (let i = 0; i < 3 && p; i++) {
+            p = p.parent;
+            if (p && p.type === 'export_statement') { isExported = true; break; }
+          }
+        }
+
         nodes.push({
           project: ctx.project,
           kind: nodeKind,
@@ -426,9 +436,11 @@ export class GraphExtractor {
           endLine,
           signature,
           visibility,
+          isExported,
           properties: {
             language: ctx.language,
             nodeType: node.type,
+            isExported,
           },
         });
 
@@ -526,8 +538,8 @@ export class GraphExtractor {
         const nodeIndex = nodes.length;
         nodes.push({
           project: _ctx.project,
-          kind: 'module',
-          label: 'module' as GraphNodeLabel,
+          kind: 'import',
+          label: 'import' as GraphNodeLabel,
           name: imp.modulePath,
           qualifiedName: moduleQN,
           filePath: _ctx.filePath,

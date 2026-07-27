@@ -251,6 +251,7 @@ export class GraphQueryManager {
 
   /**
    * Find dead code: nodes with no incoming references (excluding contains).
+   * Methods in exported classes are considered reachable.
    */
   findDeadCode(kinds?: GraphNode['kind'][]): GraphNode[] {
     const targetKinds = kinds || ['function', 'method', 'class'];
@@ -260,6 +261,14 @@ export class GraphQueryManager {
       const nodes = this.store.getNodesByKind(this.project, kind);
       for (const node of nodes) {
         if (node.isExported) continue;
+
+        // Methods inside exported classes are reachable through the class
+        if (node.kind === 'method') {
+          const ancestors = this.traverser.getAncestors(node.id);
+          if (ancestors.some(a => (a.kind === 'class' || a.kind === 'struct') && a.isExported)) {
+            continue;
+          }
+        }
 
         const incomingEdges = this.store.getEdgesByTarget(node.id);
         const references = incomingEdges.filter(e => e.kind !== 'contains');

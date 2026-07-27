@@ -210,7 +210,23 @@ export class GraphTraverser {
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
 
-    // instantiates counts as a caller too
+    // For container nodes, traverse into children so callers of their methods surface.
+    const focalNode = this.store.getNodeById(nodeId);
+    const containerKinds = new Set(['class', 'struct', 'interface', 'trait', 'protocol', 'module', 'enum']);
+    if (focalNode && containerKinds.has(focalNode.kind)) {
+      const containsEdges = this.store.getEdgesBySource(nodeId, 'contains' as any);
+      if (containsEdges.length > 0) {
+        const children = this.store.getNodesById(containsEdges.map(e => e.targetId));
+        for (const edge of containsEdges) {
+          const childNode = children.get(edge.targetId);
+          if (childNode && !visited.has(childNode.id)) {
+            result.push({ node: childNode, edge });
+            this.getCallersRecursive(childNode.id, maxDepth, currentDepth, result, visited);
+          }
+        }
+      }
+    }
+
     const incoming = this.getAdjacentEdges(nodeId, 'incoming', ['calls', 'references', 'imports', 'instantiates']);
     if (incoming.length === 0) return;
 
@@ -243,6 +259,24 @@ export class GraphTraverser {
     if (visited.has(nodeId)) return;
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
+
+    // For container nodes (class, struct, interface, etc.), also traverse
+    // into children via CONTAINS edges so callees of their methods surface.
+    const focalNode = this.store.getNodeById(nodeId);
+    const containerKinds = new Set(['class', 'struct', 'interface', 'trait', 'protocol', 'module', 'enum']);
+    if (focalNode && containerKinds.has(focalNode.kind)) {
+      const containsEdges = this.store.getEdgesBySource(nodeId, 'contains' as any);
+      if (containsEdges.length > 0) {
+        const children = this.store.getNodesById(containsEdges.map(e => e.targetId));
+        for (const edge of containsEdges) {
+          const childNode = children.get(edge.targetId);
+          if (childNode && !visited.has(childNode.id)) {
+            result.push({ node: childNode, edge });
+            this.getCalleesRecursive(childNode.id, maxDepth, currentDepth, result, visited);
+          }
+        }
+      }
+    }
 
     const outgoing = this.getAdjacentEdges(nodeId, 'outgoing', ['calls', 'references', 'imports', 'instantiates']);
     if (outgoing.length === 0) return;
@@ -454,6 +488,10 @@ export class GraphTraverser {
     const toNode = this.store.getNodeById(toId);
     if (!fromNode || !toNode) return null;
 
+    // Use bidirectional BFS with contains edges so sibling functions
+    // in the same file are reachable (up to file node, down to sibling)
+    const kinds = edgeKinds.length > 0 ? edgeKinds : undefined;
+
     const visited = new Set<number>();
     const queue: Array<{ nodeId: number; path: Array<{ node: GraphNode; edge: GraphEdge | null }> }> = [
       { nodeId: fromId, path: [{ node: fromNode, edge: null }] },
@@ -465,18 +503,23 @@ export class GraphTraverser {
       if (visited.has(nodeId)) continue;
       visited.add(nodeId);
 
-      const outgoing = this.getAdjacentEdges(nodeId, 'outgoing', edgeKinds);
-      if (outgoing.length === 0) continue;
+      const adjacent = this.getAdjacentEdges(nodeId, 'both', kinds || []);
+      if (adjacent.length === 0) continue;
 
-      const wantIds = outgoing.map(e => e.targetId).filter(id => !visited.has(id));
+      // Deduplicate neighbor IDs
+      const neighborIds = new Set<number>();
+      for (const e of adjacent) {
+        neighborIds.add(e.sourceId === nodeId ? e.targetId : e.sourceId);
+      }
+      const wantIds = [...neighborIds].filter(id => !visited.has(id));
       const nextNodes = wantIds.length > 0 ? this.store.getNodesById(wantIds) : new Map();
 
-      for (const edge of outgoing) {
-        if (!visited.has(edge.targetId)) {
-          const nextNode = nextNodes.get(edge.targetId);
-          if (nextNode) {
-            queue.push({ nodeId: edge.targetId, path: [...path, { node: nextNode, edge }] });
-          }
+      for (const edge of adjacent) {
+        const nextId = edge.sourceId === nodeId ? edge.targetId : edge.sourceId;
+        if (visited.has(nextId)) continue;
+        const nextNode = nextNodes.get(nextId);
+        if (nextNode) {
+          queue.push({ nodeId: nextId, path: [...path, { node: nextNode, edge }] });
         }
       }
     }
