@@ -460,24 +460,43 @@ export class SqliteGraphStore implements GraphStore {
       }
 
       // Second pass: LIKE substring (supplements, not replaces, FTS).
-      // For multi-word queries (>2 words), require only majority words to match
-      // (AND semantics for ≤2 words, at-least-floor(N/2+1) for 3+ words).
-      // This prevents a single non-matching word from zeroing out results.
-      const words = (options.query || '')
+      // Strategy: filter noise words (>2 chars, skip common programming terms
+      // that match almost everything). For short queries (≤3 meaningful words),
+      // use OR semantics. For longer queries (4+ words), require majority match.
+      const NOISE_WORDS = new Set([
+        'class','function','method','type','interface','object',
+        'string','number','data','import','export','module','file',
+        'code','the','and','for','use','get','set','add','new',
+      ]);
+      let rawWords = (options.query || '')
         .replace(/([a-z])([A-Z])/g, '$1 $2')
         .split(/[\s_\-.:/]+/)
         .filter((t: string) => t.length > 1);
+      // Only filter noise words if we have enough meaningful ones left
+      const meaningful = rawWords.filter(t => !NOISE_WORDS.has(t.toLowerCase()));
+      const words = meaningful.length > 0 ? meaningful : rawWords;
       if (words.length > 0) {
-        const minMatch = words.length <= 2 ? words.length : Math.floor(words.length / 2) + 1;
+        const useOr = words.length <= 3;
         const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
-        const likeExprs = words.map(() => `(CASE WHEN n.name LIKE ? OR n.qualified_name LIKE ? THEN 1 ELSE 0 END)`);
         const { conditions: baseConds, params: baseParams } = this.buildFindConditions(options);
-        const allConds = [...baseConds, ...(baseConds.length > 0 ? [] : []),
-          `(n.kind IN ('function','method','class'))`,
-          `(${likeExprs.join(' + ')}) >= ${minMatch}`,
-        ];
-        const allP = [...baseParams, ...likeParams];
-        const whereSQL = allConds.filter(c => c).join(' AND ');
+        let whereSQL: string;
+        let allP: unknown[];
+
+        if (useOr) {
+          const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
+          const allConds = [...baseConds, ...likeConds.map(c => `(${c})`),
+            `(n.kind IN ('function','method','class'))`];
+          allP = [...baseParams, ...likeParams];
+          whereSQL = allConds.join(' AND ');
+        } else {
+          const minMatch = Math.ceil(words.length / 2);
+          const likeExprs = words.map(() => `(CASE WHEN n.name LIKE ? OR n.qualified_name LIKE ? THEN 1 ELSE 0 END)`);
+          const allConds = [...baseConds,
+            `(n.kind IN ('function','method','class'))`,
+            `(${likeExprs.join(' + ')}) >= ${minMatch}`];
+          allP = [...baseParams, ...likeParams];
+          whereSQL = allConds.filter(c => c).join(' AND ');
+        }
 
         try {
           const likeRows = rdb.prepare(
