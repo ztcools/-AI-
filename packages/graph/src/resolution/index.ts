@@ -263,10 +263,10 @@ export class ReferenceResolver {
   /** Default batch size for resolveAndPersistBatched. */
   private static DEFAULT_BATCH_SIZE = 500;
 
-  constructor(projectRoot: string, store: GraphStore) {
+  constructor(projectRoot: string, store: GraphStore, project?: string) {
     this.projectRoot = path.resolve(projectRoot);
     this.store = store;
-    this.project = getRepoIdentity(this.projectRoot);
+    this.project = project || getRepoIdentity(this.projectRoot);
 
     // LRU caches — 5000 entries each
     this.fileContentCache = new LRUCache(5000);

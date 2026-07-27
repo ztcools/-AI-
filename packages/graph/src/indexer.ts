@@ -342,7 +342,7 @@ export class GraphIndexer {
     // Phase 3: Reference resolution
     options.onProgress?.({ phase: 'resolving', current: 0, total: 1 });
 
-    const resolver = new ReferenceResolver(this.projectDir, this.store);
+    const resolver = new ReferenceResolver(this.projectDir, this.store, this.project);
     resolver.warmCaches();
 
     const refCount = this.store.getUnresolvedRefsCount(this.project);
