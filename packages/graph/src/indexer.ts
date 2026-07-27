@@ -423,9 +423,16 @@ export class GraphIndexer {
   private scanFiles(dir: string): FileToIndex[] {
     const results: FileToIndex[] = [];
     const exts = new Set([
-      '.js', '.jsx', '.mjs', '.ts', '.tsx',
-      '.py', '.java', '.cpp', '.c', '.h', '.hpp', '.cc',
+      '.js', '.jsx', '.mjs', '.cjs',
+      '.ts', '.tsx',
+      '.py', '.pyi', '.pyx',
+      '.java', '.kt', '.kts', '.scala',
+      '.cpp', '.c', '.h', '.hpp', '.hh', '.cc', '.cxx', '.hxx', '.inl',
       '.go', '.rs', '.cs',
+      '.php', '.rb', '.swift', '.m', '.mm', '.dart', '.sol',
+      '.lua', '.r', '.ex', '.exs', '.erl', '.hs',
+      '.vue', '.svelte', '.astro',
+      '.zig', '.nim', '.vb',
     ]);
 
     // Try git ls-files first
