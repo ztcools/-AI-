@@ -12,9 +12,92 @@ claude-context 是一套代码索引与检索系统，核心价值：
 
 发布为 MCP server，通过 `node packages/mcp/dist/index.js` 启动，在**任意项目**中 `index` → `search`，无需该项目的开发依赖。
 
-## 索引架构设计（团队开发）
+## 双引擎架构总览
 
-### 核心原则：索引跟踪文件内容，不跟踪 git 历史
+```
+                    ┌─────────────────────────┐
+                    │     MCP search API       │
+                    │  (both/vector/graph)     │
+                    └───────────┬─────────────┘
+                                │
+            ┌───────────────────┴───────────────────┐
+            │                                       │
+    ┌───────▼────────┐                    ┌────────▼─────────┐
+    │  向量索引 (Milvus)│                    │  图索引 (SQLite)   │
+    │  语义搜索        │                    │  结构查询          │
+    │  dev ⊕ root     │                    │  调用图/影响面     │
+    │  RRF 融合       │                    │  跨文件引用解析    │
+    └───────┬────────┘                    └────────┬─────────┘
+            │                                       │
+    ┌───────▼────────┐                    ┌────────▼─────────┐
+    │ Milvus Server   │                    │ .context/graph/   │
+    │ 10.50.4.149     │                    │ <project> 本地    │
+    │ (团队共享)       │                    │ (开发者本地)      │
+    └────────────────┘                    └──────────────────┘
+```
+
+**搜索合并流程**（`search mode=both`）：
+1. 向量 + 图搜索**并行**执行（Promise.all）
+2. 向量结果标注匹配的图符号名称和出入度
+3. 未匹配的图符号独立展示
+4. 图上下文富化（4 层）：调用图 → 影响面 → 文件依赖 → 架构摘要
+
+## 各 git 操作场景下的索引行为
+
+### 图索引（SQLite, 随项目存储）
+
+图索引直接绑定工作树文件内容，通过 Merkle 内容哈希检测变更：
+
+| 操作 | 行为 | 性能 |
+|------|------|------|
+| **修改文件** | Merkle 检测 → 增量重建（仅变更文件） | 变更文件数 × ~10ms/文件 |
+| **git reset --hard** | 文件内容变化 → Merkle 检测变化 → 重建变化文件 | 与 reset 范围成正比 |
+| **git rebase** | 文件可能变化 → Merkle 检测 → 重建 + 重新计算 merge-base | 合并后增量 |
+| **git stash / pop** | 内容变化 → Merkle 检测 → embedding cache 100% 命中 → 极快 | < 1s |
+| **git checkout 分支** | 不同分支 = 不同 DB 内容。Merkle 检测 → 增量重建 | 分支差异文件数 × ~10ms |
+| **克隆新仓库** | 无 DB 文件 → 首次 `search` 触发自动构建 | 全量文件 × ~10ms |
+| **git merge** | 新文件被索引，未变文件跳过 | 仅新/改文件 |
+
+**git 操作正确性保证**：
+- 基于**文件内容哈希**，不是 git commit SHA，对 `reset --hard`/`rebase` 免疫
+- dirty flag 防护：索引中断后下次强制全量重建
+- merge-base 追踪：rebase 后自动重新计算 `devChangedFiles`
+
+### 向量索引（Milvus, 网络服务）
+
+向量索引使用 **dev ⊕ root 双层架构**，每层在不同场景下行为不同。
+
+**核心机制**：
+```
+identity = gitRemote:branch:devFingerprint
+collection = hcc_<md5(identity)>
+merkle snapshot = ~/.context/merkle/<md5(identity)>.json
+devChangedFiles = git diff --name-only merge-base HEAD  (首次计算)
+```
+
+| 操作 | 行为 | 说明 |
+|------|------|------|
+| **首次 index** | delta 模式：`git diff merge-base HEAD` → 计算 devChangedFiles → 只索引与 root 不同的文件 | 未变文件由 root 层提供 |
+| **修改文件** | Merkle 检测变化 → 增量索引变更文件 → devChangedFiles 增量更新 | 仅修改的文件重索引 |
+| **git checkout 分支** | 不同分支 = 不同 identity = 不同 collection + 不同 Merkle 快照。切回时 Merkle 匹配 → 零成本 | 每分支独立 collection |
+| **git reset --hard** | 文件变化 → Merkle 检测 → 批量删除旧 chunks + 嵌入新 chunks | 变更文件数 × ~50ms/文件 |
+| **git rebase** | 文件可能变化 + merge-base 变化 → rebase reconciliation 自动触发 → `git diff` 重新计算 devChangedFiles → 旧 dev 文件中与 root 相同的移除、新分叉文件加入 | 自动修正 |
+| **git stash / pop** | 内容变化 → Merkle 检测 → embedding cache 100% 命中 → 极快（仅写 Milvus） | < 2s |
+| **git merge** | 新文件被索引 → devChangedFiles 扩展 | 仅新文件 |
+
+**rebase 后的精确行为**：
+1. `syncIndexByMerkle` 检测 `merge-base` 是否变化（对比 `lastMergeBase` 快照字段）
+2. 变化后执行 `git diff --name-only <new-merge-base>` 获取新的变更文件集合
+3. 旧 dev 文件中与 root 相同的 → 从 `removed` 列表加入（后续从 Milvus 删除）
+4. 新分叉文件 → 加入 `modified` 列表（后续重新索引）
+5. `devChangedFiles` 更新为新的集合
+6. 搜索时 `buildMaskFilter(devChangedFiles)` 在 root 层正确排除 dev 版本
+
+**版本污染防护**：
+- 每个开发者独立 collection（`<identity>` = `<remote>:<branch>:<devFingerprint>`）
+- devChangedFiles 通过 `relativePath not in [...]` 在 root 层 mask
+- 两层全局 RRF 融合 + 去重：dev 层优先，root 层兜底
+- **不会被其他开发者的修改污染**
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -267,16 +350,87 @@ else:
   - 支持 dotenv 标准语法：引号、注释（`#`/`//`）、`export` 前缀
   - 优先级：`process.env` > `.env` 文件
 
-### graph — 知识图谱
-- `SqliteGraphStore` — 带 FTS5 全文索引的 SQLite 存储（WAL 模式）
-  - `getReadonlyDB()` — 只读副本连接，搜索/查询时使用，避免后台构建阻塞读操作
-- `GraphExtractor` — tree-sitter AST 提取节点和边
-- `CallTracer` — 调用链追踪（BFS），支持 inbound/outbound/both
-- `GraphSearcher` — BM25+FTS 图搜索
-- `ArchitectureAnalyzer` — 架构分析：入口点检测、模块聚类
-- `FunctionRegistry` — O(1) 函数查找，用于跨文件调用解析
-- `parse-worker.ts` — Worker Thread 脚本，并行 AST 解析
-- `InMemoryGraphBuffer` — Phase 1 的内存图缓冲区
+### graph — 知识图谱（v2 — 2026-07 重构）
+
+v2 对标 CodeGraph 进行重构，核心变化：
+
+| 维度 | v1 (旧) | v2 (新) |
+|------|---------|---------|
+| 存储位置 | `~/.context/graph/` 全局 DB | `<project>/.context/graph/knowledge-graph.db` 随项目存储 |
+| 提取 | 2 遍（定义 + 调用） | 3 遍（定义 + unresolved ref + 路由） |
+| 解析 | FunctionRegistry（同文件内） | ReferenceResolver（跨文件 import 追踪 + 名称匹配） |
+| 遍历 | CallTracer（BFS only） | GraphTraverser（BFS/DFS/影响面/最短路径/类型层级） |
+| 解析 | 单 Worker，用完即弃 | ParseWorkerPool 持久池 + StoreWriter 专用写线程 |
+| 节点元数据 | label + properties | kind/language/signature/visibility/isExported/provenance |
+| 边元数据 | type + properties | kind/line/column/provenance/metadata |
+| 引用解析 | 无 | import 解析 → 跨文件 CALLS 边 |
+
+#### graph v2 核心模块
+
+- `SqliteGraphStore` ([graph-store.ts](packages/graph/src/graph-store.ts)) — 项目内 SQLite 存储（WAL 模式, FTS5）
+  - `beginBulkLoad()`/`endBulkLoad()` — 批量写入模式（禁用 FTS 触发器 + FK）
+  - `getReadonlyDB()` — 只读副本连接，搜索不阻塞写入
+  - **unresolved_refs 表** — 待解析引用的行级追踪（pending/failed 状态）
+  - `getEdgesBySourceKinds()`/`getEdgesByTargetKinds()` — SQL IN 批量查询替代 N 次单查
+  - Schema: nodes（19 列）+ edges（10 列）+ unresolved_refs（9 列）+ files + nodes_fts
+- `GraphIndexer` ([indexer.ts](packages/graph/src/indexer.ts)) — 4 阶段编排器
+  1. **扫描**（git ls-files 或 filesystem walk）
+  2. **解析**（GraphExtractor → InMemoryGraphBuffer + unresolved refs）
+  3. **存储**（批量 flush 到 SQLite，每 10K 行 yield 事件循环）
+  4. **解析**（ReferenceResolver → 跨文件 CALLS 边 + 边类型提升）
+- `GraphExtractor` ([extractor.ts](packages/graph/src/extractor.ts)) — 3 遍 tree-sitter 提取
+  - Pass 1: 收集定义 → nodes + CONTAINS 边
+  - Pass 2: 调用表达式 → unresolvedRefs（不直接创建 CALLS 边）
+  - Pass 3: HTTP 路由收集
+  - **作用域修复**（2026-07）：`const sum = add(x,y)` 中 add 调用的父节点正确为函数而非变量
+- `ReferenceResolver` ([resolution/index.ts](packages/graph/src/resolution/index.ts)) — 多策略引用解析管线
+  - `resolveOne` 策略链: pre-filter → import-mapping → name-match → jvm-fqn → razor-using
+  - `resolveViaImport` — 解析 import 语句 → 在导入文件中按 kind+name 匹配目标节点
+  - `knownNames` Set O(1) 预过滤（跳过不存在的符号）
+  - LRU 缓存（5000 entries）: 文件内容/import 映射/节点查找
+  - `resolveAndPersistBatched` — 分批解析（500/batch），yield 事件循环
+  - 边类型提升: calls→instantiates（target 为 class）、extends→implements（target 为 interface）
+- `GraphTraverser` ([traversal.ts](packages/graph/src/traversal.ts)) — 图遍历算法
+  - BFS/DFS（含边优先级排序 contains > calls > instantiates > references）
+  - `getCallers`/`getCallees` — 调用者/被调用者追踪（含 instantiates 边）
+  - `getCallGraph` — 双向调用图
+  - `getTypeHierarchy` — 类型层级（extends/implements 祖先+后代）
+  - `getImpactRadius` — 变更影响面分析（排除 contains 防爆炸）
+  - `findPath` — 两节点最短路径（BFS）
+  - `getAncestors`/`getChildren` — 容器层级
+- `GraphQueryManager` ([queries.ts](packages/graph/src/queries.ts)) — 高级查询
+  - `getContext` — 节点完整上下文（祖先、子、入/出引用、类型、导入）
+  - `getFileDependencies`/`getFileDependents` — 跨文件依赖分析
+  - `findDeadCode` — 死代码检测
+  - `findCircularDependencies` — 循环依赖检测
+  - `getNodeMetrics` — 复杂度指标
+- `GraphSearcher` ([searcher.ts](packages/graph/src/searcher.ts)) — 图搜索（FTS5 BM25 + grep + 图富化）
+- `ArchitectureAnalyzer` ([architecture.ts](packages/graph/src/architecture.ts)) — 入口点检测、模块聚类、内聚度计算
+- `InMemoryGraphBuffer` ([graph-buffer.ts](packages/graph/src/graph-buffer.ts)) — Phase 1 内存图缓冲（惰性二级索引、字符串驻留）
+
+#### graph v2 多线程基础设施
+
+- `ParseWorkerPool` ([parse-pool.ts](packages/graph/src/parse-pool.ts))
+  - 持久 Worker Threads（默认 `max(1, cores-2)`），为 Milvus 留核
+  - 每 250 文件回收 Worker（WASM 内存泄漏防护）
+  - 超时处理（30s 基础 + 3x 硬杀）
+  - Grammar WASM 一次性加载 → 传递给每个 Worker
+- `StoreWriter` ([store-writer.ts](packages/graph/src/store-writer.ts))
+  - 专用 Worker Thread 处理 SQLite 写入
+  - 窗口 backpressure（64 个未确认 bundle）
+  - `drain()` 等待所有写入完成
+
+#### 图索引共享模型
+
+图索引 DB 存储在 `<project>/.context/graph/knowledge-graph.db`，已加入 `.gitignore`：
+- **Git 跟踪方案评估**：SQLite 二进制文件不适合 git。多个开发者同时修改代码会导致 DB 文件冲突无法合并；DB 重建速度快（<5s 本项目）。DB 文件随工作树通过 Merkle 同步自动维护，始终与当前文件内容一致。
+- **团队共享**：每个开发者本地运行 `index` 重建自己的图索引。图索引与当前工作树文件内容严格一致（Merkle 内容哈希），不依赖 git 历史。
+- **克隆新项目**：搜索触发自动图索引构建（`maybeAutoBuildGraphIndex`），首次搜索时自动初始化。
+
+#### 图索引关键环境变量
+
+- `CODEGRAPH_PARSE_WORKERS` — Worker 池大小覆盖（默认 `cores-2`）
+- `CODEGRAPH_PARSE_TIMEOUT_MS` — 单文件解析超时（默认 30s）
 
 ### mcp — MCP 服务（唯一对外入口）
 - `src/index.ts` — 入口，`ContextMcpServer` 类
@@ -289,7 +443,11 @@ else:
   - `handleClearIndex` — 取消在途索引 → 清除 dev collection + Merkle 快照 + graph index
   - `handleStatus` — 检查 dev + root 两层索引状态
   - `syncCollectionState()` — 从 Milvus collections 同步本地快照状态
-  - `enrichWithGraphContextDeep()` — 3 层图增强：直接调用关系 → BFS 调用链 → 架构摘要
+  - `enrichWithGraphContextDeep()` — **4 层图增强**：
+  1. **Call Graph**：直接调用关系（callers/callees + 函数签名，含出入度）
+  2. **Change Impact**：top 3 匹配符号的变更影响面（impact radius）
+  3. **File Dependencies**：通过 graph symbols 标注的文件依赖链
+  4. **Architecture**：入口点摘要（首次搜索时 emitted）
 - `src/graph-handlers.ts` — 图操作 handler：`handleIndexRepository`（3 阶段）、`handleSearchGraph`、`handleTracePath`、`handleGetArchitecture`等
 - `src/sync.ts` — 后台自动同步（默认每 5 分钟，使用 `syncIndexByMerkle`）
   - 全局锁 stale 阈值 2 分钟（兜底回收），可通过 `CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS` 调整
