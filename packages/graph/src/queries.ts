@@ -14,10 +14,12 @@ import { GraphTraverser } from './traversal';
 export class GraphQueryManager {
   private store: SqliteGraphStore;
   private traverser: GraphTraverser;
+  private project: string;
 
-  constructor(store: SqliteGraphStore) {
+  constructor(store: SqliteGraphStore, project?: string) {
     this.store = store;
     this.traverser = new GraphTraverser(store);
+    this.project = project || store.listProjects()[0] || '';
   }
 
   /**
@@ -104,7 +106,7 @@ export class GraphQueryManager {
    */
   getFileDependencies(filePath: string): string[] {
     const deps = new Set<string>();
-    const nodes = this.store.getNodesByFile('', filePath);
+    const nodes = this.store.getNodesByFile(this.project, filePath);
     for (const node of nodes) {
       const outgoing = this.store.getEdgesBySource(node.id);
       for (const edge of outgoing) {
@@ -123,7 +125,7 @@ export class GraphQueryManager {
    */
   getFileDependents(filePath: string): string[] {
     const deps = new Set<string>();
-    const nodes = this.store.getNodesByFile('', filePath);
+    const nodes = this.store.getNodesByFile(this.project, filePath);
     for (const node of nodes) {
       const incoming = this.store.getEdgesByTarget(node.id);
       for (const edge of incoming) {
@@ -141,7 +143,7 @@ export class GraphQueryManager {
    * Get all symbols exported by a file.
    */
   getExportedSymbols(filePath: string): GraphNode[] {
-    const nodes = this.store.getNodesByFile('', filePath);
+    const nodes = this.store.getNodesByFile(this.project, filePath);
     return nodes.filter(n => n.isExported);
   }
 
@@ -161,7 +163,7 @@ export class GraphQueryManager {
 
     const allNodes: GraphNode[] = [];
     for (const kind of kinds) {
-      const nodes = this.store.getNodesByKind('', kind);
+      const nodes = this.store.getNodesByKind(this.project, kind);
       for (const node of nodes) {
         if (regex.test(node.qualifiedName)) allNodes.push(node);
       }
@@ -173,7 +175,7 @@ export class GraphQueryManager {
    * Get module/package structure as a directory tree.
    */
   getModuleStructure(): Map<string, string[]> {
-    const filePaths = this.store.getAllFilePaths('');
+    const filePaths = this.store.getAllFilePaths(this.project);
     const structure = new Map<string, string[]>();
     for (const fp of filePaths) {
       const parts = fp.split('/');
@@ -255,7 +257,7 @@ export class GraphQueryManager {
     const deadCode: GraphNode[] = [];
 
     for (const kind of targetKinds) {
-      const nodes = this.store.getNodesByKind('', kind);
+      const nodes = this.store.getNodesByKind(this.project, kind);
       for (const node of nodes) {
         if (node.isExported) continue;
 
@@ -284,7 +286,7 @@ export class GraphQueryManager {
     ];
 
     for (const kind of kinds) {
-      const kindNodes = this.store.getNodesByKind('', kind);
+      const kindNodes = this.store.getNodesByKind(this.project, kind);
       for (const node of kindNodes) {
         if (filter(node)) nodes.set(node.id, node);
       }
