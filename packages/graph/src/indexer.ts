@@ -27,7 +27,6 @@ import {
 import { SqliteGraphStore, getGraphDbPath } from './graph-store';
 import { InMemoryGraphBuffer } from './graph-buffer';
 import { GraphExtractor } from './extractor';
-import { FunctionRegistry } from './registry';
 import { ReferenceResolver } from './resolution/index';
 
 // ── Constants ───────────────────────────────────────────────────────

@@ -524,37 +524,6 @@ export class SqliteGraphStore implements GraphStore {
     }
   }
 
-  /** LIKE-based substring search fallback for when FTS returns 0 results. */
-  private fallbackLikeSearch(options: GraphSearchOptions): GraphSearchResponse {
-    const { conditions, params } = this.buildFindConditions(options);
-    const words = (options.query || '')
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .split(/[\s_\-.:/]+/)
-      .filter((t: string) => t.length > 1);
-
-    if (words.length === 0) {
-      return { results: [], total: 0, hasMore: false };
-    }
-
-    const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
-    const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
-    const allConds = [...conditions, ...likeConds.map(c => `(${c})`)];
-    const allParams = [...params, ...likeParams];
-    const whereSQL = allConds.length > 0 ? allConds.join(' AND ') : '1=1';
-    const limit = options.limit ?? 200;
-    const offset = options.offset ?? 0;
-    const rdb = this.readDB;
-
-    const rows = rdb.prepare(
-      `SELECT n.*, 0.5 AS score FROM nodes n WHERE ${whereSQL} ORDER BY n.name LIMIT ? OFFSET ?`
-    ).all(...allParams, limit, offset) as Array<Record<string, unknown>>;
-    const countRow = rdb.prepare(
-      `SELECT COUNT(*) as total FROM nodes n WHERE ${whereSQL}`
-    ).get(...allParams) as { total: number };
-
-    return this.buildNodeResults(rows, countRow, options, offset);
-  }
-
   private buildFindConditions(options: GraphSearchOptions): { conditions: string[]; params: unknown[] } {
     const conditions: string[] = [];
     const params: unknown[] = [];
