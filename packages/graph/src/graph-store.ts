@@ -500,10 +500,14 @@ export class SqliteGraphStore implements GraphStore {
         }
       }
 
-      // Apply offset/limit after merging
+      // Apply offset/limit after merging, excluding noise kinds
+      const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
+      const filtered = allRows.filter(row =>
+        !NOISE_KINDS.has(row.kind as string) && !NOISE_KINDS.has(row.label as string)
+      );
       const start = offset || 0;
-      const sliced = allRows.slice(start, start + limit);
-      const mergedCount = { total: seenIds.size };
+      const sliced = filtered.slice(start, start + limit);
+      const mergedCount = { total: filtered.length };
       return this.buildNodeResults(sliced, mergedCount, options, offset);
     } else {
       const query = `
@@ -563,8 +567,15 @@ export class SqliteGraphStore implements GraphStore {
     options: GraphSearchOptions,
     offset: number,
   ): GraphSearchResponse {
+    // Exclude noise kinds from all results
+    const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
+    const filteredRows = rows.filter(row => {
+      const k = (row.kind || row.label) as string;
+      return !NOISE_KINDS.has(k);
+    });
+
     const results: GraphSearchResult[] = [];
-    const nodeIds = rows.map(row => row.id as number);
+    const nodeIds = filteredRows.map(row => row.id as number);
     const degreeMap = this.getNodeDegreesBatch(nodeIds);
 
     for (const row of rows) {
