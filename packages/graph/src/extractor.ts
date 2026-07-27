@@ -676,9 +676,11 @@ export class GraphExtractor {
       if (callName) {
         const entry = registry.get(callName);
         if (entry) {
-          if (entry.importModule) {
-            // Imported calls → IMPORTS edge (structural, created directly)
-            if (entry.nodeIndex !== currentDefIdx) {
+          if (entry.nodeIndex !== currentDefIdx) {
+            if (entry.importModule) {
+              // Imported function call: keep the IMPORTS edge, AND also produce
+              // an unresolved ref so the reference resolver can create a CALLS
+              // edge to the actual target function in the imported file.
               edges.push({
                 project: ctx.project,
                 sourceId: currentDefIdx,
@@ -691,19 +693,16 @@ export class GraphExtractor {
                 properties: { importModule: entry.importModule },
               });
             }
-          } else {
-            // Regular calls → unresolved reference (resolved later by reference resolver)
-            if (entry.nodeIndex !== currentDefIdx) {
-              unresolvedRefs.push({
-                fromNodeId: currentDefIdx,
-                referenceName: callName,
-                referenceKind: 'calls' as GraphEdgeKind,
-                line: callLine,
-                column: callCol,
-                filePath: ctx.filePath,
-                language,
-              });
-            }
+            // Always create unresolved reference for cross-file resolution
+            unresolvedRefs.push({
+              fromNodeId: currentDefIdx,
+              referenceName: callName,
+              referenceKind: 'calls' as GraphEdgeKind,
+              line: callLine,
+              column: callCol,
+              filePath: ctx.filePath,
+              language,
+            });
           }
         } else {
           // Call to something not in this file → unresolved reference

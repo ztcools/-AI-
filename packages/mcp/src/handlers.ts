@@ -822,98 +822,117 @@ export class ToolHandlers {
                 };
             }
 
-            // ── Dual-mode search: vector + graph, or single-mode ──
+            // ── Dual-mode search: parallel vector + graph ──
             let vectorResults: any[] = [];
-            let graphResultText = '';
+            let graphSymbols: Array<{ name: string; kind: string; filePath: string; line: number; inDegree: number; outDegree: number }> = [];
 
-            if (searchMode !== 'graph') {
-                searchResults = await this.context.searchWithLayers(
-                    layers,
-                    query,
-                    Math.min(resultLimit, 50),
-                    tuning.threshold,
-                    filterExpr,
-                );
+            const vectorPromise = searchMode !== 'graph'
+              ? (async () => {
+                  searchResults = await this.context.searchWithLayers(
+                      layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr,
+                  );
+                  if (layers.length > 1) searchSourceNote = ' (dev ⊕ root)';
+                  else if (devExists) searchSourceNote = ' (dev index)';
+                  else searchSourceNote = ' (root fallback — run index for your dev copy)';
 
-                if (layers.length > 1) {
-                    searchSourceNote = ' (dev ⊕ root)';
-                } else if (devExists) {
-                    searchSourceNote = ' (dev index)';
-                } else {
-                    searchSourceNote = ' (root fallback — run index for your dev copy)';
-                }
+                  let scored = searchResults;
+                  if (tuning.scoreRatio > 0 && scored.length > 1) {
+                      const topScore = Number(scored[0]?.score) || 0;
+                      if (topScore > 0) {
+                          const floor = topScore * tuning.scoreRatio;
+                          scored = scored.filter((r: any, i: number) => i === 0 || (Number(r.score) || 0) >= floor);
+                      }
+                  }
+                  vectorResults = scored;
+              })()
+              : Promise.resolve();
 
-                // Score cutoff
-                let scored = searchResults;
-                if (tuning.scoreRatio > 0 && scored.length > 1) {
-                    const topScore = Number(scored[0]?.score) || 0;
-                    if (topScore > 0) {
-                        const floor = topScore * tuning.scoreRatio;
-                        scored = scored.filter((r: any, i: number) =>
-                            i === 0 || (Number(r.score) || 0) >= floor
-                        );
-                    }
-                }
-                vectorResults = scored;
-            }
+            const graphPromise = (searchMode !== 'vector' && this.graphToolHandlers)
+              ? (async () => {
+                  try {
+                      const store = this.graphToolHandlers!.getStore();
+                      const project = getRepoIdentity(absolutePath);
+                      const gr = store.findNodes({ project, query, limit: Math.min(resultLimit, 10) });
+                      if (gr.results.length > 0) {
+                          graphSymbols = gr.results.map(r => ({
+                              name: r.node.name,
+                              kind: r.node.kind,
+                              filePath: r.node.filePath,
+                              line: r.node.startLine,
+                              inDegree: r.inDegree,
+                              outDegree: r.outDegree,
+                          }));
+                      }
+                  } catch {}
+              })()
+              : Promise.resolve();
 
-            // Append graph results if mode=graph or mode=both and graph handlers exist
-            if (searchMode !== 'vector' && this.graphToolHandlers && query.trim().length > 0) {
-                try {
-                    const project = getRepoIdentity(absolutePath);
-                    const gr = this.graphToolHandlers.handleSearchGraph({
-                        project,
-                        query,
-                        limit: Math.min(resultLimit, 10),
-                    });
-                    const gText = gr.content[0]?.text || '';
-                    if (gText && !gText.startsWith('Found 0 results')) {
-                        graphResultText = gText;
-                    }
-                } catch {}
-            }
+            await Promise.all([vectorPromise, graphPromise]);
 
-            // ── No results found ──
-            if (vectorResults.length === 0 && !graphResultText) {
+            // ── No results ──
+            if (vectorResults.length === 0 && graphSymbols.length === 0) {
                 let noMsg = `No results for "${query}" in '${absolutePath}'${searchSourceNote}`;
                 if (isIndexing) noMsg += `\nIndexing in progress — retry later.`;
                 if (!devExists) noMsg += `\nTip: run index tool first.`;
                 return { content: [{ type: "text", text: noMsg }] };
             }
 
-            // ── Format vector results ──
+            // ── Cross-reference: match graph symbols to vector hits ──
+            const graphFileSet = new Set(graphSymbols.map(s => s.filePath));
+
+            // ── Format results ──
+            const parts: string[] = [];
+
             if (vectorResults.length > 0) {
-                const items = vectorResults.map((r: any, i: number) => {
+                const modeTag = searchMode === 'both' && graphSymbols.length > 0 ? ' vector+graph' : '';
+                parts.push(`${vectorResults.length}${modeTag} hits for "${query}"${searchSourceNote}${indexingStatusMessage}`);
+
+                for (let i = 0; i < vectorResults.length; i++) {
+                    const r = vectorResults[i];
                     const loc = `${r.relativePath}:${r.startLine}-${r.endLine}`;
                     if (compactStyle) {
-                        return `[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}`;
+                        const graphMatch = graphSymbols.filter(s => s.filePath === r.relativePath);
+                        const graphNote = graphMatch.length > 0 ? ` [graph: ${graphMatch.map(s => s.name).join(', ')}]` : '';
+                        parts.push(`[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}${graphNote}`);
+                    } else {
+                        const code = truncateContent(r.content, tuning.snippetMaxChars);
+                        const graphMatch = graphSymbols.filter(s =>
+                            s.filePath === r.relativePath &&
+                            s.line >= r.startLine &&
+                            s.line <= r.endLine
+                        );
+                        const graphNote = graphMatch.length > 0
+                            ? `  graph: ${graphMatch.map(s => `${s.kind} \`${s.name}\` (↖${s.inDegree} ↗${s.outDegree})`).join(' | ')}\n`
+                            : '';
+                        parts.push(`[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}\n${graphNote}\`\`\`${r.language}\n${code}\n\`\`\``);
                     }
-                    const code = truncateContent(r.content, tuning.snippetMaxChars);
-                    return `[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}\n\`\`\`${r.language}\n${code}\n\`\`\``;
-                }).join(compactStyle ? '\n' : '\n\n');
-
-                const modeTag = searchMode === 'both' ? ' vector+graph' : '';
-                resultMessage = `${vectorResults.length}${modeTag} hits for "${query}"${searchSourceNote}${indexingStatusMessage}\n${items}\n`;
-            }
-
-            // ── Graph enrichment (both mode only, when enrich !== false) ──
-            if (doEnrich && this.graphToolHandlers && vectorResults.length > 0) {
-                try {
-                    resultMessage += this.enrichWithGraphContextDeep(
-                        vectorResults.slice(0, 5),
-                        absolutePath,
-                        query,
-                    );
-                } catch (graphErr: any) {
-                    console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
                 }
             }
 
-            // ── Graph-only mode: standalone graph results ──
-            if (graphResultText && searchMode === 'graph') {
-                resultMessage = `Graph hits for "${query}" in '${absolutePath}'${indexingStatusMessage}\n\n${graphResultText}`;
-            } else if (graphResultText && vectorResults.length === 0) {
-                resultMessage = `Graph-only hits for "${query}" (no vector matches)${indexingStatusMessage}\n\n${graphResultText}`;
+            // ── Graph symbols not matched by vector search ──
+            const unmatchedSymbols = graphSymbols.filter(s => !vectorResults.some(r =>
+                r.relativePath === s.filePath && r.startLine <= s.line && r.endLine >= s.line
+            ));
+            if (unmatchedSymbols.length > 0 && searchMode !== 'vector') {
+                parts.push('');
+                parts.push('### Graph symbols');
+                for (const s of unmatchedSymbols.slice(0, 5)) {
+                    parts.push(`- ${s.kind} \`${s.name}\` (${s.filePath}:${s.line}) ↖${s.inDegree} ↗${s.outDegree}`);
+                }
+            }
+
+            resultMessage = parts.join('\n');
+
+            // ── Graph enrichment ──
+            if (doEnrich && this.graphToolHandlers && vectorResults.length > 0) {
+                try {
+                    const enrich = this.enrichWithGraphContextDeep(
+                        vectorResults.slice(0, 5), absolutePath, query,
+                    );
+                    if (enrich) resultMessage += enrich;
+                } catch (graphErr: any) {
+                    console.warn(`[SEARCH] Graph enrichment failed: ${graphErr.message}`);
+                }
             }
 
             if (isIndexing) {

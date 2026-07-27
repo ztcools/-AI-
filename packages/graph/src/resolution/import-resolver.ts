@@ -134,17 +134,17 @@ export function resolveViaImport(
       matchedImport.resolvedFile,
     );
 
-    // Search for the full reference name in the imported file's nodes
-    let nodes = context.getNodesInFile(relativeResolved);
-    if (dotIndex > 0) {
-      // For qualified references, try the full suffix
-      nodes = context.getNodesByName(refName);
-      // Filter to the resolved file if we got global results
-      if (nodes.length === 0) {
-        nodes = context.getNodesInFile(relativeResolved).filter(
-          (n) => n.name === refName.slice(dotIndex + 1),
-        );
-      }
+    // Search for matching function/method nodes by name in the imported file
+    const targetName = dotIndex > 0 ? refName.slice(dotIndex + 1) : refName;
+    let candidates = context.getNodesInFile(relativeResolved)
+      .filter(n => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
+
+    // Filter by name: exact match preferred
+    let nodes = candidates.filter(n => n.name === targetName);
+    if (nodes.length === 0) {
+      // Fallback: all candidates (for qualified names or renamed exports)
+      nodes = candidates.length > 0 ? candidates
+        : context.getNodesByName(targetName);
     }
 
     if (nodes.length === 1) {
@@ -157,14 +157,14 @@ export function resolveViaImport(
     }
 
     if (nodes.length > 1) {
-      // Ambiguous but in importing file — prefer exported/public nodes
+      // Multiple matches — prefer exported
       const exported = nodes.filter((n) => n.isExported);
       const candidate = exported.length === 1 ? exported[0] : nodes[0];
       return {
         original: ref,
         targetNodeId: candidate.id,
-        resolvedBy: 'import-mapping-ambiguous',
-        confidence: exported.length === 1 ? 0.90 : 0.70,
+        resolvedBy: 'import-mapping',
+        confidence: exported.length === 1 ? 0.90 : 0.75,
       };
     }
   }
