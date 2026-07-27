@@ -567,18 +567,24 @@ export class SqliteGraphStore implements GraphStore {
     options: GraphSearchOptions,
     offset: number,
   ): GraphSearchResponse {
-    // Exclude noise kinds from all results
+    // Exclude noise: import pseudo-nodes, variables, file nodes, parameter/enum_member,
+    // and constructor methods (no agent benefit from seeing OrderService.constructor).
     const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
     const filteredRows = rows.filter(row => {
       const k = (row.kind || row.label) as string;
-      return !NOISE_KINDS.has(k);
+      const name = (row.name as string) || '';
+      // Exclude by kind
+      if (NOISE_KINDS.has(k)) return false;
+      // Exclude constructor methods
+      if (k === 'method' && name.endsWith('.constructor')) return false;
+      return true;
     });
 
     const results: GraphSearchResult[] = [];
     const nodeIds = filteredRows.map(row => row.id as number);
     const degreeMap = this.getNodeDegreesBatch(nodeIds);
 
-    for (const row of rows) {
+    for (const row of filteredRows) {
       const node = this.rowToNode(row);
       const { inDegree, outDegree } = degreeMap.get(node.id) || { inDegree: 0, outDegree: 0 };
 
