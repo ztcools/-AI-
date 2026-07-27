@@ -96,25 +96,23 @@ Index a codebase for intelligent code search. One call builds both the vector in
         // deliberately directive. Keep the guidance honest — every claim here is
         // backed by the handler (hybrid vector+BM25 ranking, graph enrichment).
         const search_description = `
-Semantic + knowledge-graph search over the indexed codebase.
+Semantic + knowledge-graph search over the indexed codebase. Use this FIRST before Read/grep — it tells you WHERE to look and HOW code connects, using far fewer tokens than reading files blindly.
 
-**Modes:**
-- \`both\` (default) — vector semantic + graph symbol search together
-- \`vector\` — semantic search only (no graph; "how/where is X implemented")
-- \`graph\` — symbol search only ("who calls X")
+**Mode (pick based on what you need):**
+- \`mode: "both"\` (default) — vector semantic + graph symbols. Best for open-ended exploration.
+- \`mode: "vector"\` — pure semantic search. Use when asking "how/where is X implemented".
+- \`mode: "graph"\` — pure symbol + call-graph search. Use for "who calls X", "impact of changing Y".
 
-**Output control (both mode):**
-- \`enrich: true\` (default) — append call-relationship context
-- \`style: 'compact'\` — only file:line locations, no code snippets
+**Output tuning:**
+- \`enrich: false\` — skip call-graph context section (saves tokens when you only need locations)
+- \`style: "compact"\` — file:line only, no code snippets (fastest, least tokens)
 
-🎯 **When:**
-- Finding where something is implemented (unknown path)
-- Understanding an unfamiliar subsystem
-- Tracing call relationships (graph mode)
-
-🚫 **Skip — use Read/grep instead:**
-- File path already known (from CLAUDE.md or recent reads) → read directly
-- Exact symbol/string known → grep, faster and zero-cost
+🎯 **When to use each mode:**
+- "how does auth work" → both (explore flow)
+- "find the User model" → vector
+- "who calls sendEmail" → graph
+- "what files import validators" → graph
+- "show me the login function" → vector
 
 Query in natural language (e.g. "how are auth tokens refreshed").
 `;
