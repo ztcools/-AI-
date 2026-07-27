@@ -855,6 +855,7 @@ export class ToolHandlers {
             const graphPromise = (searchMode !== 'vector' && this.graphToolHandlers)
               ? (async () => {
                   try {
+                      this.graphToolHandlers!.setProject(absolutePath);
                       const store = this.graphToolHandlers!.getStore();
                       const project = getRepoIdentity(absolutePath);
                       const gr = store.findNodes({ project, query, limit: Math.min(resultLimit, 10) });

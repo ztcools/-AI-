@@ -52,8 +52,16 @@ export class GraphToolHandlers {
     }
   }
 
-  /** Set/update the active project directory. */
+  /** Set/update the active project directory. Re-opens the store at the new project. */
   setProject(projectDir: string): void {
+    if (this.projectDir === projectDir) return;
+    // Close old store, open new one at project's .context/graph/
+    this.store.close();
+    this.store = new SqliteGraphStore(projectDir);
+    this.store.initialize();
+    this.traverser = new GraphTraverser(this.store);
+    this.searcher = new GraphSearcher(this.store);
+    this.architecture = new ArchitectureAnalyzer(this.store);
     this.projectDir = projectDir;
     this.project = getRepoIdentity(projectDir);
   }
