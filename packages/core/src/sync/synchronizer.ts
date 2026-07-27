@@ -387,7 +387,6 @@ export class FileSynchronizer {
 
     /** Mark the snapshot as clean after successful indexing. */
     async markClean(): Promise<void> {
-        if (!this.dirty) return;
         this.dirty = false;
         await this.saveSnapshot();
         console.log('[Synchronizer] Marked snapshot as clean — indexing completed successfully.');
