@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (path)
 );
 
--- FTS5 index for BM25 full-text search on node names and qualified names
+-- FTS5 index: stores camelCase-split names so "order" matches "createOrder"
+-- The trigger_fn helper splits camelCase strings (e.g. "createOrder" → "create Order")
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name,
     qualified_name,
@@ -130,7 +131,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
 const FTS_TRIGGERS_SQL = `
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
     INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+    VALUES (
+      new.id,
+      replace(replace(replace(new.name, '_', ' '), '-', ' '), '::', ' '),
+      replace(replace(replace(new.qualified_name, '_', ' '), '-', ' '), '.', ' ') ,
+      replace(replace(new.file_path, '/', ' '), '_', ' ')
+    );
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
@@ -142,7 +148,12 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
     VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
     INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+    VALUES (
+      new.id,
+      replace(replace(replace(new.name, '_', ' '), '-', ' '), '::', ' '),
+      replace(replace(replace(new.qualified_name, '_', ' '), '-', ' '), '.', ' ') ,
+      replace(replace(new.file_path, '/', ' '), '_', ' ')
+    );
 END;
 `;
 
@@ -426,22 +437,30 @@ export class SqliteGraphStore implements GraphStore {
 
     if (options.query && options.query.trim().length > 0) {
       const ftsQuery = this.buildFtsQuery(options.query);
-      const query = `
-        SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
-        FROM nodes n
-        JOIN nodes_fts fts ON n.id = fts.rowid
-        WHERE nodes_fts MATCH ? AND ${whereClause}
-        ORDER BY score
-        LIMIT ? OFFSET ?
-      `;
-      const countQuery = `
-        SELECT COUNT(*) as total
-        FROM nodes n
-        JOIN nodes_fts fts ON n.id = fts.rowid
-        WHERE nodes_fts MATCH ? AND ${whereClause}
-      `;
-      const rows = rdb.prepare(query).all(ftsQuery, ...params, limit, offset) as Array<Record<string, unknown>>;
-      const countRow = rdb.prepare(countQuery).get(ftsQuery, ...params) as { total: number };
+      let rows: Array<Record<string, unknown>> = [];
+      let countRow: { total: number } = { total: 0 };
+
+      try {
+        rows = rdb.prepare(`
+          SELECT n.*, bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
+          FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
+          WHERE nodes_fts MATCH ? AND ${whereClause}
+          ORDER BY score LIMIT ? OFFSET ?
+        `).all(ftsQuery, ...params, limit, offset) as Array<Record<string, unknown>>;
+        countRow = rdb.prepare(`
+          SELECT COUNT(*) as total
+          FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
+          WHERE nodes_fts MATCH ? AND ${whereClause}
+        `).get(ftsQuery, ...params) as { total: number };
+      } catch {
+        // FTS failed (e.g. special chars) — fall through to LIKE
+      }
+
+      if (rows.length === 0) {
+        const r = this.fallbackLikeSearch(options);
+        return r;
+      }
+
       return this.buildNodeResults(rows, countRow, options, offset);
     } else {
       const query = `
@@ -460,6 +479,37 @@ export class SqliteGraphStore implements GraphStore {
       const countRow = rdb.prepare(countQuery).get(...params) as { total: number };
       return this.buildNodeResults(rows, countRow, options, offset);
     }
+  }
+
+  /** LIKE-based substring search fallback for when FTS returns 0 results. */
+  private fallbackLikeSearch(options: GraphSearchOptions): GraphSearchResponse {
+    const { conditions, params } = this.buildFindConditions(options);
+    const words = (options.query || '')
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .split(/[\s_\-.:/]+/)
+      .filter((t: string) => t.length > 1);
+
+    if (words.length === 0) {
+      return { results: [], total: 0, hasMore: false };
+    }
+
+    const likeConds = words.map(() => '(n.name LIKE ? OR n.qualified_name LIKE ?)');
+    const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
+    const allConds = [...conditions, ...likeConds.map(c => `(${c})`)];
+    const allParams = [...params, ...likeParams];
+    const whereSQL = allConds.length > 0 ? allConds.join(' AND ') : '1=1';
+    const limit = options.limit ?? 200;
+    const offset = options.offset ?? 0;
+    const rdb = this.readDB;
+
+    const rows = rdb.prepare(
+      `SELECT n.*, 0.5 AS score FROM nodes n WHERE ${whereSQL} ORDER BY n.name LIMIT ? OFFSET ?`
+    ).all(...allParams, limit, offset) as Array<Record<string, unknown>>;
+    const countRow = rdb.prepare(
+      `SELECT COUNT(*) as total FROM nodes n WHERE ${whereSQL}`
+    ).get(...allParams) as { total: number };
+
+    return this.buildNodeResults(rows, countRow, options, offset);
   }
 
   private buildFindConditions(options: GraphSearchOptions): { conditions: string[]; params: unknown[] } {
