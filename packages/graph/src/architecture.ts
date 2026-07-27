@@ -40,18 +40,18 @@ export class ArchitectureAnalyzer {
         // Count node types
         const nodeTypes: Record<string, number> = {};
         for (const node of nodes) {
-            nodeTypes[node.label] = (nodeTypes[node.label] || 0) + 1;
+            nodeTypes[node.kind] = (nodeTypes[node.kind] || 0) + 1;
         }
 
         // Count edge types (single pass)
         const schema = this.store.getSchema();
         const edgeTypes: Record<string, number> = {};
-        for (const etype of schema.edgeTypes) {
+        for (const etype of schema.edgeKinds) {
             edgeTypes[etype] = 0;
         }
         const allEdges = this.store.findEdges(project);
         for (const edge of allEdges) {
-            edgeTypes[edge.type] = (edgeTypes[edge.type] || 0) + 1;
+            edgeTypes[edge.kind] = (edgeTypes[edge.kind] || 0) + 1;
         }
 
         // Find entry points: high out-degree, low in-degree nodes
@@ -81,7 +81,7 @@ export class ArchitectureAnalyzer {
         const candidates: Array<{ node: GraphNode; score: number }> = [];
 
         // Filter to Function/Method nodes first
-        const funcNodes = nodes.filter(n => n.label === 'Function' || n.label === 'Method');
+        const funcNodes = nodes.filter(n => n.kind === 'function' || n.kind === 'method');
 
         // Batch-load degrees for all candidate nodes to avoid N+1 queries
         const degreeMap = this.store.getNodeDegreesBatch(funcNodes.map(n => n.id));

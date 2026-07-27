@@ -306,6 +306,7 @@ export class ToolHandlers {
         // 2. Graph indexing — always attempt, even if vector indicates "already indexed"
         if (this.graphToolHandlers) {
             const project = getRepoIdentity(absolutePath);
+            this.graphToolHandlers.setProject(absolutePath);
             const stats = this.graphToolHandlers.getStore().getProjectStats(project);
             const alreadyGraphIndexed = stats.nodes > 0;
 
@@ -1152,7 +1153,7 @@ export class ToolHandlers {
                 }
 
                 // Routes summary
-                const routeResult = store.findNodes({ project, label: 'Route', limit: 100 });
+                const routeResult = store.findNodes({ project, kind: 'route', limit: 100 });
                 if (routeResult.total > 0) {
                     lines.push(`  Routes: ${routeResult.total}`);
                     for (const r of routeResult.results.slice(0, 5)) {
@@ -1449,9 +1450,9 @@ export class ToolHandlers {
                 });
             }
             for (const r of nodeResult.results) {
-                const label = r.node.label;
+                const kind = r.node.kind;
                 // Drop noise: interfaces, types, variables — only keep callable symbols
-                if (label !== 'Function' && label !== 'Method' && label !== 'Class') continue;
+                if (kind !== 'function' && kind !== 'method' && kind !== 'class') continue;
                 // Drop unused symbols entirely
                 const nodeId = r.node.id;
                 // Quick check: if the symbol name contains any query keyword, or if
@@ -1469,7 +1470,7 @@ export class ToolHandlers {
 
         // Batch edges
         const nodeIdsArr = fileNodes.map(f => f.node.id);
-        const allCallerEdges = store.getEdgesByTargetBatch(nodeIdsArr, 'CALLS');
+        const allCallerEdges = store.getEdgesByTargetBatch(nodeIdsArr, 'calls');
         const allCalleeEdges = store.getEdgesBySourceBatch(nodeIdsArr);
 
         for (const { node } of fileNodes) {

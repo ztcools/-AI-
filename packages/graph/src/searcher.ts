@@ -142,8 +142,8 @@ export class GraphSearcher {
         } = { node, source };
 
         if (includeNeighbors) {
-            const callerEdges = this.store.getEdgesByTarget(node.id, 'CALLS');
-            const calleeEdges = this.store.getEdgesBySource(node.id, 'CALLS');
+            const callerEdges = this.store.getEdgesByTarget(node.id, 'calls');
+            const calleeEdges = this.store.getEdgesBySource(node.id, 'calls');
 
             result.callers = callerEdges.map(e => {
                 const n = this.store.getNodeById(e.sourceId);
@@ -213,7 +213,7 @@ export class GraphSearcher {
                     node: {
                         id: -1,
                         project,
-                        label: 'File',
+                        kind: 'file', label: 'file',
                         name: match.filePath.split('/').pop() || match.filePath,
                         qualifiedName: match.filePath,
                         filePath: match.filePath,

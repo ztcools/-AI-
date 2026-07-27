@@ -41,7 +41,7 @@ export interface RegistryEntry {
     label: GraphNodeLabel;
 }
 
-export interface ResolutionResult {
+export interface RegistryResolutionResult {
     qualifiedName: string;
     strategy: string;
     confidence: number;
@@ -143,7 +143,7 @@ function candidateCountPenalty(base: number, count: number): number {
 }
 
 /** Empty resolution result. */
-function emptyResult(): ResolutionResult {
+function emptyResult(): RegistryResolutionResult {
     return { qualifiedName: '', strategy: '', confidence: 0, candidateCount: 0 };
 }
 
@@ -216,7 +216,7 @@ export class FunctionRegistry {
         moduleQN: string,
         importMapKeys: string[] = [],
         importMapVals: string[] = [],
-    ): ResolutionResult {
+    ): RegistryResolutionResult {
         // Split callee at the first path separator: "pkg.Func" → prefix="pkg", suffix="Func"
         // Rust/C++ use "::" rather than ".", honor whichever appears first
         let prefix = calleeName;
@@ -263,7 +263,7 @@ export class FunctionRegistry {
         suffix: string,
         keys: string[],
         vals: string[],
-    ): ResolutionResult {
+    ): RegistryResolutionResult {
         if (!keys.length || !vals.length) return emptyResult();
 
         // Find prefix in import map keys
@@ -320,7 +320,7 @@ export class FunctionRegistry {
         calleeName: string,
         suffix: string,
         moduleQN: string,
-    ): ResolutionResult {
+    ): RegistryResolutionResult {
         const candidate = `${moduleQN}.${calleeName}`;
         if (this.exact.has(candidate)) {
             return {
@@ -375,7 +375,7 @@ export class FunctionRegistry {
         calleeName: string,
         moduleQN: string,
         importVals: string[],
-    ): ResolutionResult {
+    ): RegistryResolutionResult {
         const lookup = simpleName(calleeName);
         const arr = this.byName.get(lookup);
         if (!arr || arr.length === 0) return emptyResult();
@@ -419,7 +419,7 @@ export class FunctionRegistry {
         arr: string[],
         moduleQN: string,
         importVals: string[],
-    ): ResolutionResult {
+    ): RegistryResolutionResult {
         if (importVals.length > 0) {
             // Filter by import reachability
             const filtered = arr.filter((qn) => isImportReachable(qn, importVals));

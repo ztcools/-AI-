@@ -17,7 +17,9 @@
 import {
     GraphNode,
     GraphEdge,
+    GraphNodeKind,
     GraphNodeLabel,
+    GraphEdgeKind,
     GraphEdgeType,
     GraphSearchResult,
 } from './types';
@@ -135,13 +137,15 @@ export class InMemoryGraphBuffer {
         }
 
         const id = this.nextId++;
+        const kind = this.intern(label) as GraphNodeKind;
         const node: GraphNode = {
             id,
             // Only intern highly-repetitive fields. name/qualifiedName are
             // effectively unique per node, so interning them just bloats the
             // intern pool with one entry each and saves nothing.
             project: this.intern(this.project),
-            label: this.intern(label) as GraphNodeLabel,
+            kind,
+            label: kind,
             name,
             qualifiedName,
             filePath: this.intern(filePath),
@@ -312,6 +316,7 @@ export class InMemoryGraphBuffer {
         }
 
         const id = this.nextId++;
+        const kind = this.intern(type) as GraphEdgeKind;
         const edge: GraphEdge = {
             id,
             project: this.intern(this.project),
@@ -319,7 +324,8 @@ export class InMemoryGraphBuffer {
             targetId,
             // Edge types come from a tiny fixed set — interning collapses them
             // to a single shared string across all edges.
-            type: this.intern(type) as GraphEdgeType,
+            kind,
+            type: kind,
             properties,
         };
 
@@ -440,7 +446,8 @@ export class InMemoryGraphBuffer {
             for (const [, node] of this.nodeByQN) {
                 const realId = store.upsertNode({
                     project: node.project,
-                    label: node.label,
+                    kind: node.kind,
+                    label: node.kind,
                     name: node.name,
                     qualifiedName: node.qualifiedName,
                     filePath: node.filePath,
@@ -464,7 +471,8 @@ export class InMemoryGraphBuffer {
                     project: edge.project,
                     sourceId: realSourceId,
                     targetId: realTargetId,
-                    type: edge.type,
+                    kind: edge.kind,
+                    type: edge.kind,
                     properties: edge.properties,
                 });
                 edgeCount++;

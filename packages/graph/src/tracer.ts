@@ -2,7 +2,7 @@
  * Call chain tracer. Traces call paths through the knowledge graph
  * using BFS/DFS traversal on CALLS edges.
  */
-import { GraphStore, GraphNode, GraphEdge, GraphEdgeType, TraceOptions, TraceResult, TraceNode } from './types';
+import { GraphStore, GraphNode, GraphEdge, GraphEdgeKind, GraphEdgeType, TraceOptions, TraceResult, TraceNode } from './types';
 
 export class CallTracer {
     private store: GraphStore;
@@ -82,10 +82,10 @@ export class CallTracer {
         interface QueueItem {
             nodeId: number;
             depth: number;
-            edgeType: GraphEdgeType;
+            edgeKind: GraphEdgeKind;
         }
 
-        const queue: QueueItem[] = [{ nodeId: startNode.id, depth: 0, edgeType: 'CALLS' }];
+        const queue: QueueItem[] = [{ nodeId: startNode.id, depth: 0, edgeKind: 'calls' }];
         let head = 0;
         visited.add(startNode.id);
 
@@ -98,7 +98,7 @@ export class CallTracer {
                 : this.store.getEdgesByTarget(current.nodeId);
 
             for (const edge of edges) {
-                if (!edgeTypes.includes(edge.type)) continue;
+                if (!edgeTypes.includes(edge.kind)) continue;
 
                 const neighborId = direction === 'outbound' ? edge.targetId : edge.sourceId;
                 if (visited.has(neighborId)) continue;
@@ -113,14 +113,14 @@ export class CallTracer {
                 results.push({
                     node: neighbor,
                     depth: current.depth + 1,
-                    edgeType: edge.type,
+                    edgeKind: edge.kind,
                     isTest,
                 });
 
                 queue.push({
                     nodeId: neighborId,
                     depth: current.depth + 1,
-                    edgeType: edge.type,
+                    edgeKind: edge.kind,
                 });
             }
         }
@@ -129,13 +129,13 @@ export class CallTracer {
     private getEdgeTypesForMode(mode: string): GraphEdgeType[] {
         switch (mode) {
             case 'calls':
-                return ['CALLS'];
+                return ['calls'];
             case 'data_flow':
-                return ['CALLS', 'DATA_FLOWS'];
+                return ['calls', 'DATA_FLOWS'];
             case 'cross_service':
-                return ['CALLS', 'HTTP_CALLS', 'ASYNC_CALLS', 'CROSS_HTTP_CALLS', 'CROSS_ASYNC_CALLS', 'CROSS_CHANNEL'];
+                return ['calls', 'http_calls', 'async_calls', 'cross_http_calls', 'cross_async_calls', 'cross_channel'];
             default:
-                return ['CALLS'];
+                return ['calls'];
         }
     }
 }
