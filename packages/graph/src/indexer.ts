@@ -33,14 +33,33 @@ import { ReferenceResolver } from './resolution/index';
 
 const DEFAULT_PARSE_WORKERS = Math.max(1, os.availableParallelism() - 2);
 
-/** Directory names excluded from file scanning. */
+/** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
-  '.venv', 'vendor', 'target', 'coverage', '.nyc_output', '.cache',
+  '.venv', 'venv', 'vendor', 'target', 'coverage', '.nyc_output', '.cache',
   '.idea', '.vscode', '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp',
   '.tox', '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
   '.svn', '.hg', 'bower_components', '.terraform', '.parcel-cache',
   '.context',  // our own data dir
+  // Python
+  '.pixi', '.pdm-build', '.ruff_cache', '.nox', '.hypothesis', '.eggs',
+  // JVM
+  '.gradle', '.mvn', '.kotlin', 'classes', '.bloop', '.metals',
+  // C/C++ / Rust
+  'CMakeFiles', '_build', 'third_party', 'external', '_deps',
+  '.conan',
+  // .NET
+  'packages', '.vs',
+  // JS/TS bundler artifacts
+  '.parcel-cache', '.svelte-kit', '.vinxi', '.nitro', 'out-tsc', '.vercel', '.netlify',
+  // iOS/Swift
+  'Pods', 'Carthage', 'DerivedData', '.swiftpm',
+  // Dart/Flutter
+  '.dart_tool', '.pub-cache',
+  // Lua
+  'lua_modules', '.luarocks',
+  // Delphi
+  '__history', '__recovery',
 ]);
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -419,6 +438,15 @@ export class GraphIndexer {
 
   // ── File scanning ────────────────────────────────────────────────
 
+  /** Check whether a relative path (from git ls-files) lives under an ignored directory. */
+  private isIgnoredPath(relPath: string): boolean {
+    const parts = relPath.replace(/\\/g, '/').split('/');
+    for (const part of parts) {
+      if (IGNORE_DIRS.has(part)) return true;
+    }
+    return false;
+  }
+
   private scanFiles(dir: string): FileToIndex[] {
     const results: FileToIndex[] = [];
     const exts = new Set([
@@ -441,6 +469,8 @@ export class GraphIndexer {
         { encoding: 'utf-8', timeout: 10000, maxBuffer: 10 * 1024 * 1024 },
       );
       for (const line of output.trim().split('\n').filter(Boolean)) {
+        // Skip paths under ignored directories
+        if (this.isIgnoredPath(line)) continue;
         const ext = path.extname(line);
         if (!exts.has(ext)) continue;
         const abs = path.join(dir, line);

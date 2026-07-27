@@ -513,6 +513,45 @@ export class SqliteGraphStore implements GraphStore {
         }
       }
 
+      // Third pass (last resort): prefix matching for words that were too
+      // long to match anything. "passwords" → %pass% → matches "hashPassword".
+      // Only runs when the first LIKE pass returned nothing and we have words > 4 chars.
+      if (allRows.length === 0 && words.filter(w => w.length > 4).length > 0) {
+        const longWords = words.filter(w => w.length > 4);
+        const shortWords = words.filter(w => w.length <= 4);
+        // For long words, use min-4-char prefix
+        const prefixParams: string[] = [];
+        const prefixConds: string[] = [];
+        for (const w of longWords) {
+          const prefix = w.slice(0, Math.max(4, Math.floor(w.length * 0.6)));
+          prefixConds.push('(n.name LIKE ? OR n.qualified_name LIKE ?)');
+          prefixParams.push(`%${prefix}%`, `%${prefix}%`);
+        }
+        // For short words, keep exact match
+        for (const w of shortWords) {
+          prefixConds.push('(n.name LIKE ? OR n.qualified_name LIKE ?)');
+          prefixParams.push(`%${w}%`, `%${w}%`);
+        }
+        const { conditions: baseConds3, params: baseParams3 } = this.buildFindConditions(options);
+        // OR between prefix groups, NOT AND — "how" should not block "passwords" match
+        const prefixOrCond = prefixConds.map(c => `(${c})`).join(' OR ');
+        const allConds3 = [...baseConds3, `(${prefixOrCond})`,
+          `(n.kind IN ('function','method','class'))`];
+        const allP3 = [...baseParams3, ...prefixParams];
+        const whereSQL3 = allConds3.join(' AND ');
+        try {
+          const prefixRows = rdb.prepare(
+            `SELECT n.*, 0.05 AS score FROM nodes n WHERE ${whereSQL3} ORDER BY n.name LIMIT ?`
+          ).all(...allP3, limit * 2) as Array<Record<string, unknown>>;
+          for (const row of prefixRows) {
+            if (!seenIds.has(row.id as number)) {
+              seenIds.add(row.id as number);
+              allRows.push(row);
+            }
+          }
+        } catch { /* skip */ }
+      }
+
       // Apply offset/limit after merging, excluding noise kinds
       const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
       const filtered = allRows.filter(row =>

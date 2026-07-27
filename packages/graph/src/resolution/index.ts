@@ -252,6 +252,8 @@ export class ReferenceResolver {
   private knownNames: Set<string> | null = null;
   /** Suffix-clean names: "Calc.multiply" → we add "multiply" for O(1) intra-class call check. */
   private knownSuffixNames: Set<string> | null = null;
+  /** Multi-segment suffixes for dotted refs: "os.path.join" → "path.join". */
+  private knownDottedSuffixes: Set<string> | null = null;
 
   // Tracking for batch operations
   private nodeCache: Map<number, GraphNode> = new Map();
@@ -291,9 +293,18 @@ export class ReferenceResolver {
   private _buildSuffixIndex(): void {
     if (!this.knownNames) return;
     this.knownSuffixNames = new Set();
+    this.knownDottedSuffixes = new Set();
     for (const name of this.knownNames) {
+      // "OrderService.createOrder" → suffixName: "createOrder"
       const dotIdx = name.lastIndexOf('.');
-      if (dotIdx > 0) this.knownSuffixNames.add(name.slice(dotIdx + 1));
+      if (dotIdx > 0) {
+        this.knownSuffixNames.add(name.slice(dotIdx + 1));
+        // Also add trailing multi-segment: "OrderService.createOrder" → "OrderService.createOrder"
+        // but we need the 2-segment tail: "Foo.bar" in "a.b.c.Foo.bar" → "Foo.bar"
+        let prevDot = name.lastIndexOf('.', dotIdx - 1);
+        if (prevDot < 0) prevDot = -1;
+        this.knownDottedSuffixes.add(name.slice(prevDot + 1));
+      }
     }
   }
 
@@ -320,6 +331,7 @@ export class ReferenceResolver {
     this.nodeCache.clear();
     this.knownNames = null;
     this.knownSuffixNames = null;
+    this.knownDottedSuffixes = null;
   }
 
   // ── Resolution ───────────────────────────────────────────────────────
@@ -381,14 +393,10 @@ export class ReferenceResolver {
             const baseName = refName.slice(0, dotIndex);
             const memberName = refName.slice(dotIndex + 1);
             if (!this.knownNames.has(baseName) && !this.knownNames.has(memberName)) {
-              // Check suffix: ClassName.methodName → methodName
-              let suffixFound = false;
-              for (const kn of this.knownNames) {
-                if (kn.endsWith('.' + refName) || kn.endsWith('.' + baseName)) {
-                  suffixFound = true; break;
-                }
-              }
-              if (!suffixFound) {
+              // O(1) suffix/dotted check
+              if (!this.knownSuffixNames?.has(refName) &&
+                  !this.knownSuffixNames?.has(baseName) &&
+                  !this.knownDottedSuffixes?.has(refName)) {
                 unresolved.push(ref);
                 incrementStat(byMethod, 'pre-filter');
                 continue;
