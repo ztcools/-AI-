@@ -128,7 +128,23 @@ export class GraphToolHandlers {
         options.files = specificFiles;
       }
 
-      const result = await indexer.indexAll(options);
+      // 增量（带 files 或 mode=incremental）走 sync()：它内部做真增量 —
+      // 只重索引变更文件、删除已删文件的节点。修复此前 options.files 被
+      // 传入却仍跑全量（大仓库上"增量"其实是全量，巨慢且每次 search 重复触发）。
+      const isIncremental = (specificFiles && specificFiles.length > 0) || mode === 'incremental';
+      const result = isIncremental
+        ? await (async () => {
+            const r = await indexer.sync(options);
+            return {
+              success: true,
+              nodesCreated: r.nodesUpdated,
+              edgesCreated: 0,
+              filesIndexed: r.filesAdded,
+              durationMs: r.durationMs,
+              errors: [] as string[],
+            };
+          })()
+        : await indexer.indexAll(options);
       this.indexingProgress.delete(project);
 
       if (result.success) {
@@ -405,19 +421,37 @@ export class GraphToolHandlers {
         }
       }
 
-      let diffOutput: string;
+      // 工作区实时性：未提交的改动（未暂存 + 已暂存 + 未跟踪）是图索引必须
+      // 实时反映的 —— 用户改完代码（未必 commit）search 就应看到新符号。
+      let worktreeFiles: string[] = [];
       try {
-        diffOutput = execSync(`git diff --name-only ${diffBranch}...HEAD`, {
-          cwd: repoPath, encoding: 'utf-8', timeout: 10000,
-        });
-      } catch {
-        diffOutput = execSync('git diff --name-only HEAD', {
-          cwd: repoPath, encoding: 'utf-8', timeout: 10000,
-        });
-        diffBranch = 'HEAD';
+        const unstaged = execSync('git diff --name-only', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
+        const staged = execSync('git diff --name-only --cached', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
+        const untracked = execSync('git ls-files --others --exclude-standard', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
+        worktreeFiles = (unstaged + '\n' + staged + '\n' + untracked).trim().split('\n').filter(Boolean);
+      } catch { /* non-git or read error */ }
+
+      // 未提交改动优先返回：这是"图实时性"的核心，与分支分叉检测解耦，
+      // 避免 `git diff main...HEAD` 在浅克隆/单提交仓库报错把工作区改动也吞掉。
+      if (worktreeFiles.length > 0) {
+        return { changedFiles: Array.from(new Set(worktreeFiles)), diffBranch: 'worktree' };
       }
 
-      const changedFiles = diffOutput.trim().split('\n').filter(Boolean);
+      let branchFiles: string[] = [];
+      try {
+        branchFiles = execSync(`git diff --name-only ${diffBranch}...HEAD`, {
+          cwd: repoPath, encoding: 'utf-8', timeout: 10000,
+        }).trim().split('\n').filter(Boolean);
+      } catch {
+        try {
+          branchFiles = execSync('git diff --name-only HEAD', {
+            cwd: repoPath, encoding: 'utf-8', timeout: 10000,
+          }).trim().split('\n').filter(Boolean);
+          diffBranch = 'HEAD';
+        } catch { /* ignore */ }
+      }
+
+      const changedFiles = Array.from(new Set(branchFiles));
       return { changedFiles, diffBranch };
     } catch {
       return null;

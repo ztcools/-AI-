@@ -11,6 +11,7 @@ import {
 } from "@seeway/claude-context-core";
 import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
 import type { GraphToolHandlers } from "./graph-handlers.js";
+import { INDEXER_VERSION } from "@seeway/claude-context-graph";
 import { linkState, LinkInfo } from "./link-state.js";
 
 /**
@@ -32,6 +33,7 @@ export class ToolHandlers {
      * 此集合防止每次 search 都重复触发。
      */
     private autoGraphBuildTriggered: Set<string> = new Set();
+    private lastGraphSyncCheck: Map<string, number> = new Map();
     /**
      * 架构摘要已输出的项目集合（每会话每项目只输出一次，避免 token 浪费）。
      */
@@ -360,6 +362,12 @@ export class ToolHandlers {
             // 已链接 → 触发图自动构建（若图为空）
             if (link) {
                 this.maybeAutoBuildGraphIndex(absolutePath);
+            }
+
+            // 图索引实时性：图非空时做 Merkle 变更检测，文件变了立即后台增量重建，
+            // 使后续 search 能看到当前工作区代码（向量按设计不实时，仅保护分支每日更新）。
+            if (this.graphToolHandlers) {
+                this.maybeIncrementalGraphSync(absolutePath);
             }
 
             // 图状态
@@ -723,17 +731,67 @@ export class ToolHandlers {
     }
 
     /** 图是否由旧版索引器构建（需重建）。无版本戳或版本落后即视为过时。 */
-    private isGraphOutdated(codebasePath: string): boolean {
+    private isGraphOutdated(_codebasePath: string): boolean {
         try {
-            const { GraphIndexer } = require('@seeway/claude-context-graph');
-            const project = getRepoIdentity(codebasePath);
-            const ix = new GraphIndexer(codebasePath, project);
-            const outdated = ix.isOutdated();
-            ix.close();
-            return outdated;
+            // 复用 getStore() 的现有 SQLite 连接（不为每次检查新开连接）。
+            // 注意：mcp 是 ESM，不能用 require() —— 之前 require 写法在 ESM 下
+            // 抛 ReferenceError 被 catch 吞掉，导致版本检测永远返回 false。
+            return this.graphToolHandlers!.getStore().getGraphVersion() < INDEXER_VERSION;
         } catch {
             return false;
         }
+    }
+
+    /**
+     * 图索引实时性保障：Merkle 变更检测（~每 8s 每项目至多一次），发现文件变更
+     * 即后台增量重建图。向量索引按设计不实时（仅保护分支每日全量/增量），
+     * 但图必须反映当前工作区代码 —— 用户改完代码后 search 应立即能看到新符号。
+     * 由 CLAUDE_CONTEXT_GRAPH_REALTIME 控制（默认 true）。
+     */
+    private maybeIncrementalGraphSync(codebasePath: string): void {
+        if ((process.env.CLAUDE_CONTEXT_GRAPH_REALTIME || 'true') === 'false') return;
+        if (!this.graphToolHandlers) return;
+
+        let project: string;
+        try {
+            project = getRepoIdentity(codebasePath);
+        } catch {
+            return;
+        }
+
+        // 节流：每项目 8s 内至多检测一次，避免高频 search 触发重复 Merkle 扫描。
+        const now = Date.now();
+        const last = this.lastGraphSyncCheck.get(project) || 0;
+        if (now - last < 8000) return;
+        this.lastGraphSyncCheck.set(project, now);
+
+        // 图已在构建/增量中则跳过。
+        if (this.graphToolHandlers.getIndexingProgress(project)) return;
+
+        let stats: { nodes: number };
+        try {
+            this.graphToolHandlers.setProject(codebasePath);
+            stats = this.graphToolHandlers.getStore().getProjectStats(project);
+        } catch {
+            return;
+        }
+        if (stats.nodes === 0) return;   // 空图由 maybeAutoBuildGraphIndex 全量处理
+
+        setImmediate(async () => {
+            try {
+                const det = this.graphToolHandlers!.detectChangedFiles({ project });
+                if (!det || det.changedFiles.length === 0) return;
+                console.log(`[GRAPH-SYNC] ${det.changedFiles.length} file(s) changed for '${project}', incremental re-index`);
+                await this.graphToolHandlers!.handleIndexRepository({
+                    repo_path: codebasePath,
+                    mode: 'incremental',
+                    files: det.changedFiles,
+                });
+                console.log(`[GRAPH-SYNC] Incremental re-index complete for '${project}'`);
+            } catch (e: any) {
+                console.warn(`[GRAPH-SYNC] Incremental re-index failed for '${project}': ${e?.message || e}`);
+            }
+        });
     }
 
     private enrichWithGraphContextDeep(

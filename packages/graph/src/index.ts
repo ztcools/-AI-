@@ -21,7 +21,7 @@ export * from './utils';
 // v2 new modules
 export { GraphTraverser, CallTracer } from './traversal';
 export { GraphQueryManager } from './queries';
-export { GraphIndexer } from './indexer';
+export { GraphIndexer, INDEXER_VERSION } from './indexer';
 export type { GraphIndexerOptions } from './indexer';
 
 // Multi-threading infrastructure (v2)

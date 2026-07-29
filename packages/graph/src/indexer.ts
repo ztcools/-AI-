@@ -607,11 +607,17 @@ export class GraphIndexer {
   }
 
   private detectChangedFiles(): string[] {
+    // 工作区实时性：未提交（未暂存+已暂存）与未跟踪的新文件都要纳入，
+    // 否则用户改了代码未 commit 时图无法实时反映。排除自身数据目录 .context。
+    const isOurs = (f: string) => /^\.context\//.test(f.replace(/\\/g, '/'));
     try {
-      const output = execSync('git diff --name-only HEAD', {
+      const tracked = execSync('git diff --name-only HEAD', {
         cwd: this.projectDir, encoding: 'utf-8', timeout: 10000,
       }).trim();
-      return output.split('\n').filter(Boolean);
+      const untracked = execSync('git ls-files --others --exclude-standard', {
+        cwd: this.projectDir, encoding: 'utf-8', timeout: 10000,
+      }).trim();
+      return (tracked + '\n' + untracked).split('\n').map(s => s.trim()).filter(f => f && !isOurs(f));
     } catch {
       return [];
     }
