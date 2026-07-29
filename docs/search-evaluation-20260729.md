@@ -167,3 +167,25 @@ search 返回 "not linked... run link first"。**图引擎本可离线工作**�
 
 **后续建议**：在 1 个大库（trpc）+ 1 个业务项目（Lune）上复测，验证"大库 search 占优"的假设，
 并接入精确 token 计量（tiktoken）。
+
+---
+
+## 九、价值最大化轮（2026-07-29 第二轮，已落地）
+
+针对"search 不是每次都该触发 / 价值最大化 / 降噪提精度"，本轮改动：
+
+| 优化 | 实现 | 实测效果 |
+|------|------|---------|
+| **触发规则** | search_description 重写 + 输出头 `[repo: N files, small/medium/large]` | agent 能判断：小库 grep/read、大库/关系问题 search |
+| **大小库界定** | <300 小库(grep 更省) / 300–2000 中库 / >2000 大库(search 占优) | 写入描述与输出头，可操作 |
+| **测试文件降权** | `penalizeTestResults`（向量侧，SEARCH_TEST_PENALTY=0.55） | requests-flow top10 测试文件 ↓，生产实现升 |
+| **docs/tests 开关** | `docs:true`/`tests:true` 单次关闭对应降权 | 文档/测试类查询不被误伤 |
+| **graph 模式调用链** | graph-only 也产出 Call Graph | 关系问题 ~200t 拿核心链路（王牌场景） |
+
+**成本控制**（实测 token）：graph ~200 / compact ~341 / limit=5 ~2832 / both(10块) ~4416。
+**最终验证**：8 场景 docs 5→0、命中 17/19、avg token 5100→4416（-13%）、图实时性 ✓。
+
+**核心价值定位（回答"search 是否摆件"）**：
+- search **唯一**能答 grep 答不了的：谁调用它、调用链、影响面、死代码、入口。
+- 在**大库/陌生库**定位上，search 一次定位 vs grep 大海捞针。
+- 在**小库/已知符号**上，search 是**浪费**（已用触发规则 + 规模提示明确告知 agent）。
