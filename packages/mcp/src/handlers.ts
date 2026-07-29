@@ -748,33 +748,58 @@ export class ToolHandlers {
         const seenSymbols = new Set<string>();
 
         const queryWords = query.toLowerCase().split(/[\s_\-.,:;!?/\\()\[\]{}]+/).filter((w: string) => w.length > 1);
+        // 测试文件降权/排除（富化阶段）：tests/、test_*.py、*_test.go 等
+        const isTestPath = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
+        // 相关性：词边界匹配（含驼峰/下划线切分），避免裸子串把 `get` 误判命中 `__getitem__`。
+        const nameTokens = (name: string): string[] =>
+            name.toLowerCase().split(/[^a-z0-9]+|(?<=[a-z0-9])(?=[A-Z])/).filter(Boolean);
+        const relevant = (name: string): boolean => {
+            if (queryWords.length === 0) return true;
+            const toks = new Set(nameTokens(name));
+            return queryWords.some(w => toks.has(w));
+        };
+
+        const allNodeIds = new Set<number>();
+        const fileNodes: Array<{ node: any; filePath: string }> = [];
+        const seenNodeIds = new Set<number>();
+
+        // ① 主源：图符号命中（findNodes）——调用链应围绕"用户实际找的符号"展开，
+        //    而不是只围绕向量 top5 文件。这正是此前 send/get_adapter 被富化丢弃的根因。
+        const graphHitNodes: any[] = [];
+        try {
+            const gr = store.findNodes({ project, query, limit: 12 });
+            for (const r of gr.results) {
+                const n = r.node;
+                if (n.kind !== 'function' && n.kind !== 'method' && n.kind !== 'class') continue;
+                if (isTestPath(n.filePath)) continue;
+                graphHitNodes.push(n);
+                if (!seenNodeIds.has(n.id)) {
+                    seenNodeIds.add(n.id);
+                    fileNodes.push({ node: n, filePath: n.filePath });
+                    allNodeIds.add(n.id);
+                }
+            }
+        } catch { /* graph symbols optional */ }
+
+        // ② 辅源：向量命中文件里的相关符号（补充图符号未覆盖、但向量认为相关的文件）。
         const maxFiles = 5;
         const perFileLimit = 12;
-
         const seenFiles = new Set<string>();
         for (const result of searchResults.slice(0, maxFiles)) {
             seenFiles.add(result.relativePath);
         }
-
-        const allNodeIds = new Set<number>();
-        const fileNodes: Array<{ node: any; filePath: string }> = [];
-
         for (const filePath of seenFiles) {
             const normalizedPath = filePath.replace(/^\/+/, '');
-            const nodeResult = store.findNodes({
-                project,
-                exactFilePath: normalizedPath,
-                limit: perFileLimit,
-            });
+            if (isTestPath(normalizedPath)) continue;
+            const nodeResult = store.findNodes({ project, exactFilePath: normalizedPath, limit: perFileLimit });
             for (const r of nodeResult.results) {
                 const kind = r.node.kind;
                 if (kind !== 'function' && kind !== 'method' && kind !== 'class') continue;
-                const nameLower = r.node.name.toLowerCase();
-                const relevant = queryWords.length === 0 || queryWords.some((w: string) => nameLower.includes(w));
-                if (relevant) {
-                    fileNodes.push({ node: r.node, filePath: normalizedPath });
-                    allNodeIds.add(r.node.id);
-                }
+                if (!relevant(r.node.name)) continue;
+                if (seenNodeIds.has(r.node.id)) continue;
+                seenNodeIds.add(r.node.id);
+                fileNodes.push({ node: r.node, filePath: normalizedPath });
+                allNodeIds.add(r.node.id);
             }
         }
 
@@ -804,19 +829,31 @@ export class ToolHandlers {
 
             if (callerEdges.length === 0 && calleeEdges.length === 0) continue;
 
-            const callerNames = callerEdges.slice(0, 3).map((e) => {
-                const caller = nodeMap.get(e.sourceId);
-                return caller ? `\`${caller.name}\`` : '?';
-            });
-            const calleeNames = calleeEdges.slice(0, 3).map((e) => {
-                const callee = nodeMap.get(e.targetId);
-                return callee ? `\`${callee.name}\`` : '?';
-            });
+            // 去噪：自指调用（`app ← app`）、同名互调、测试文件调用者；并按名去重。
+            const isTestP = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
+            const pick = (edges: any[], getId: (e: any) => number, isCaller: boolean): string[] => {
+                const seen = new Set<string>();
+                const out: string[] = [];
+                for (const e of edges) {
+                    const c = nodeMap.get(getId(e));
+                    if (!c || c.id === node.id || c.name === node.name) continue;
+                    if (isCaller && isTestP(c.filePath)) continue;   // 测试调用者噪声大，隐藏
+                    if (seen.has(c.name)) continue;
+                    seen.add(c.name);
+                    out.push(`\`${c.name}\``);
+                    if (out.length >= 3) break;
+                }
+                return out;
+            };
+            const callerFiltered = pick(callerEdges, (e) => e.sourceId, true);
+            const calleeFiltered = pick(calleeEdges, (e) => e.targetId, false);
 
+            // 签名折叠为单行（多行签名会把调用链撑成几十行）。
+            const sig = node.signature ? String(node.signature).replace(/\s+/g, ' ').trim() : '';
             let line = `\`${node.name}\``;
-            if (node.signature) line += node.signature;
-            if (callerNames.length > 0) line += ` ← ${callerNames.join(', ')}`;
-            if (calleeNames.length > 0) line += ` → ${calleeNames.join(', ')}`;
+            if (sig) line += sig;
+            if (callerFiltered.length > 0) line += ` ← ${callerFiltered.join(', ')}`;
+            if (calleeFiltered.length > 0) line += ` → ${calleeFiltered.join(', ')}`;
             line += `  (${node.filePath}:${node.startLine})`;
             directRelations.push(line);
         }

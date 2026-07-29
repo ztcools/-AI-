@@ -2372,9 +2372,34 @@ export class Context {
         all.sort((a, b) => b.score - a.score);
         const deduped = this.deduplicateResults(all);
         deduped.sort((a, b) => b.score - a.score);
-        const filtered = this.applyScoreCutoff(deduped, threshold);
-        const finalResults = filtered.slice(0, topK);
+        // 文档降权：自然语言查询时 .md/.rst 等文档散文与查询语义更接近，
+        // 容易把真正的代码实现压出 topK（实测 requests-flow top5 全是 docs）。
+        const codeWeighted = this.penalizeDocResults(deduped);
+        const filtered = this.applyScoreCutoff(codeWeighted, threshold);
+        const contentDeduped = this.dedupNearDuplicateContent(filtered);
+        const finalResults = this.applyFileDiversity(contentDeduped, topK);
         console.log(`[Context] ✅ Dev-aware search: ${all.length} raw → ${finalResults.length} results`);
         return finalResults;
+    }
+
+    /**
+     * Down-rank prose/documentation files so natural-language queries surface
+     * code over docs. Docs often embed nearer to an NL query than the code that
+     * actually implements it, crowding the implementation out of topK.
+     * Controlled by SEARCH_DOC_PENALTY (0 disables; default 0.5 = docs keep half score).
+     */
+    private penalizeDocResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        const penalty = parseFloat(envManager.get('SEARCH_DOC_PENALTY') || '0.5');
+        if (penalty <= 0 || penalty >= 1) return results;
+        const isDoc = (r: SemanticSearchResult): boolean => {
+            const lang = (r.language || '').toLowerCase();
+            if (['markdown', 'text', 'rst', 'asciidoc', 'adoc', 'tex', 'org'].includes(lang)) return true;
+            return /\.(md|markdown|rst|adoc|asciidoc|txt|tex|org)$/i.test(r.relativePath);
+        };
+        const weighted = results.map(r =>
+            isDoc(r) ? { ...r, score: r.score * penalty } : r,
+        );
+        weighted.sort((a, b) => b.score - a.score);
+        return weighted;
     }
 }

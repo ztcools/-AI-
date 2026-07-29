@@ -86,16 +86,19 @@ Unbind this repo from its cloud vector index. Local graph is kept; re-run link t
 `;
 
         const search_description = `
-Semantic + call-graph search over the linked codebase. Returns file:line + code snippet + who-calls-it, using ~70% fewer tokens than reading files blindly. Use it to LOCATE code and map relationships BEFORE Read/grep.
+Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. Use it to LOCATE code and map relationships BEFORE Read/grep. It is a first-hop locator, NOT a replacement for Read/grep.
 
-When to reach for it:
-- Understand a flow ("how does auth work") → mode "both" (default): semantic + graph symbols.
-- Find a specific implementation ("the User model") → mode "vector".
-- Trace relationships ("who calls sendEmail", "impact of changing Y", dead code) → mode "graph".
+Reach for it when:
+- Large or unfamiliar codebase: "how does auth work", "where is X handled" → mode "both" (default).
+- Relationship/structure questions grep CANNOT answer: "who calls sendEmail", "impact of changing Y", dead code, entry points → mode "graph".
+- You know the concept but not the exact name (semantic tolerance beats keyword grep).
 
-When NOT to use it: exact string/symbol/path already known (use Grep/Read); config/YAML/lock/markdown full text (Grep); need verbatim whole file (Read the located line range).
+Do NOT use it when:
+- Small/well-known repo (roughly < ~1k files): plain Grep/Read is cheaper AND gives fuller answers — measured on flask/requests, grep won all 8 scenarios.
+- Exact string/symbol/path already known → Grep/Read directly.
+- Config/YAML/lock/markdown full text, or you need a verbatim whole file → Grep / Read a located line range.
 
-Query in natural language. Tuning: \`enrich:false\` (skip call-graph, leaner), \`style:"compact"\` (file:line only). Needs link for vector; without link returns graph-only.
+After search locates a spot, Read that exact line range to actually understand/edit. Query in natural language. Tuning: mode "both|vector|graph", enrich:false (skip call-graph, leaner), style:"compact" (file:line only, ~10x fewer tokens). Needs link for vector; without link returns graph-only.
 `;
 
         const clear_description = `
