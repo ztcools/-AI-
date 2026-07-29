@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { execSync } from "child_process";
 import {
     Context,
     COLLECTION_LIMIT_MESSAGE,
@@ -34,6 +35,30 @@ export class ToolHandlers {
      */
     private autoGraphBuildTriggered: Set<string> = new Set();
     private lastGraphSyncCheck: Map<string, number> = new Map();
+    private repoSizeCache: Map<string, { files: number; at: number }> = new Map();
+
+    /**
+     * 仓库规模分档（缓存 5min）：用 git ls-files 计数。
+     * <300 小库(grep/read 更省) / 300-2000 中库 / >2000 大库(search 明显占优)。
+     */
+    private getRepoSizeTier(codebasePath: string): string {
+        const cached = this.repoSizeCache.get(codebasePath);
+        if (cached && Date.now() - cached.at < 300_000) return this.formatSizeTier(cached.files);
+        let files = 0;
+        try {
+            const out = execSync('git ls-files', { cwd: codebasePath, encoding: 'utf-8', timeout: 8000 });
+            files = out.trim() ? out.trim().split('\n').length : 0;
+        } catch { /* non-git */ }
+        this.repoSizeCache.set(codebasePath, { files, at: Date.now() });
+        return this.formatSizeTier(files);
+    }
+
+    private formatSizeTier(files: number): string {
+        if (files <= 0) return '';
+        const tier = files < 300 ? 'small' : files < 2000 ? 'medium' : 'large';
+        const hint = files < 300 ? ' — grep/read likely cheaper' : files >= 2000 ? ' — search favored' : '';
+        return `[repo: ${files} files, ${tier}${hint}]`;
+    }
     /**
      * 架构摘要已输出的项目集合（每会话每项目只输出一次，避免 token 浪费）。
      */
@@ -333,11 +358,15 @@ export class ToolHandlers {
     // ── Tool: search ────────────────────────────────────────────────
     public async handleSearchCode(args: any) {
         const tuning = this.getSearchTuning();
-        const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style } = args;
+        const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style, docs, tests } = args;
         const searchMode: 'vector' | 'graph' | 'both' = (mode === 'graph') ? 'graph' : (mode === 'vector') ? 'vector' : 'both';
         const doEnrich = searchMode === 'both' && enrich !== false;
         const compactStyle = style === 'compact';
         const resultLimit = limit || tuning.defaultLimit;
+        // docs:true → 查文档/指南时不做文档降权（临时把 penalty 调 0）
+        if (docs === true) process.env.SEARCH_DOC_PENALTY = '0';
+        // tests:true → 查测试用例时不做测试降权
+        if (tests === true) process.env.SEARCH_TEST_PENALTY = '0';
 
         try {
             const absolutePath = resolveCodebasePath(codebasePath);
@@ -419,20 +448,27 @@ export class ToolHandlers {
             let graphSymbols: Array<{ name: string; kind: string; filePath: string; line: number; inDegree: number; outDegree: number }> = [];
             let searchSourceNote = link ? ` (cloud: ${link.branch})` : ' (graph-only)';
 
+            let vectorError: string | null = null;
             const vectorPromise = (searchMode !== 'graph' && layers.length > 0)
                 ? (async () => {
-                    const searchResults = await this.context.searchWithLayers(
-                        layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr,
-                    );
-                    let scored = searchResults;
-                    if (tuning.scoreRatio > 0 && scored.length > 1) {
-                        const topScore = Number(scored[0]?.score) || 0;
-                        if (topScore > 0) {
-                            const floor = topScore * tuning.scoreRatio;
-                            scored = scored.filter((r: any, i: number) => i === 0 || (Number(r.score) || 0) >= floor);
+                    try {
+                        const searchResults = await this.context.searchWithLayers(
+                            layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr,
+                        );
+                        let scored = searchResults;
+                        if (tuning.scoreRatio > 0 && scored.length > 1) {
+                            const topScore = Number(scored[0]?.score) || 0;
+                            if (topScore > 0) {
+                                const floor = topScore * tuning.scoreRatio;
+                                scored = scored.filter((r: any, i: number) => i === 0 || (Number(r.score) || 0) >= floor);
+                            }
                         }
+                        vectorResults = scored;
+                    } catch (e: any) {
+                        // 向量失败不能拖垮图结果 —— 记录错误，继续返回图部分
+                        vectorError = e?.message || String(e);
+                        console.warn(`[SEARCH] Vector search failed (falling back to graph-only): ${vectorError}`);
                     }
-                    vectorResults = scored;
                 })()
                 : Promise.resolve();
 
@@ -461,6 +497,7 @@ export class ToolHandlers {
             // ── 无结果 ──
             if (vectorResults.length === 0 && graphSymbols.length === 0) {
                 let noMsg = `No results for "${query}" in '${absolutePath}'${searchSourceNote}`;
+                if (vectorError) noMsg += `\nVector search error: ${vectorError}`;
                 if (!link) noMsg += `\nTip: run link to enable cloud vector search.`;
                 return { content: [{ type: 'text', text: noMsg }] };
             }
@@ -470,7 +507,12 @@ export class ToolHandlers {
             const linkHeader = link
                 ? `[linked: ${link.remoteUrl}@${link.branch}]`
                 : `[not linked — graph-only]`;
-            parts.push(linkHeader);
+            // 仓库规模分档：让 agent 判断 search 是否划算（小库 grep/read 更省）。
+            const sizeTier = this.getRepoSizeTier(absolutePath);
+            parts.push(`${linkHeader} ${sizeTier}`);
+            if (vectorError) {
+                parts.push(`[vector search failed: ${vectorError} — showing graph-only results]`);
+            }
 
             if (vectorResults.length > 0) {
                 const modeTag = searchMode === 'both' && graphSymbols.length > 0 ? ' vector+graph' : '';
@@ -570,14 +612,17 @@ export class ToolHandlers {
             // 清本地图
             if (this.graphToolHandlers) {
                 const project = (() => { try { return getRepoIdentity(absolutePath); } catch { return absolutePath; } })();
+                const store = this.graphToolHandlers.getStore();
                 try {
                     this.graphToolHandlers.setProject(absolutePath);
-                    this.graphToolHandlers.getStore().beginTransaction();
-                    this.graphToolHandlers.getStore().deleteProject(project);
-                    this.graphToolHandlers.getStore().commitTransaction();
+                    store.beginTransaction();
+                    store.deleteProject(project);
+                    store.commitTransaction();
                     cleared.push('graph');
                     console.log(`[CLEAR] Cleared graph index for: ${project}`);
                 } catch (graphError: any) {
+                    // 事务失败必须 rollback，否则连接一直处于打开事务状态被锁死
+                    try { store.rollbackTransaction(); } catch { /* ignore */ }
                     console.warn(`[CLEAR] Failed to clear graph index for '${project}': ${graphError.message}`);
                 }
             }

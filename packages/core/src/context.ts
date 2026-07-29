@@ -1608,11 +1608,14 @@ export class Context {
      */
     updateEmbedding(embedding: Embedding): void {
         this.embedding = embedding;
-        // Model changed → invalidate cached dimension and embedding-cache instance
-        // so we never key vectors under the wrong model/dimension.
+        // Model changed → invalidate cached dimension, embedding-cache instance,
+        // AND the query-embedding cache (its keys are bare query strings with no
+        // model identity, so stale old-model vectors would otherwise be reused
+        // against a collection built in a different embedding space).
         this.knownDimension = null;
         this.embeddingCacheInstance = null;
         this.embeddingCacheKey = null;
+        this.queryEmbeddingCache.clear();
         console.log(`[Context] 🔄 Updated embedding provider: ${embedding.getProvider()}`);
     }
 
@@ -1626,6 +1629,7 @@ export class Context {
         this.commitIndexState = new CommitIndexState(vectorDatabase);
         this.embeddingCacheInstance = null;
         this.embeddingCacheKey = null;
+        this.queryEmbeddingCache.clear();
         console.log(`[Context] 🔄 Updated vector database`);
     }
 
@@ -2375,11 +2379,45 @@ export class Context {
         // 文档降权：自然语言查询时 .md/.rst 等文档散文与查询语义更接近，
         // 容易把真正的代码实现压出 topK（实测 requests-flow top5 全是 docs）。
         const codeWeighted = this.penalizeDocResults(deduped);
-        const filtered = this.applyScoreCutoff(codeWeighted, threshold);
+        // 测试文件降权：测试代码与"X 怎么用/X 怎么实现"的查询语义也接近，
+        // 会挤占生产实现的位置（实测 requests-flow top2 是 tests/test_adapters.py）。
+        const prodWeighted = this.penalizeTestResults(codeWeighted);
+        const filtered = this.applyScoreCutoff(prodWeighted, threshold);
         const contentDeduped = this.dedupNearDuplicateContent(filtered);
         const finalResults = this.applyFileDiversity(contentDeduped, topK);
         console.log(`[Context] ✅ Dev-aware search: ${all.length} raw → ${finalResults.length} results`);
+        // 重置单次 search 可能设置的降权覆盖，避免泄漏到下一次查询。
+        delete process.env.SEARCH_DOC_PENALTY;
+        delete process.env.SEARCH_TEST_PENALTY;
         return finalResults;
+    }
+
+    /**
+     * Down-rank test/spec files so production implementations outrank test doubles.
+     * Tests mirror the API under test and embed near "how do I use X" queries,
+     * but the production implementation is almost always the intended answer.
+     * Controlled by SEARCH_TEST_PENALTY (0 disables; default 0.55 = tests keep ~half score).
+     */
+    private penalizeTestResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        const penalty = parseFloat(process.env.SEARCH_TEST_PENALTY ?? envManager.get('SEARCH_TEST_PENALTY') ?? '0.55');
+        if (penalty <= 0 || penalty >= 1) return results;
+        const isTest = (r: SemanticSearchResult): boolean => {
+            const fp = r.relativePath || '';
+            const base = fp.slice(fp.lastIndexOf('/') + 1);
+            // test directories: tests/, test/, testing/, __tests__/, spec/, testdata/
+            if (/(^|\/)(tests?|testing|__tests__|spec|specs|testdata|test_fixtures|fixtures)(\/|$)/i.test(fp)) return true;
+            // test file names: test_*, *_test.*, *_spec.*, *.test.*, *.spec.*, conftest.*
+            if (/^(test_|conftest)/i.test(base)) return true;
+            if (/(_test|_spec|\.test|\.spec)\.[^.]+$/i.test(base)) return true;
+            // Java/TS style: FooTest.java, FooTests.java, FooSpec.ts
+            if (/(Test|Tests|Spec|TestCase)\.[^.]+$/.test(base)) return true;
+            return false;
+        };
+        const weighted = results.map(r =>
+            isTest(r) ? { ...r, score: r.score * penalty } : r,
+        );
+        weighted.sort((a, b) => b.score - a.score);
+        return weighted;
     }
 
     /**
@@ -2389,7 +2427,8 @@ export class Context {
      * Controlled by SEARCH_DOC_PENALTY (0 disables; default 0.5 = docs keep half score).
      */
     private penalizeDocResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
-        const penalty = parseFloat(envManager.get('SEARCH_DOC_PENALTY') || '0.5');
+        // process.env 优先（允许单次 search 用 docs:true 临时禁用降权）。
+        const penalty = parseFloat(process.env.SEARCH_DOC_PENALTY ?? envManager.get('SEARCH_DOC_PENALTY') ?? '0.5');
         if (penalty <= 0 || penalty >= 1) return results;
         const isDoc = (r: SemanticSearchResult): boolean => {
             const lang = (r.language || '').toLowerCase();

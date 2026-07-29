@@ -88,19 +88,19 @@ Unbind this repo from its cloud vector index. Local graph is kept; re-run link t
 `;
 
         const search_description = `
-Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. Use it to LOCATE code and map relationships BEFORE Read/grep. It is a first-hop locator, NOT a replacement for Read/grep.
+Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. It is a first-hop LOCATOR, not a replacement for Read/Grep. The output header shows a repo size tier (small/medium/large) — use it to decide.
 
-Reach for it when:
-- Large or unfamiliar codebase: "how does auth work", "where is X handled" → mode "both" (default).
-- Relationship/structure questions grep CANNOT answer: "who calls sendEmail", "impact of changing Y", dead code, entry points → mode "graph".
-- You know the concept but not the exact name (semantic tolerance beats keyword grep).
+DEFAULT = Grep/Read. Reach for search ONLY in these cases:
+1. RELATIONSHIP questions grep CANNOT answer — "who calls X", "callers of Y", "impact of changing Z", dead code, entry points → mode "graph" (cheapest, ~200 tok, returns the call chain). Works at ANY repo size.
+2. LARGE/UNFAMILIAR repo (> ~2000 files) AND you don't know where something lives — "how does auth work", "where is request handled" → mode "both". Grep would drown in hits here.
+3. You know the CONCEPT but not the exact identifier (semantic recall beats keyword grep) → mode "vector".
 
 Do NOT use it when:
-- Small/well-known repo (roughly < ~1k files): plain Grep/Read is cheaper AND gives fuller answers — measured on flask/requests, grep won all 8 scenarios.
-- Exact string/symbol/path already known → Grep/Read directly.
-- Config/YAML/lock/markdown full text, or you need a verbatim whole file → Grep / Read a located line range.
+- SMALL repo (< ~300 files): Grep/Read is cheaper AND gives fuller answers. Measured: grep beat search in all 8 scenarios on flask/requests.
+- Exact string/symbol/file path already known → Grep/Read directly (instant, zero cost).
+- Need a verbatim whole file or config/YAML/markdown → Grep / Read a located line range.
 
-After search locates a spot, Read that exact line range to actually understand/edit. Query in natural language. Tuning: mode "both|vector|graph", enrich:false (skip call-graph, leaner), style:"compact" (file:line only, ~10x fewer tokens). Needs link for vector; without link returns graph-only.
+After search locates a spot, Read that exact line range to understand/edit. Query in natural language. Cost control: mode "graph" (~200 tok) << "vector"/"both"; add style:"compact" for file:line only (~10x fewer tokens), limit:5 to cap snippets, enrich:false to skip the call-graph. Needs link for vector; without link returns graph-only.
 `;
 
         const clear_description = `
@@ -184,6 +184,16 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                     type: "boolean",
                                     description: "Attach graph call-relationship context to results (both mode only, default true). Set false for lean output.",
                                     default: true,
+                                },
+                                docs: {
+                                    type: "boolean",
+                                    description: "Include documentation/markdown without score penalty (default false: docs are down-ranked so code wins). Set true when searching for guides/README/concepts.",
+                                    default: false,
+                                },
+                                tests: {
+                                    type: "boolean",
+                                    description: "Include test files without score penalty (default false: tests are down-ranked so production code wins). Set true when searching for test examples/usage in tests.",
+                                    default: false,
                                 },
                                 style: {
                                     type: "string",
