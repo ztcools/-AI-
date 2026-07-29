@@ -42,8 +42,8 @@
             │                                       │
     ┌───────▼────────┐                    ┌────────▼─────────┐
     │  向量索引 (Milvus)│                    │  图索引 (SQLite)   │
-    │  语义搜索        │                    │  结构查询          │
-    │  dev ⊕ root     │                    │  调用图/影响面     │
+    │  云端只读检索     │                    │  结构查询          │
+    │  按 repo:branch  │                    │  调用图/影响面     │
     │  hybrid RRF 融合 │                    │  跨文件引用解析    │
     └───────┬────────┘                    └────────┬─────────┘
             │                                       │
@@ -65,19 +65,20 @@
 
 ## 索引架构
 
-### 向量索引（Milvus, dev ⊕ root 双层）
+### 向量索引（Milvus, 云端统一管理 + 本地只读检索）
+
+本地【不做】任何向量索引写入。向量统一由云端 git-index-service 按 `仓库:保护分支`
+预先索引到 Milvus；本地 MCP 只做 ①查询向量化 ②直连云端 Milvus 只读检索。
 
 ```
-identity = gitRemote:branch:devFingerprint
-collection = hcc_<md5(identity)>
-merkle snapshot = ~/.context/merkle/<md5(identity)>.json
+identity    = normalizeGitUrl(gitRemote) + ':' + branch     # 云端保护分支
+collection  = (hcc|cc)_<slug32>_<md5(identity)[:8]>
+寻址        = getCollectionNameForIdentity(identity)
 ```
 
-- **首次 index**：检测 root collection 是否存在 → delta 模式（只索引与 main 不同的文件）
-- **搜索**：dev ⊕ root 双层，root 层通过 `buildMaskFilter(devChangedFiles)` 硬排除 dev 已覆盖文件
-- **rebase 后**：自动检测 merge-base 变化 → 重新计算 devChangedFiles → 旧 dev 文件与 root 相同的移除，新分叉的加入
-- **版本隔离**：每开发者独立 collection（`<url>:<branch>:<devFingerprint>`），互不污染
-- 开发者指纹零配置：`git config user.email` 自动获取
+- **link**：`/seeway-link` 把当前仓库绑定到云端某保护分支的 collection（会话级，进程内存不落盘）。
+- **搜索**：单层云端 collection 只读检索（dense + BM25 sparse，RRF 融合）。
+- **管理**：仓库/保护分支的增删与索引全在 PhiGent 控制台（云端）手动管理。
 
 ### 图索引（SQLite, 随项目存储）
 
@@ -88,13 +89,14 @@ merkle snapshot = ~/.context/merkle/<md5(identity)>.json
 
 ### git 操作场景行为
 
-| 操作 | 图索引 | 向量索引 |
+| 操作 | 图索引（本地） | 向量索引（云端） |
 |------|--------|---------|
-| 修改文件 | Merkle 检测 → 增量重建 | Merkle 检测 → 增量索引 |
-| git reset --hard | 内容变化 → 增量重建 | 内容变化 → 批量重建 |
-| git rebase | 内容变化 → 重建 + 重算 merge-base | 自动修正 devChangedFiles |
-| git checkout | 切换快照 → 重建差异 | 切换 collection → 已有快照零成本 |
-| git stash/pop | 内容变化 → embedding cache 命中 | 极快（仅写 Milvus） |
+| 修改文件 | git diff → 真增量重建 | 无关（云端每日定时更新） |
+| git reset/rebase/checkout | 内容变化 → 增量/全量重建 | 无关 |
+| 索引器升级 | INDEXER_VERSION 版本戳 → 自动识别旧图重建 | 无关 |
+
+> 本地改动与云端索引的短暂不一致是设计接受的：改动的文件在当前 agent 上下文里，
+> 无需对它们做增量向量索引。
 
 ---
 
@@ -204,7 +206,7 @@ await ix.indexAll();
 
 - TypeScript commonjs（mcp 和 git-index-service 用 ESM）
 - 环境变量通过 `envManager` 读取（不直读 `process.env`）
-- repo identity: `<gitRemote>:<branch>`（分支）/ `<gitRemote>:<branch>:<devFingerprint>`（开发者）
+- repo identity: `normalizeGitUrl(<gitRemote>):<branch>`（云端保护分支寻址与本地图 project 共用）
 - 图节点/边: `kind` 为主字段（`label`/`type` 为 deprecated 向后兼容）
 - 分支: `main`，所有开发在此直接进行
 

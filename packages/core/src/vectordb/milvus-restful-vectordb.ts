@@ -806,9 +806,12 @@ export class MilvusRestfulVectorDatabase implements VectorDatabase {
                 search_param_2.filter = options.filterExpr;
             }
 
+            // 尊重调用方传入的 rerank k（context.searchLayer 会传 RRF_K），
+            // 缺省才回退 100 —— 之前硬编码 100 完全忽略 options.rerank。
+            const rerankK = options?.rerank?.params?.k ?? 100;
             const rerank_strategy = {
                 strategy: "rrf",
-                params: { k: 100 }
+                params: { k: rerankK }
             };
 
             const hybridSearchRequest: any = {

@@ -752,9 +752,11 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 limit: searchRequests[1].limit
             };
 
+            // 尊重调用方传入的 rerank k（context.searchLayer 会传 RRF_K），缺省回退 100。
+            const rerankK = options?.rerank?.params?.k ?? 100;
             const rerank_strategy = {
                 strategy: "rrf",
-                params: { k: 100 }
+                params: { k: rerankK }
             };
 
             // Execute hybrid search

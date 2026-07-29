@@ -402,7 +402,11 @@ export class GraphTraverser {
     const visited = new Set<number>();
     nodes.set(focalNode.id, focalNode);
 
-    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited);
+    // Hard cap on expansion — a large class fans out into dozens of methods,
+    // each recursing into its own callers, which explodes combinatorially.
+    // Bound the total subgraph so impact stays a useful summary, not a dump.
+    const MAX_IMPACT_NODES = 50;
+    this.getImpactRecursive(nodeId, maxDepth, 0, nodes, edges, visited, MAX_IMPACT_NODES);
 
     return { nodes, edges, roots: [nodeId] };
   }
@@ -414,8 +418,10 @@ export class GraphTraverser {
     nodes: Map<number, GraphNode>,
     edges: GraphEdge[],
     visited: Set<number>,
+    maxNodes: number = 50,
   ): void {
     if (visited.has(nodeId)) return;
+    if (nodes.size >= maxNodes) return; // expansion budget exhausted
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
 
@@ -429,11 +435,12 @@ export class GraphTraverser {
         if (containsEdges.length > 0) {
           const children = this.store.getNodesById(containsEdges.map(e => e.targetId));
           for (const edge of containsEdges) {
+            if (nodes.size >= maxNodes) break;
             const childNode = children.get(edge.targetId);
             if (childNode && !visited.has(childNode.id)) {
               nodes.set(childNode.id, childNode);
               edges.push(edge);
-              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited);
+              this.getImpactRecursive(childNode.id, maxDepth, currentDepth, nodes, edges, visited, maxNodes);
             }
           }
         }
@@ -449,12 +456,13 @@ export class GraphTraverser {
     const sources = this.store.getNodesById(incoming.map(e => e.sourceId));
 
     for (const edge of incoming) {
+      if (nodes.size >= maxNodes) break;
       const sourceNode = sources.get(edge.sourceId);
       if (!sourceNode) continue;
       edges.push(edge);
       if (!visited.has(sourceNode.id)) {
         nodes.set(sourceNode.id, sourceNode);
-        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited);
+        this.getImpactRecursive(sourceNode.id, maxDepth, currentDepth + 1, nodes, edges, visited, maxNodes);
       }
     }
   }

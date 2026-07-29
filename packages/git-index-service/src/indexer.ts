@@ -85,7 +85,16 @@ export class GitIndexer {
         const spec: RepoSpec = { ...repo, branch: requestedBranch };
         try {
             this.current = { repo: repo.name, branch: requestedBranch, phase: '拉取仓库', percentage: 0 };
-            const { dir: localPath, branch } = this.repoManager.ensureCheckout(spec);
+            const { dir: localPath, branch } = await this.repoManager.ensureCheckout(spec);
+            // 保护分支被删除/改名后，ensureCheckout 会静默回落到默认分支(main)。
+            // 若继续索引并把结果记到"被请求的保护分支"名下，状态就错乱了（显示
+            // dev 已索引，实际是 main）。显式报错，让管理员知道该保护分支已失效。
+            if (branch !== requestedBranch && requestedBranch !== repo.branch) {
+                throw new Error(
+                    `protected branch '${requestedBranch}' not found on remote (fell back to '${branch}'). ` +
+                    `Remove it from protectedBranches or fix the branch name.`
+                );
+            }
             // Persist the branch actually indexed when the main branch fell back to the
             // remote default. Only applies to the canonical main slot, not protected branches.
             if (branch !== spec.branch && requestedBranch === repo.branch) {

@@ -81,7 +81,7 @@ echo -e "${GREEN}  ✓ 仓库就绪 ($INSTALL_DIR)${NC}"
 
 echo -e "${YELLOW}[4/7] 安装依赖 (可能需要几分钟)...${NC}"
 cd "$INSTALL_DIR"
-# 只安装 MCP 子图(core + graph + mcp)的依赖,避开 vscode/chrome 的
+# 只安装 MCP 子图(core + graph + mcp)的依赖,避开无关包的
 # keytar(需 libsecret)、faiss 等原生依赖在用户机上编译失败。
 INSTALL_FILTER='--filter @seeway/claude-context-mcp...'
 if [ -n "$SUDO_USER" ]; then

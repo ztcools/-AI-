@@ -104,7 +104,7 @@ export function startHttpServer(
                 const repo = store.getRepo(name);
                 if (!repo) return send(res, 404, { error: `repo '${name}' not found` });
                 try {
-                    const branches = repoManager.listRemoteBranches(repo);
+                    const branches = await repoManager.listRemoteBranches(repo);
                     return send(res, 200, { repo: name, branches: branches.map(b => ({ name: b })) });
                 } catch (e: any) {
                     const msg = e?.message || String(e);
@@ -179,11 +179,15 @@ export function startHttpServer(
                 return send(res, 202, { status: 'started' });
             }
             // /index/:name or /index/:name/:branch
+            // Branch names may contain slashes (release/1.0, feature/x) — split on
+            // the FIRST slash only: everything before it is the repo name, the rest
+            // is the branch. Decode each segment after splitting.
             const indexMatch = url.match(/^\/index\/(.+)$/);
             if (method === 'POST' && indexMatch) {
-                const parts = indexMatch[1].split('/').map(decodeURIComponent);
-                const name = parts[0];
-                const branch = parts[1];
+                const rest = indexMatch[1];
+                const firstSlash = rest.indexOf('/');
+                const name = decodeURIComponent(firstSlash === -1 ? rest : rest.slice(0, firstSlash));
+                const branch = firstSlash === -1 ? undefined : decodeURIComponent(rest.slice(firstSlash + 1));
                 if (indexer.isRunning()) return send(res, 409, { error: 'indexing already in progress' });
                 if (branch) {
                     void indexer.indexOneBranch(name, branch).then(r => {

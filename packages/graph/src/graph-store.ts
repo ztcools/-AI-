@@ -719,11 +719,21 @@ export class SqliteGraphStore implements GraphStore {
     // always the intended answer, not the test double. Demote test/spec files by
     // a large score margin so they rank after real definitions, without being
     // filtered out entirely (tests are still searchable when asked for).
-    const TEST_PATH = /(^|\/)(test|tests|testing|spec|__tests__|test_|conftest)|(_test|_spec|\.test|\.spec|Test|Tests|Spec)\.(py|js|ts|jsx|tsx|go|java|rs|cpp|c|cc)$/i;
+    const isTestFile = (fp: string): boolean => {
+      const lower = fp.toLowerCase();
+      const base = lower.slice(lower.lastIndexOf('/') + 1);
+      const stem = base.replace(/\.[^.]+$/, '');
+      // test directories: tests/, test/, testing/, __tests__/, spec/ anywhere in path
+      if (/(^|\/)(tests?|testing|__tests__|spec|specs|testdata|test_fixtures)(\/|$)/i.test(fp)) return true;
+      // test file names: test_*, *_test, *_spec, *.test.*, *.spec.*, conftest, *Test, *Tests, *Spec (exact-ish)
+      if (/^(test_|conftest)/.test(base)) return true;
+      if (/(_test|_spec|\.test|\.spec)\.[^.]+$/.test(base)) return true;
+      if (/(Test|Tests|Spec|Tests?Case)\.[^.]+$/.test(base.slice(base.lastIndexOf('/') + 1)) && /[A-Z]/.test(fp.slice(fp.lastIndexOf('/') + 1))) return true;
+      void stem;
+      return false;
+    };
     for (const r of results) {
-      const fp = r.node.filePath || '';
-      const isTest = TEST_PATH.test(fp) || /(^|\/)test(s)?\//i.test(fp);
-      if (isTest) r.score -= 100;
+      if (isTestFile(r.node.filePath || '')) r.score -= 100;
     }
     results.sort((a, b) => b.score - a.score);
 
@@ -1013,6 +1023,21 @@ export class SqliteGraphStore implements GraphStore {
   // ── File-level operations ─────────────────────────────────────────
 
   deleteNodesByFile(project: string, filePath: string): void {
+    // Re-arm cross-file CALLS refs that point INTO this file BEFORE deleting.
+    // The resolved ref rows for these edges were consumed long ago; if we just
+    // cascade-delete the edges, the callers (in OTHER files) permanently lose
+    // their CALLS edges into this file because there's no pending ref left to
+    // re-resolve after re-indexing. Recreate them as pending refs keyed on the
+    // caller (source) node, which survives the delete.
+    this.db.prepare(`
+      INSERT INTO unresolved_refs (project, from_node_id, reference_name, reference_kind, line, col, file_path, language, status)
+      SELECT e.project, e.source_id, tn.name, e.kind, e.line, e.col, sn.file_path, sn.language, 'pending'
+      FROM edges e
+      JOIN nodes tn ON tn.id = e.target_id AND tn.project = e.project AND tn.file_path = ?
+      JOIN nodes sn ON sn.id = e.source_id AND sn.project = e.project
+      WHERE e.project = ? AND e.kind = 'calls' AND sn.file_path != ?
+    `).run(filePath, project, filePath);
+
     // Delete edges + unresolved refs first (cascade manually since FK is off during bulk load)
     this.db.prepare(`
       DELETE FROM edges WHERE project = ? AND (

@@ -287,38 +287,45 @@ export class ToolHandlers {
                 const stats = this.graphToolHandlers.getStore().getProjectStats(graphProject);
                 const alreadyGraphIndexed = stats.nodes > 0;
 
-                setImmediate(async () => {
-                    try {
-                        if (alreadyGraphIndexed) {
-                            // 增量更新
-                            let changedFiles: string[] = [];
-                            try {
-                                const detectResult = this.graphToolHandlers!.detectChangedFiles({ project: graphProject });
-                                if (detectResult) changedFiles = detectResult.changedFiles;
-                            } catch { /* 忽略，走全量 */ }
+                // 与 maybeAutoBuildGraphIndex 共用一个去重 Set，避免 link + 后续 search
+                // 各触发一次后台建图。失败时移除，允许后续重试（之前失败后永不重试）。
+                if (!this.autoGraphBuildTriggered.has(graphProject)) {
+                    this.autoGraphBuildTriggered.add(graphProject);
+                    setImmediate(async () => {
+                        try {
+                            if (alreadyGraphIndexed) {
+                                // 增量更新
+                                let changedFiles: string[] = [];
+                                try {
+                                    const detectResult = this.graphToolHandlers!.detectChangedFiles({ project: graphProject });
+                                    if (detectResult) changedFiles = detectResult.changedFiles;
+                                } catch { /* 忽略，走全量 */ }
 
-                            if (changedFiles.length > 0) {
-                                console.log(`[LINK] Detected ${changedFiles.length} changed files, running incremental graph index`);
+                                if (changedFiles.length > 0) {
+                                    console.log(`[LINK] Detected ${changedFiles.length} changed files, running incremental graph index`);
+                                    await this.graphToolHandlers!.handleIndexRepository({
+                                        repo_path: absolutePath,
+                                        mode: 'incremental',
+                                        files: changedFiles,
+                                    });
+                                } else {
+                                    console.log(`[LINK] No changes detected for '${graphProject}', skipping graph re-index`);
+                                }
+                            } else {
+                                console.log(`[LINK] Local graph empty for '${graphProject}', building in background...`);
                                 await this.graphToolHandlers!.handleIndexRepository({
                                     repo_path: absolutePath,
-                                    mode: 'incremental',
-                                    files: changedFiles,
+                                    mode: 'full',
                                 });
-                            } else {
-                                console.log(`[LINK] No changes detected for '${graphProject}', skipping graph re-index`);
+                                console.log(`[LINK] Background graph build complete for '${graphProject}'`);
                             }
-                        } else {
-                            console.log(`[LINK] Local graph empty for '${graphProject}', building in background...`);
-                            await this.graphToolHandlers!.handleIndexRepository({
-                                repo_path: absolutePath,
-                                mode: 'full',
-                            });
-                            console.log(`[LINK] Background graph build complete for '${graphProject}'`);
+                        } catch (e: any) {
+                            // 失败移除标记，允许下次 search/link 重试
+                            this.autoGraphBuildTriggered.delete(graphProject);
+                            console.warn(`[LINK] Background graph build failed for '${graphProject}': ${e?.message || e}`);
                         }
-                    } catch (e: any) {
-                        console.warn(`[LINK] Background graph build failed for '${graphProject}': ${e?.message || e}`);
-                    }
-                });
+                    });
+                }
 
                 graphNote = alreadyGraphIndexed
                     ? `\n[Graph] Already indexed: ${stats.nodes} nodes, ${stats.edges} edges (incremental check in background)`
@@ -773,6 +780,8 @@ export class ToolHandlers {
                 });
                 console.log(`[GRAPH-AUTO] Background graph build complete for '${project}'`);
             } catch (e: any) {
+                // 失败移除标记，允许下次 search/status 重试（之前失败后标记残留，永不重试）
+                this.autoGraphBuildTriggered.delete(project);
                 console.warn(`[GRAPH-AUTO] Background graph build failed for '${project}': ${e?.message || e}`);
             }
         });

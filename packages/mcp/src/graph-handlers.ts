@@ -116,10 +116,13 @@ export class GraphToolHandlers {
         force: (args.force as boolean) || false,
         signal: undefined,
         onProgress: (progress: IndexProgress) => {
+          // 保留首次回调的 startTime —— 之前每次都重置成 now，
+          // 导致 elapsed = now - startTime 永远 ~0，进度时间显示失效。
+          const existing = this.indexingProgress.get(project);
           this.indexingProgress.set(project, {
             total: progress.total,
             current: progress.current,
-            startTime: Date.now(),
+            startTime: existing?.startTime ?? Date.now(),
           });
         },
       };
@@ -269,8 +272,8 @@ export class GraphToolHandlers {
       if (callers.length > 0) {
         lines.push(`Callers (${callers.length}):`);
         for (const c of callers) {
-          lines.push(`  [depth=${root.kind}] ${c.node.name} (${c.node.qualifiedName})`);
-          lines.push(`    ${c.node.filePath}:${c.node.startLine} (${c.edge.kind})`);
+          lines.push(`  ${c.node.name} (${c.node.qualifiedName})`);
+          lines.push(`    ${c.node.filePath}:${c.node.startLine} —${c.edge.kind}→ ${root.name}`);
         }
         lines.push('');
       }
@@ -278,8 +281,8 @@ export class GraphToolHandlers {
       if (callees.length > 0) {
         lines.push(`Callees (${callees.length}):`);
         for (const c of callees) {
-          lines.push(`  [depth=${root.kind}] ${c.node.name} (${c.node.qualifiedName})`);
-          lines.push(`    ${c.node.filePath}:${c.node.startLine} (${c.edge.kind})`);
+          lines.push(`  ${c.node.name} (${c.node.qualifiedName})`);
+          lines.push(`    ${c.node.filePath}:${c.node.startLine} ${root.name} —${c.edge.kind}→`);
         }
         lines.push('');
       }

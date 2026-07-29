@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -57,20 +57,39 @@ export class RepoManager {
         return this.toSshUrl(repo.url);
     }
 
-    private git(dir: string, args: string, useSsh = false): string {
+    /** Strip any embedded credentials from a git error message before it can
+     *  reach logs or an HTTP response (oauth2:<token>@host → oauth2:***@host). */
+    private sanitizeError(err: any): Error {
+        const msg = String(err?.message || err);
+        const cleaned = msg
+            .replace(/(oauth2:)[^@\s]+(@)/gi, '$1***$2')
+            .replace(/(https?:\/\/)[^/\s:]+:[^@\s]+(@)/gi, '$1***:***$2');
+        const e = new Error(cleaned);
+        (e as any).code = (err as any)?.code;
+        return e;
+    }
+
+    /** Async git — never blocks the event loop, so /health /status stay responsive
+     *  while a long fetch/reset is running (execSync froze the whole process). */
+    private git(dir: string, args: string, useSsh = false): Promise<string> {
         // Internal GitLab with a self-signed cert → set GIT_SSL_NO_VERIFY=true to skip TLS verify.
         const noVerify = String(process.env.GIT_SSL_NO_VERIFY || '').toLowerCase();
         const sslOpt = (noVerify === 'true' || noVerify === '1') ? '-c http.sslVerify=false ' : '';
         const env = { ...process.env };
         if (useSsh) env.GIT_SSH_COMMAND = this.ssh.sshCommand();
-        return execSync(`git ${sslOpt}${args}`, {
-            cwd: dir,
-            env,
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe'],
-            timeout: 300_000,
-            maxBuffer: 64 * 1024 * 1024,
-        }).trim();
+        return new Promise((resolve, reject) => {
+            exec(`git ${sslOpt}${args}`, {
+                cwd: dir,
+                env,
+                encoding: 'utf-8',
+                stdio: ['pipe', 'pipe', 'pipe'],
+                timeout: 300_000,
+                maxBuffer: 64 * 1024 * 1024,
+            } as any, (err, stdout) => {
+                if (err) return reject(this.sanitizeError(err));
+                resolve(String(stdout).trim());
+            });
+        });
     }
 
     /**
@@ -79,13 +98,13 @@ export class RepoManager {
      * This makes "add repo, leave branch as main" work for repos whose default is
      * master/dev/etc., instead of failing with "couldn't find remote ref".
      */
-    private resolveBranch(cwd: string, fetchUrl: string, requested: string, useSsh: boolean): string {
+    private async resolveBranch(cwd: string, fetchUrl: string, requested: string, useSsh: boolean): Promise<string> {
         try {
-            const heads = this.git(cwd, `ls-remote --heads "${fetchUrl}" "${requested}"`, useSsh);
+            const heads = await this.git(cwd, `ls-remote --heads "${fetchUrl}" "${requested}"`, useSsh);
             if (heads.trim()) return requested;
         } catch { /* fall through to default */ }
         try {
-            const symref = this.git(cwd, `ls-remote --symref "${fetchUrl}" HEAD`, useSsh);
+            const symref = await this.git(cwd, `ls-remote --symref "${fetchUrl}" HEAD`, useSsh);
             const m = symref.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
             if (m && m[1]) {
                 console.warn(`[RepoManager] Branch '${requested}' not found on remote; using default '${m[1]}'.`);
@@ -102,28 +121,28 @@ export class RepoManager {
      * identity matches developer checkouts. Returns the local path and the branch
      * actually checked out.
      */
-    ensureCheckout(repo: RepoSpec): { dir: string; branch: string } {
+    async ensureCheckout(repo: RepoSpec): Promise<{ dir: string; branch: string }> {
         fs.mkdirSync(this.workdir, { recursive: true });
         const fetchUrl = this.fetchUrl(repo);
         const useSsh = this.useSsh(repo);
 
-        const branch = this.resolveBranch(this.workdir, fetchUrl, repo.branch, useSsh);
+        const branch = await this.resolveBranch(this.workdir, fetchUrl, repo.branch, useSsh);
         const dir = this.dirFor({ ...repo, branch });
 
         if (!fs.existsSync(path.join(dir, '.git'))) {
             fs.mkdirSync(dir, { recursive: true });
-            this.git(dir, 'init -q');
-            this.git(dir, `remote add origin "${repo.url}"`);
+            await this.git(dir, 'init -q');
+            await this.git(dir, `remote add origin "${repo.url}"`);
         } else {
             // Keep origin canonical in case config changed.
-            try { this.git(dir, `remote set-url origin "${repo.url}"`); } catch { /* ignore */ }
+            try { await this.git(dir, `remote set-url origin "${repo.url}"`); } catch { /* ignore */ }
         }
 
         // Fetch full history (needed for commit-to-commit diffs) from the auth URL.
-        this.git(dir, `fetch --prune "${fetchUrl}" "${branch}"`, useSsh);
+        await this.git(dir, `fetch --prune "${fetchUrl}" "${branch}"`, useSsh);
         // Point a named local branch at the fetched tip so identity resolves to url:branch.
-        this.git(dir, `checkout -B "${branch}" FETCH_HEAD`);
-        this.git(dir, 'reset --hard FETCH_HEAD');
+        await this.git(dir, `checkout -B "${branch}" FETCH_HEAD`);
+        await this.git(dir, 'reset --hard FETCH_HEAD');
 
         return { dir, branch };
     }
@@ -133,10 +152,10 @@ export class RepoManager {
      * management API so clients (e.g. /seeway-link) can offer a pick-list of
      * branches to link/index. Throws on auth/network failure.
      */
-    listRemoteBranches(repo: RepoSpec, timeoutMs = 30_000): string[] {
+    async listRemoteBranches(repo: RepoSpec, timeoutMs = 30_000): Promise<string[]> {
         const fetchUrl = this.fetchUrl(repo);
         const useSsh = this.useSsh(repo);
-        const out = this.gitWithTimeout(this.workdir, `ls-remote --heads "${fetchUrl}"`, useSsh, timeoutMs);
+        const out = await this.gitWithTimeout(this.workdir, `ls-remote --heads "${fetchUrl}"`, useSsh, timeoutMs);
         const branches: string[] = [];
         for (const line of out.split('\n')) {
             const m = line.match(/refs\/heads\/(\S+)\s*$/);
@@ -146,18 +165,23 @@ export class RepoManager {
     }
 
     /** git() variant with a caller-supplied timeout (for ls-remote listing). */
-    private gitWithTimeout(dir: string, args: string, useSsh: boolean, timeoutMs: number): string {
+    private gitWithTimeout(dir: string, args: string, useSsh: boolean, timeoutMs: number): Promise<string> {
         const noVerify = String(process.env.GIT_SSL_NO_VERIFY || '').toLowerCase();
         const sslOpt = (noVerify === 'true' || noVerify === '1') ? '-c http.sslVerify=false ' : '';
         const env = { ...process.env };
         if (useSsh) env.GIT_SSH_COMMAND = this.ssh.sshCommand();
-        return execSync(`git ${sslOpt}${args}`, {
-            cwd: dir,
-            env,
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe'],
-            timeout: timeoutMs,
-            maxBuffer: 64 * 1024 * 1024,
-        }).trim();
+        return new Promise((resolve, reject) => {
+            exec(`git ${sslOpt}${args}`, {
+                cwd: dir,
+                env,
+                encoding: 'utf-8',
+                stdio: ['pipe', 'pipe', 'pipe'],
+                timeout: timeoutMs,
+                maxBuffer: 64 * 1024 * 1024,
+            } as any, (err, stdout) => {
+                if (err) return reject(this.sanitizeError(err));
+                resolve(String(stdout).trim());
+            });
+        });
     }
 }
