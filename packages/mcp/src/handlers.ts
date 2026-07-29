@@ -513,7 +513,10 @@ export class ToolHandlers {
             let resultMessage = parts.join('\n');
 
             // ── 图富化 ──
-            if (doEnrich && this.graphToolHandlers && vectorResults.length > 0) {
+            // both 模式：向量命中文件 + 图符号一起富化；graph 模式（无向量结果）：
+            // 调用链往往比裸符号清单更有用（impact/flow 场景），同样产出富化。
+            const wantEnrich = doEnrich || (searchMode === 'graph' && graphSymbols.length > 0);
+            if (wantEnrich && this.graphToolHandlers) {
                 try {
                     const enrich = this.enrichWithGraphContextDeep(
                         vectorResults.slice(0, 5), absolutePath, query,
