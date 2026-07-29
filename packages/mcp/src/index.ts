@@ -24,16 +24,12 @@ import { MilvusVectorDatabase } from "@seeway/claude-context-core";
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
 import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
-import { SnapshotManager } from "./snapshot.js";
-import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
 import { GraphToolHandlers } from "./graph-handlers.js";
 
 class ContextMcpServer {
     private server: Server;
     private context: Context;
-    private snapshotManager: SnapshotManager;
-    private syncManager: SyncManager;
     private toolHandlers: ToolHandlers;
     private graphToolHandlers: GraphToolHandlers;
 
@@ -58,7 +54,7 @@ class ContextMcpServer {
         const embedding = createEmbeddingInstance(config);
         logEmbeddingProviderInfo(config, embedding);
 
-        // Initialize vector database
+        // Initialize vector database (read-only against cloud Milvus)
         const vectorDatabase = new MilvusVectorDatabase({
             address: config.milvusAddress,
             ...(config.milvusToken && { token: config.milvusToken })
@@ -71,87 +67,78 @@ class ContextMcpServer {
             collectionNameOverride: config.collectionNameOverride
         });
 
-        // Initialize managers
-        this.snapshotManager = new SnapshotManager();
-        this.syncManager = new SyncManager(this.context, this.snapshotManager);
+        // Initialize graph handlers
         this.graphToolHandlers = new GraphToolHandlers();
-        this.toolHandlers = new ToolHandlers(this.context, this.snapshotManager, this.graphToolHandlers);
-
-        // Load existing codebase snapshot on startup (fire-and-forget in constructor,
-        // will be fully loaded before server starts handling requests)
-        void this.snapshotManager.loadCodebaseSnapshot();
+        this.toolHandlers = new ToolHandlers(this.context, this.graphToolHandlers);
 
         this.setupTools();
     }
 
     private setupTools() {
-        const index_description = `
-Index a codebase for intelligent code search. One call builds both the vector index (Milvus, shared with your team via git remote URL + branch) and the local knowledge graph (SQLite). Team members on the same repo+branch reuse each other's vector index.
-
-⚠️ **First-time setup**: call this once per project. Afterwards, incremental updates happen automatically, and the local graph auto-builds on your first \`search\` if a teammate already indexed the repo.
+        // NOTE: descriptions are the primary lever for how often the model
+        // reaches for each tool. Keep them compact and verifiable.
+        const link_description = `
+Bind this repo to its cloud vector index (pre-built per protected branch) and build/incrementally update the local knowledge graph. Prerequisite for search to return vector results. Once per session per repo. Omit branch to list cloud candidates.
 `;
 
-        // NOTE: this description is the primary lever for how often the model
-        // reaches for search instead of falling back to manual file reads. It is
-        // deliberately directive. Keep the guidance honest — every claim here is
-        // backed by the handler (hybrid vector+BM25 ranking, graph enrichment).
+        const unlink_description = `
+Unbind this repo from its cloud vector index. Local graph is kept; re-run link to re-bind.
+`;
+
         const search_description = `
-Semantic + knowledge-graph search over the indexed codebase. Use this FIRST before Read/grep — it tells you WHERE to look and HOW code connects, using far fewer tokens than reading files blindly.
+Semantic + call-graph search over the linked codebase. Returns file:line + code snippet + who-calls-it, using ~70% fewer tokens than reading files blindly. Use it to LOCATE code and map relationships BEFORE Read/grep.
 
-**Mode (pick based on what you need):**
-- \`mode: "both"\` (default) — vector semantic + graph symbols. Best for open-ended exploration.
-- \`mode: "vector"\` — pure semantic search. Use when asking "how/where is X implemented".
-- \`mode: "graph"\` — pure symbol + call-graph search. Use for "who calls X", "impact of changing Y".
+When to reach for it:
+- Understand a flow ("how does auth work") → mode "both" (default): semantic + graph symbols.
+- Find a specific implementation ("the User model") → mode "vector".
+- Trace relationships ("who calls sendEmail", "impact of changing Y", dead code) → mode "graph".
 
-**Output tuning:**
-- \`enrich: false\` — skip call-graph context section (saves tokens when you only need locations)
-- \`style: "compact"\` — file:line only, no code snippets (fastest, least tokens)
+When NOT to use it: exact string/symbol/path already known (use Grep/Read); config/YAML/lock/markdown full text (Grep); need verbatim whole file (Read the located line range).
 
-🎯 **When to use each mode:**
-- "how does auth work" → both (explore flow)
-- "find the User model" → vector
-- "who calls sendEmail" → graph
-- "what files import validators" → graph
-- "show me the login function" → vector
+Query in natural language. Tuning: \`enrich:false\` (skip call-graph, leaner), \`style:"compact"\` (file:line only). Needs link for vector; without link returns graph-only.
+`;
 
-Query in natural language (e.g. "how are auth tokens refreshed").
+        const clear_description = `
+Clear the local graph index for a codebase. Cloud vector index is not affected. Re-run link to rebuild.
+`;
+
+        const status_description = `
+Show link state (cloud repo@branch + connectivity) and local graph index stats (nodes/edges/types/routes).
 `;
 
         this.server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
-                        name: "index",
-                        description: index_description,
+                        name: "link",
+                        description: link_description,
                         inputSchema: {
                             type: "object",
                             properties: {
                                 path: {
                                     type: "string",
-                                    description: "Path to the codebase directory to index. Defaults to current workspace.",
+                                    description: "Path to the codebase directory. Defaults to current workspace.",
                                 },
-                                force: {
-                                    type: "boolean",
-                                    description: "Force re-indexing even if already indexed",
-                                    default: false,
-                                },
-                                splitter: {
+                                repo: {
                                     type: "string",
-                                    description: "Code splitter: 'ast' (syntax-aware) or 'langchain' (character-based)",
-                                    enum: ["ast", "langchain"],
-                                    default: "ast",
+                                    description: "Remote repo URL (e.g. git@github.com:org/repo.git). Defaults to git remote of path.",
                                 },
-                                customExtensions: {
-                                    type: "array",
-                                    items: { type: "string" },
-                                    description: "Additional file extensions beyond defaults",
-                                    default: [],
+                                branch: {
+                                    type: "string",
+                                    description: "Protected branch name (e.g. main). Defaults to current branch; omit to list candidates from cloud.",
                                 },
-                                ignorePatterns: {
-                                    type: "array",
-                                    items: { type: "string" },
-                                    description: "Additional ignore patterns beyond defaults",
-                                    default: [],
+                            },
+                        },
+                    },
+                    {
+                        name: "unlink",
+                        description: unlink_description,
+                        inputSchema: {
+                            type: "object",
+                            properties: {
+                                path: {
+                                    type: "string",
+                                    description: "Path to the codebase directory. Defaults to current workspace.",
                                 },
                             },
                         },
@@ -205,7 +192,7 @@ Query in natural language (e.g. "how are auth tokens refreshed").
                     },
                     {
                         name: "clear",
-                        description: "Clear all indexes (vector + graph) for a codebase.",
+                        description: clear_description,
                         inputSchema: {
                             type: "object",
                             properties: {
@@ -218,7 +205,7 @@ Query in natural language (e.g. "how are auth tokens refreshed").
                     },
                     {
                         name: "status",
-                        description: "Get indexing status — vector index (Milvus) and graph index (SQLite) combined.",
+                        description: status_description,
                         inputSchema: {
                             type: "object",
                             properties: {
@@ -238,18 +225,18 @@ Query in natural language (e.g. "how are auth tokens refreshed").
             const safeArgs = args || {};
 
             switch (name) {
-                case "index":
-                case "index_codebase":
-                    return await this.toolHandlers.handleIndex(args);
+                case "link":
+                    return await this.toolHandlers.handleLink(safeArgs);
+                case "unlink":
+                    return await this.toolHandlers.handleUnlink(safeArgs);
                 case "search":
                 case "search_code":
-                    return await this.toolHandlers.handleSearchCode(args);
+                    return await this.toolHandlers.handleSearchCode(safeArgs);
                 case "clear":
                 case "clear_index":
-                    return await this.toolHandlers.handleClearIndex(args);
+                    return await this.toolHandlers.handleClearIndex(safeArgs);
                 case "status":
-                case "get_indexing_status":
-                    return await this.toolHandlers.handleStatus(args);
+                    return await this.toolHandlers.handleStatus(safeArgs);
 
                 default:
                     throw new Error(`Unknown tool: ${name}`);
@@ -258,32 +245,15 @@ Query in natural language (e.g. "how are auth tokens refreshed").
     }
 
     async start() {
-        console.log('[SYNC-DEBUG] MCP server start() method called');
         console.log('Starting Context MCP server...');
 
-        // One-shot startup healing for legacy 0/0+completed snapshot entries
-        // left over from pre-fix MCP versions. Runs before the transport accepts
-        // requests so clients never observe the poisoning state. See Issue #295.
-        await this.toolHandlers.validateLegacyZeroEntries();
-
         const transport = new StdioServerTransport();
-        console.log('[SYNC-DEBUG] StdioServerTransport created, attempting server connection...');
-
         await this.server.connect(transport);
         console.log("MCP server started and listening on stdio.");
-        console.log('[SYNC-DEBUG] Server connection established successfully');
-
-        // Start background sync after server is connected
-        console.log('[SYNC-DEBUG] Initializing background sync...');
-        this.syncManager.startBackgroundSync();
-        console.log('[SYNC-DEBUG] MCP server initialization complete');
     }
 
-    /** Gracefully shut down: stop sync, release locks, close graph store. */
+    /** Gracefully shut down: close graph store. */
     shutdown(): void {
-        console.error('[SHUTDOWN] Stopping background sync...');
-        try { this.syncManager.stopBackgroundSync(); } catch { /* best effort */ }
-        try { this.syncManager.stopTriggerWatcher(); } catch { /* best effort */ }
         console.error('[SHUTDOWN] Closing graph store...');
         try { this.graphToolHandlers.close(); } catch { /* best effort */ }
         console.error('[SHUTDOWN] Shutdown complete.');
@@ -292,16 +262,13 @@ Query in natural language (e.g. "how are auth tokens refreshed").
 
 // Main execution
 async function main() {
-    // Parse command line arguments
     const args = process.argv.slice(2);
 
-    // Show help if requested
     if (args.includes('--help') || args.includes('-h')) {
         showHelpMessage();
         process.exit(0);
     }
 
-    // Create configuration
     const config = createMcpConfig();
     logConfigurationSummary(config);
 
@@ -313,7 +280,6 @@ async function main() {
 // Reference to the running server for graceful shutdown.
 let runningServer: ContextMcpServer | null = null;
 
-// Handle graceful shutdown
 function gracefulShutdown(signal: string) {
     console.error(`Received ${signal}, shutting down gracefully...`);
     if (runningServer) {
@@ -325,7 +291,6 @@ function gracefulShutdown(signal: string) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Always start the server - this is designed to be the main entry point
 main().then(server => { runningServer = server; }).catch((error) => {
     console.error("Fatal error:", error);
     process.exit(1);

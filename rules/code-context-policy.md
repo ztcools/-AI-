@@ -1,6 +1,6 @@
-# 代码上下文策略 · claude-context (search / index / status)
+# 代码上下文策略 · claude-context (link / search / status)
 
-**适用守卫**：本节仅在当前会话可用 `search` / `index` / `status` / `clear` 这组 MCP 工具时生效。若工具列表中没有它们，**完全忽略本节**。
+**适用守卫**：本节仅在当前会话可用 `link` / `search` / `status` / `clear` 这组 MCP 工具时生效。若工具列表中没有它们，**完全忽略本节**。
 
 ## search 不是"另一个 grep"
 
@@ -8,7 +8,14 @@
 1. **语义检索**：按*意图*找代码（稠密向量 + BM25 混合），不知道确切函数名也能命中。
 2. **调用图上下文**：每个命中附带 `↖谁调用` / `↗调用谁` + 函数签名 + 文件位置。
 
-**实测：search 平均节省 77% token**（只用 Read 的 23%），覆盖率 83%。
+**实测：search 平均节省 ~70% token**，调用链/影响面 grep 无法给出。
+
+## 前提：先 link
+
+向量检索的数据在云端（按"仓库:保护分支"预先索引）。用 search 的向量能力前，先对当前仓库 `link` 一次（会话级）：
+- `link` 会绑定云端 collection 并建立/增量更新本地图索引。
+- 不带 branch 调用 → 列出该仓库在云端的可链接保护分支，选一个再 link。
+- 未 link 时 search 退化为**仅本地图**（调用图/影响面仍可用），向量结果缺失时先 link。
 
 ## 三种模式，各司其职
 
@@ -16,20 +23,19 @@
 |------|-------|------|
 | `both`（默认） | 探索流程、理解子系统 | "how does auth work" |
 | `vector` | 找具体实现、搜概念 | "find the User model" |
-| `graph` | 追踪调用关系、影响面 | "who calls sendEmail" |
-
-默认使用 `both`。若只关心"谁调用 X"这类结构问题，切到 `graph` 更快更省 token。
+| `graph` | 追踪调用关系、影响面、死代码 | "who calls sendEmail" |
 
 ## 优先用 search 的场景
 - **理解陌生代码/流程**：search 拿到 file:line + 调用链，替代十几次盲读
 - **重构前评估影响面**：search 目标符号 → 看调用者列表 → 判断波及谁。**动手改之前必做**
 - **Bug 根因定位**：search 症状/报错 → 顺调用链跨文件追到根因
+- **死代码/入口排查**：`↖0`（无调用者）/入口标记直接给出
 - **找现有模式/约定**：加功能前 search 类似实现，照着写
 
 ## 不要用 search 的场景
 - **已知精确文件路径** → 直接 Read 定点区间
 - **已知精确符号名** → grep（更快、零成本）
-- **非代码文件**（YAML/JSON/Markdown/配置）→ Read/grep
+- **非代码文件**（YAML/JSON/Markdown/配置/锁文件）→ Read/grep
 - **要完整文件内容** → 直接 Read
 
 ## 关键用法
@@ -38,7 +44,7 @@
 2. **只 Read 真正需要的区间**（offset/limit），不要整文件通读
 3. 首轮不准就换更聚焦的 query 再搜；一个概念一条 query
 4. search 无结果 → **立刻回退** grep/read，不要死循环
-5. 未索引 → `index` 一次（之后增量自动更新）
+5. 未链接 → 先 `link`；纯调用图/影响面问题可直接 `mode: "graph"`
 
 ## 规模参考
 - 大仓库：优先 search（grep 噪声太多，向量检索更精准）

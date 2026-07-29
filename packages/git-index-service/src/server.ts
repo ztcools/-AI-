@@ -2,22 +2,25 @@ import * as http from 'http';
 import { GitIndexer } from './indexer.js';
 import { ConfigStore } from './config-store.js';
 import { Scheduler } from './scheduler.js';
-import { RepoSpec } from './config.js';
+import { RepoSpec, normalizeProtectedBranches } from './config.js';
 import { SshKeyManager } from './ssh-key.js';
+import { RepoManager } from './repo-manager.js';
 
 /**
  * Management HTTP API for the git index service. Framework-free. Enables CORS so
  * the PhiGent web UI can call it directly. Endpoints:
  *   GET  /health
- *   GET  /status                 overall status (schedule, repos, last runs)
+ *   GET  /status                 overall status (schedule, repos, per-branch last runs)
  *   GET  /repos                  list repos (tokens masked)
+ *   GET  /branches?name=<repo>   list remote branches of a repo (for /seeway-link pick-list)
  *   GET  /ssh-key                the service SSH deploy public key
- *   POST /repos                  add/replace a repo {name,url,branch,token?}
- *   PUT  /repos/:name            update a repo
+ *   POST /repos                  add/replace a repo {name,url,branch,protectedBranches?,token?}
+ *   PUT  /repos/:name            update a repo (protectedBranches: omitted = keep, [] = clear)
  *   DELETE /repos/:name          remove a repo
  *   PUT  /schedule               {dailyHour|null, intervalMs}
- *   POST /index                  index all now
- *   POST /index/:name            index one repo now
+ *   POST /index                  index all now (main + protected branches)
+ *   POST /index/:name            index one repo now (all its branches)
+ *   POST /index/:name/:branch    index one branch of one repo now
  */
 export function startHttpServer(
     port: number,
@@ -25,11 +28,13 @@ export function startHttpServer(
     store: ConfigStore,
     scheduler: Scheduler,
     sshKeys: SshKeyManager,
+    repoManager: RepoManager,
 ): http.Server {
     const maskRepo = (r: RepoSpec) => ({
         name: r.name,
         url: r.url,
         branch: r.branch,
+        protectedBranches: r.protectedBranches || [],
         hasToken: !!r.token,
         // token → https clone/pull; no token → ssh with the service deploy key
         auth: r.token ? 'https' : 'ssh',
@@ -69,14 +74,17 @@ export function startHttpServer(
             },
             repos: store.getRepos().map(r => ({
                 ...maskRepo(r),
-                lastRun: indexer.getStatus(r.name) || null,
+                // Per-branch last-run map: { "<branch>": RepoRunStatus, ... }
+                lastRuns: indexer.getStatus(r.name),
             })),
         };
     };
 
     const server = http.createServer(async (req, res) => {
         const method = req.method || 'GET';
-        const url = (req.url || '/').split('?')[0];
+        const rawUrl = req.url || '/';
+        const url = rawUrl.split('?')[0];
+        const query = new URLSearchParams(rawUrl.includes('?') ? rawUrl.split('?')[1] : '');
 
         if (method === 'OPTIONS') return send(res, 204, {});
 
@@ -90,6 +98,20 @@ export function startHttpServer(
             if (method === 'GET' && url === '/repos') {
                 return send(res, 200, { repos: store.getRepos().map(maskRepo) });
             }
+            if (method === 'GET' && url === '/branches') {
+                const name = query.get('name') || '';
+                if (!name) return send(res, 400, { error: 'name query param is required' });
+                const repo = store.getRepo(name);
+                if (!repo) return send(res, 404, { error: `repo '${name}' not found` });
+                try {
+                    const branches = repoManager.listRemoteBranches(repo);
+                    return send(res, 200, { repo: name, branches: branches.map(b => ({ name: b })) });
+                } catch (e: any) {
+                    const msg = e?.message || String(e);
+                    console.warn(`[Server] ls-remote failed for '${name}': ${msg}`);
+                    return send(res, 502, { error: 'failed to list remote branches', message: msg });
+                }
+            }
             if (method === 'GET' && url === '/ssh-key') {
                 return send(res, 200, { publicKey: sshKeys.getPublicKey() });
             }
@@ -98,10 +120,12 @@ export function startHttpServer(
                 if (!body || !body.url || !body.name) {
                     return send(res, 400, { error: 'name and url are required' });
                 }
+                const branch = body.branch ? String(body.branch) : 'main';
                 const repo: RepoSpec = {
                     name: String(body.name),
                     url: String(body.url),
-                    branch: body.branch ? String(body.branch) : 'main',
+                    branch,
+                    protectedBranches: normalizeProtectedBranches(body.protectedBranches, branch),
                     token: body.token ? String(body.token) : undefined,
                 };
                 store.upsertRepo(repo);
@@ -115,10 +139,15 @@ export function startHttpServer(
                     if (!existing) return send(res, 404, { error: 'repo not found' });
                     const body = await readBody(req);
                     if (!body) return send(res, 400, { error: 'invalid body' });
+                    const newBranch = body.branch ? String(body.branch) : existing.branch;
                     const updated: RepoSpec = {
                         name: existing.name,
                         url: body.url ? String(body.url) : existing.url,
-                        branch: body.branch ? String(body.branch) : existing.branch,
+                        branch: newBranch,
+                        // Omitted → keep; explicit (array or csv) → replace (may be empty).
+                        protectedBranches: body.protectedBranches === undefined
+                            ? (existing.protectedBranches || [])
+                            : normalizeProtectedBranches(body.protectedBranches, newBranch),
                         // Empty string clears the token; omitted keeps the old one.
                         token: body.token === undefined ? existing.token : (body.token ? String(body.token) : undefined),
                     };
@@ -149,10 +178,19 @@ export function startHttpServer(
                 void indexer.indexAll();
                 return send(res, 202, { status: 'started' });
             }
+            // /index/:name or /index/:name/:branch
             const indexMatch = url.match(/^\/index\/(.+)$/);
             if (method === 'POST' && indexMatch) {
-                const name = decodeURIComponent(indexMatch[1]);
+                const parts = indexMatch[1].split('/').map(decodeURIComponent);
+                const name = parts[0];
+                const branch = parts[1];
                 if (indexer.isRunning()) return send(res, 409, { error: 'indexing already in progress' });
+                if (branch) {
+                    void indexer.indexOneBranch(name, branch).then(r => {
+                        if (r === null) console.warn(`[Server] index-now: repo '${name}' not found`);
+                    });
+                    return send(res, 202, { status: 'started', repo: name, branch });
+                }
                 void indexer.indexOneByName(name).then(r => {
                     if (r === null) console.warn(`[Server] index-now: repo '${name}' not found`);
                 });

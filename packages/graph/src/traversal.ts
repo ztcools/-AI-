@@ -198,6 +198,20 @@ export class GraphTraverser {
 
   // ── Callers / Callees ───────────────────────────────────────────
 
+  /**
+   * Call-like edges for caller/callee traversal.
+   * True `calls` edges always win. Only when a node has NO calls edges in this
+   * direction do we fall back to `references`/`instantiates` (still a usage
+   * relationship). `imports` are never treated as calls — an import is a static
+   * module dependency, not an invocation, and including it flooded the call
+   * graph with `./module.js` module-node noise.
+   */
+  private callLikeEdges(nodeId: number, direction: 'incoming' | 'outgoing'): GraphEdge[] {
+    const calls = this.getAdjacentEdges(nodeId, direction, ['calls']);
+    if (calls.length > 0) return calls;
+    return this.getAdjacentEdges(nodeId, direction, ['references', 'instantiates']);
+  }
+
   getCallers(nodeId: number, maxDepth: number = 1): Array<{ node: GraphNode; edge: GraphEdge }> {
     const result: Array<{ node: GraphNode; edge: GraphEdge }> = [];
     const visited = new Set<number>();
@@ -216,7 +230,7 @@ export class GraphTraverser {
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
 
-    const incoming = this.getAdjacentEdges(nodeId, 'incoming', ['calls', 'references', 'imports', 'instantiates']);
+    const incoming = this.callLikeEdges(nodeId, 'incoming');
     if (incoming.length === 0) return;
 
     const sourceIds = incoming.map(e => e.sourceId);
@@ -249,7 +263,7 @@ export class GraphTraverser {
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
 
-    const outgoing = this.getAdjacentEdges(nodeId, 'outgoing', ['calls', 'references', 'imports', 'instantiates']);
+    const outgoing = this.callLikeEdges(nodeId, 'outgoing');
     if (outgoing.length === 0) return;
 
     const targetIds = outgoing.map(e => e.targetId);
@@ -426,9 +440,10 @@ export class GraphTraverser {
       }
     }
 
-    // Get all incoming edges (things that depend on this), excluding contains
-    const incoming = this.getAdjacentEdges(nodeId, 'incoming')
-      .filter(e => e.kind !== 'contains');
+    // Impact = things that truly depend on this node. Use call-like edges
+    // (calls, falling back to references/instantiates) — NOT imports, which are
+    // static module deps and would inflate the impact radius with module noise.
+    const incoming = this.callLikeEdges(nodeId, 'incoming');
     if (incoming.length === 0) return;
 
     const sources = this.store.getNodesById(incoming.map(e => e.sourceId));

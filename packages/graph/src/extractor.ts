@@ -21,6 +21,9 @@ import {
 
 // Lazy-load language parsers with fallback — any single parser failure
 // won't prevent the module from loading other languages.
+// tree-sitter 0.25+ exports {name, language, nodeTypeInfo} wrapper module;
+// setLanguage() accepts the wrapper directly (both 0.21.x and 0.25.x paths work).
+// TypeScript has two grammars — extract the .typescript sub-grammar.
 function loadParser(name: string): any {
   try {
     switch (name) {
@@ -183,6 +186,63 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
   },
 };
 
+// ── Method-name blacklist ─────────────────────────────────────────────
+// These prototype / built-in method names should never generate
+// unresolved cross-file references.  Skipping them at the extractor
+// level cuts >60 % of noise refs and keeps resolution fast.
+
+const METHOD_BLACKLIST = new Set([
+  // String.prototype
+  'substring', 'substr', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
+  'startsWith', 'endsWith', 'includes', 'indexOf', 'lastIndexOf',
+  'toLowerCase', 'toUpperCase', 'toLocaleLowerCase', 'toLocaleUpperCase',
+  'charAt', 'charCodeAt', 'codePointAt', 'at',
+  'padStart', 'padEnd', 'repeat', 'replace', 'replaceAll',
+  'slice', 'split', 'concat', 'match', 'matchAll', 'search',
+  'localeCompare', 'normalize',
+  // Array.prototype
+  'push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse',
+  'map', 'filter', 'reduce', 'reduceRight', 'forEach', 'every', 'some',
+  'find', 'findIndex', 'findLast', 'findLastIndex',
+  'flat', 'flatMap', 'join', 'fill', 'copyWithin',
+  'entries', 'keys', 'values',
+  // Object.prototype
+  'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable',
+  'toString', 'valueOf', 'toLocaleString',
+  // Number.prototype
+  'toFixed', 'toExponential', 'toPrecision',
+  // Promise.prototype
+  'then', 'catch', 'finally',
+  // RegExp.prototype
+  'test', 'exec', 'compile',
+]);
+
+/**
+ * Heuristic to decide whether a method-call name is worth tracking as an
+ * unresolved cross-file reference.  Single-word verbs and common property
+ * names (add, get, set, queue, nodes, …) are almost always local-variable
+ * or prototype calls that will never resolve; tracking them accounts for
+ * ~60 % of unresolved refs and the bulk of resolution wall time.
+ *
+ * Keep: multi-word camelCase / PascalCase identifiers that are more likely
+ * to match a real cross-file definition (getNodesById, findFiles, …).
+ */
+function isLikelyCrossFileReference(name: string): boolean {
+  // Already blacklisted prototype/builtin methods — never track
+  if (METHOD_BLACKLIST.has(name)) return false;
+  // camelCase or PascalCase with an internal capital → almost certainly a real
+  // user symbol (toJson, getAdapter, handleHTTPRequest, ServeHTTP). Always track
+  // these regardless of length — the earlier length rule was dropping toJson,
+  // read, write etc. and silently losing Java/Go call edges.
+  if (/[a-z][A-Z]/.test(name) || /^[A-Z][a-z]+[A-Z]/.test(name)) return true;
+  // Single-word all-lowercase — usually a local/builtin, but methods in many
+  // languages are lowercase (Go write/read, Python helpers). Track if ≥4 chars.
+  if (/^[a-z]+$/.test(name)) return name.length >= 4;
+  // Single uppercase word (Set, Map, Promise) — built-in
+  if (/^[A-Z][a-z]*$/.test(name)) return false;
+  return true;
+}
+
 // ── Extraction result ──────────────────────────────────────────────
 
 /** Legacy shape — kept for backward compatibility. Newly added unresolvedRefs. */
@@ -244,10 +304,27 @@ export class GraphExtractor {
       return { nodes: [], edges: [], unresolvedRefs: [] };
     }
 
+    // Try parse with shared parser; retry with fresh instance on WASM memory error
+    let tree: Parser.Tree;
     try {
       this.parser.setLanguage(config.parser);
-      const tree = this.parser.parse(source);
+      tree = this.parser.parse(source);
+    } catch (parseError: any) {
+      // tree-sitter WASM may exhaust memory on large files or under concurrency.
+      // A fresh Parser gets a clean WASM heap — retry once before giving up.
+      try {
+        const freshParser = new Parser();
+        freshParser.setLanguage(config.parser);
+        tree = freshParser.parse(source);
+      } catch (retryError: any) {
+        console.warn(
+          `[GraphExtractor] Failed to parse ${ctx.filePath} (${(source.length / 1024).toFixed(0)}KB): ${retryError.message}`,
+        );
+        return { nodes: [], edges: [], unresolvedRefs: [] };
+      }
+    }
 
+    try {
       const nodes: Omit<GraphNode, 'id'>[] = [];
       const edges: Omit<GraphEdge, 'id'>[] = [];
       const registry = new Map<string, NameEntry>();
@@ -331,6 +408,7 @@ export class GraphExtractor {
       '.js': 'javascript',
       '.jsx': 'javascript',
       '.mjs': 'javascript',
+      '.cjs': 'javascript',
       '.ts': 'typescript',
       '.tsx': 'typescript',
       '.py': 'python',
@@ -339,7 +417,11 @@ export class GraphExtractor {
       '.c': 'cpp',
       '.h': 'cpp',
       '.hpp': 'cpp',
+      '.hh': 'cpp',
       '.cc': 'cpp',
+      '.cxx': 'cpp',
+      '.hxx': 'cpp',
+      '.inl': 'cpp',
       '.go': 'go',
       '.rs': 'rust',
       '.cs': 'csharp',
@@ -690,36 +772,40 @@ export class GraphExtractor {
       if (callName) {
         const entry = registry.get(callName);
         if (entry) {
-          if (entry.nodeIndex !== currentDefIdx) {
-            if (entry.importModule) {
-              // Imported function call: keep the IMPORTS edge, AND also produce
-              // an unresolved ref so the reference resolver can create a CALLS
-              // edge to the actual target function in the imported file.
-              edges.push({
-                project: ctx.project,
-                sourceId: currentDefIdx,
-                targetId: entry.nodeIndex,
-                kind: 'imports',
-                type: 'imports' as GraphEdgeType,
-                line: callLine,
-                column: callCol,
-                provenance: 'tree-sitter',
-                properties: { importModule: entry.importModule },
-              });
-            }
-            // Always create unresolved reference for cross-file resolution
-            unresolvedRefs.push({
-              fromNodeId: currentDefIdx,
-              referenceName: callName,
-              referenceKind: 'calls' as GraphEdgeKind,
+          // Overloads share one registry name (toJson ×8). If the single registry
+          // entry happens to be THIS definition, we'd skip the call entirely and
+          // lose the edge to the sibling overload. Emit a ref unless the entry is
+          // a DIFFERENT node we already handle below — the resolver's name-matcher
+          // will pick the right overload.
+          const isSelf = entry.nodeIndex === currentDefIdx;
+          if (!isSelf && entry.importModule) {
+            // Imported function call: keep the IMPORTS edge, AND also produce
+            // an unresolved ref so the reference resolver can create a CALLS
+            // edge to the actual target function in the imported file.
+            edges.push({
+              project: ctx.project,
+              sourceId: currentDefIdx,
+              targetId: entry.nodeIndex,
+              kind: 'imports',
+              type: 'imports' as GraphEdgeType,
               line: callLine,
               column: callCol,
-              filePath: ctx.filePath,
-              language,
+              provenance: 'tree-sitter',
+              properties: { importModule: entry.importModule },
             });
           }
-        } else {
-          // Call to something not in this file → unresolved reference
+          // Always create unresolved reference for cross-file/overload resolution
+          unresolvedRefs.push({
+            fromNodeId: currentDefIdx,
+            referenceName: callName,
+            referenceKind: 'calls' as GraphEdgeKind,
+            line: callLine,
+            column: callCol,
+            filePath: ctx.filePath,
+            language,
+          });
+        } else if (isLikelyCrossFileReference(callName)) {
+          // Call to something not in this file — only track if likely cross-file
           unresolvedRefs.push({
             fromNodeId: currentDefIdx,
             referenceName: callName,
@@ -734,7 +820,7 @@ export class GraphExtractor {
 
       // Handle method calls (obj.method())
       const methodCall = this.extractMethodCall(node, source, config);
-      if (methodCall && currentDefIdx !== undefined) {
+      if (methodCall && currentDefIdx !== undefined && !METHOD_BLACKLIST.has(methodCall)) {
         const entry = registry.get(methodCall);
         if (entry) {
           if (entry.importModule) {
@@ -752,22 +838,21 @@ export class GraphExtractor {
                 properties: { callType: 'method', importModule: entry.importModule },
               });
             }
-          } else {
-            // Method call → unresolved reference
-            if (entry.nodeIndex !== currentDefIdx) {
-              unresolvedRefs.push({
-                fromNodeId: currentDefIdx,
-                referenceName: methodCall,
-                referenceKind: 'calls' as GraphEdgeKind,
-                line: callLine,
-                column: callCol,
-                filePath: ctx.filePath,
-                language,
-              });
-            }
+          } else if (entry.nodeIndex !== currentDefIdx) {
+            // Method call matching a local symbol → unresolved reference
+            unresolvedRefs.push({
+              fromNodeId: currentDefIdx,
+              referenceName: methodCall,
+              referenceKind: 'calls' as GraphEdgeKind,
+              line: callLine,
+              column: callCol,
+              filePath: ctx.filePath,
+              language,
+            });
           }
-        } else {
-          // Unresolved method call
+        } else if (isLikelyCrossFileReference(methodCall)) {
+          // Method call not in local registry. Only track as unresolved ref
+          // if the name looks like a real cross-file candidate.
           unresolvedRefs.push({
             fromNodeId: currentDefIdx,
             referenceName: methodCall,
@@ -830,8 +915,15 @@ export class GraphExtractor {
   private extractCallName(
     node: Parser.SyntaxNode,
     source: string,
-    config: LanguageConfig,
+    _config: LanguageConfig,
   ): string | null {
+    // Java: method_invocation / object_creation_expression expose the callee in a
+    // `name` field (no `function` field) — prefer it over the identifier fallback.
+    const nameChild = node.childForFieldName?.('name');
+    if (nameChild && (node.type === 'method_invocation' || node.type === 'object_creation_expression')) {
+      return source.slice(nameChild.startIndex, nameChild.endIndex);
+    }
+
     // Try 'function' field first
     const funcChild = node.childForFieldName?.('function');
     if (funcChild) {
@@ -839,20 +931,24 @@ export class GraphExtractor {
       if (funcChild.type === 'identifier') {
         return source.slice(funcChild.startIndex, funcChild.endIndex);
       }
-      // For member expressions: obj.method → extract the method name
+      // For member expressions: prefer the method/property name.
+      // tree-sitter 0.25: children are 'this'/'super'/'property_identifier',
+      // not plain 'identifier'. Search property_identifier first.
+      const propId = this.findChildByType(funcChild, 'property_identifier');
+      if (propId) {
+        return source.slice(propId.startIndex, propId.endIndex);
+      }
       const id = this.findChildByType(funcChild, 'identifier');
       if (id) {
         return source.slice(id.startIndex, id.endIndex);
       }
+      return null;
     }
 
-    // Fallback: first identifier child
+    // Fallback: no function field — search for first identifier child
+    // (handles languages where call_expression has no named 'function' field)
     const id = this.findChildByType(node, 'identifier');
-    if (id) {
-      return source.slice(id.startIndex, id.endIndex);
-    }
-
-    return null;
+    return id ? source.slice(id.startIndex, id.endIndex) : null;
   }
 
   private extractMethodCall(
@@ -860,12 +956,49 @@ export class GraphExtractor {
     source: string,
     config: LanguageConfig,
   ): string | null {
-    // Look for member_expression where the call is on a method
+    // Java: method_invocation carries the callee in a `name` field (no `function`
+    // field). `this.getAdapter(c)` / `obj.write(w)` / `toJson(s,t)` all expose
+    // `name` — use it directly.
+    const nameChild = node.childForFieldName?.('name');
+    if (nameChild && (node.type === 'method_invocation' || node.type === 'object_creation_expression')) {
+      return source.slice(nameChild.startIndex, nameChild.endIndex);
+    }
+
     const funcChild = node.childForFieldName?.('function');
-    if (funcChild && funcChild.type === 'member_expression') {
+    if (!funcChild) return null;
+
+    // JS/TS / Java / C# etc.: call's function is a member_expression → take its property.
+    if (funcChild.type === 'member_expression') {
       const property = funcChild.childForFieldName?.('property');
       if (property) {
         return source.slice(property.startIndex, property.endIndex);
+      }
+    }
+
+    // Python (`attribute`: self.x), Go (`selector_expression`: e.x),
+    // C/C++ (`field_expression`: ptr->x), C++/Java (`scoped_identifier`) —
+    // all "receiver.method" shapes. Take the method name: the explicit
+    // attribute/field/name field, else the last identifier-ish child.
+    if (
+      funcChild.type === 'attribute' ||
+      funcChild.type === 'selector_expression' ||
+      funcChild.type === 'field_expression' ||
+      funcChild.type === 'scoped_identifier' ||
+      funcChild.type === 'qualified_identifier' // C++ ns::method
+    ) {
+      const attrField =
+        funcChild.childForFieldName?.('attribute') ||
+        funcChild.childForFieldName?.('field') ||
+        funcChild.childForFieldName?.('name');
+      if (attrField) {
+        return source.slice(attrField.startIndex, attrField.endIndex);
+      }
+      // Fallback: last identifier-ish child of the receiver.method node.
+      for (let i = funcChild.childCount - 1; i >= 0; i--) {
+        const c = funcChild.child(i)!;
+        if (c.type === 'identifier' || c.type === 'property_identifier' || c.type === 'field_identifier') {
+          return source.slice(c.startIndex, c.endIndex);
+        }
       }
     }
     return null;

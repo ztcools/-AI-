@@ -1,5 +1,5 @@
 ---
-description: Seeway · 语义 + 调用图检索代码库
+description: Seeway · 语义 + 调用图检索代码库（需先 link）
 argument-hint: "<自然语言查询>（在当前工作区检索）"
 allowed-tools: mcp__claude-context__search
 ---
@@ -7,7 +7,7 @@ allowed-tools: mcp__claude-context__search
 
 - query 参数：$ARGUMENTS
 - path **省略**（默认当前工作区）。若查询里明确带了某个仓库路径，则把该路径作为 path、其余作为 query。
-- mode 默认为 `both`（向量+图）。需要时显式指定：`mode: "vector"`（纯语义）、`mode: "graph"`（纯调用图分析）
-- 拿到结果后：**先 search 定位 → 再 Read 定点行区间**。search 已返回签名/出入度/调用链，能判断"在哪"和"谁在用"后再读代码。**不要通读文件**。
+- mode 默认为 `both`（向量+图）。需要时显式指定：`mode: "vector"`（纯语义）、`mode: "graph"`（纯调用图分析）。
+- 拿到结果后：**先 search 定位 → 再 Read 定点行区间**。search 已返回签名/出入度/调用链，据此判断"在哪""谁在用"后再读代码，**不要通读文件**。
 - 结果不理想就换更聚焦的 query 再搜一次，或切换 mode。
-- 若提示未索引，提示用户先执行 `/seeway-index`。
+- 若提示未链接：当前仓库尚未 link，向量检索不可用（可能仍返回了图结果）。提示用户先 `/seeway-link` 链接云端索引；纯调用图/影响面问题可继续用 `mode: "graph"`。

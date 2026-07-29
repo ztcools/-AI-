@@ -121,8 +121,11 @@ class StoreResolutionContext implements ResolutionContext {
   }
 
   getNodesByName(name: string): GraphNode[] {
-    // No cache here — the orchestrator caches this at a higher level
     return this.store.getNodesByName(this.project, name);
+  }
+
+  getNodesBySuffix(name: string): GraphNode[] {
+    return this.store.getNodesBySuffix(this.project, name);
   }
 
   getNodesByQualifiedName(qn: string): GraphNode[] {
@@ -257,6 +260,8 @@ export class ReferenceResolver {
 
   // Tracking for batch operations
   private nodeCache: Map<number, GraphNode> = new Map();
+  /** Names that failed all strategies — persist across batches. */
+  private unresolvableCache: Set<string> = new Set();
   private stats: ResolutionResult['stats'] = {
     total: 0,
     resolved: 0,
@@ -265,7 +270,7 @@ export class ReferenceResolver {
   };
 
   /** Default batch size for resolveAndPersistBatched. */
-  private static DEFAULT_BATCH_SIZE = 500;
+  private static DEFAULT_BATCH_SIZE = 50;
 
   constructor(projectRoot: string, store: GraphStore, project?: string) {
     this.projectRoot = path.resolve(projectRoot);
@@ -385,6 +390,13 @@ export class ReferenceResolver {
         const refName = ref.referenceName;
         const language = ref.language || 'javascript';
 
+        // Step 0: Unresolvable cache — skip names already known to fail
+        if (this.unresolvableCache.has(refName)) {
+          unresolved.push(ref);
+          incrementStat(byMethod, 'unresolvable-cache');
+          continue;
+        }
+
         // Step 1: Pre-filter — skip if name doesn't exist at all
         if (this.knownNames && !this.knownNames.has(refName)) {
           // For dotted names, try the base name/member
@@ -456,7 +468,8 @@ export class ReferenceResolver {
           continue;
         }
 
-        // Unresolved after all strategies
+        // Unresolved after all strategies — cache name to skip peers
+        this.unresolvableCache.add(refName);
         unresolved.push(ref);
         incrementStat(byMethod, 'unresolved');
       }
@@ -644,12 +657,16 @@ export class ReferenceResolver {
       unresolved: 0,
       byMethod: {},
     };
+    this.unresolvableCache.clear();
   }
 
   // ── Private helpers ──────────────────────────────────────────────────
 
   /**
    * Get import mappings for a file, with caching.
+   * Prefers store-resident import nodes (fast, already extracted in Phase 1);
+   * falls back to regex-based source parsing only when the store has no
+   * import nodes for the file (e.g. cold start or non-AST languages).
    */
   private getImportMappings(
     filePath: string,
@@ -660,6 +677,31 @@ export class ReferenceResolver {
     let cached = this.importMappingsCache.get(cacheKey);
     if (cached) return cached;
 
+    // Fast path: build mappings from store-resident import nodes.
+    // Avoids re-reading + re-parsing the source (~99 % of cases).
+    const fileNodes = ctx.getNodesInFile(filePath);
+    const importNodes = fileNodes.filter((n) => n.kind === 'import');
+    if (importNodes.length > 0) {
+      const mappings: ImportMapping[] = [];
+      for (const node of importNodes) {
+        const importPath = (node.properties?.importPath as string) || node.name;
+        const importedName = node.properties?.importedName as string | undefined;
+        if (importedName) {
+          const mapping: ImportMapping = {
+            localName: importedName,
+            modulePath: importPath,
+          };
+          mapping.resolvedFile = this.resolveModuleToFile(
+            filePath, importPath, language, ctx,
+          );
+          mappings.push(mapping);
+        }
+      }
+      this.importMappingsCache.set(cacheKey, mappings);
+      return mappings;
+    }
+
+    // Slow path: regex-based extraction (cold start, non-AST languages).
     const content = ctx.readFile(filePath);
     if (!content) {
       this.importMappingsCache.set(cacheKey, []);
@@ -667,11 +709,11 @@ export class ReferenceResolver {
     }
 
     const mappings = extractImportMappings(filePath, content, language);
-
-    // Resolve module paths to absolute filesystem paths
     for (const mapping of mappings) {
       if (!mapping.resolvedFile) {
-        mapping.resolvedFile = this.resolveModuleToFile(filePath, mapping.modulePath, language, ctx);
+        mapping.resolvedFile = this.resolveModuleToFile(
+          filePath, mapping.modulePath, language, ctx,
+        );
       }
     }
 

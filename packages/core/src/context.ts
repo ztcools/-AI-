@@ -22,7 +22,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execSync } from 'child_process';
-import { FileSynchronizer } from './sync/synchronizer';
 import { getRepoIdentity } from './utils/git-identity';
 import { IgnorePatternManager } from './utils/ignore-patterns';
 import {
@@ -331,7 +330,6 @@ export class Context {
     private ignorePatternManager: IgnorePatternManager;
     private collectionNameOverride?: string;
     private warnedOverrideSanitization = new Set<string>();
-    private synchronizers = new Map<string, FileSynchronizer>();
 
     /** Cache for getRepoIdentity to avoid repeated git execSync calls in the hot path. */
     private repoIdentityCache: Map<string, string> = new Map();
@@ -475,19 +473,6 @@ export class Context {
         return this.ignorePatternManager.getPatterns();
     }
 
-    /**
-     * Get synchronizers map
-     */
-    getSynchronizers(): Map<string, FileSynchronizer> {
-        return new Map(this.synchronizers);
-    }
-
-    /**
-     * Set synchronizer for a collection
-     */
-    setSynchronizer(collectionName: string, synchronizer: FileSynchronizer): void {
-        this.synchronizers.set(collectionName, synchronizer);
-    }
 
     async getLoadedIgnorePatterns(codebasePath: string): Promise<void> {
         await this.ignorePatternManager.loadForCodebase(codebasePath);
@@ -1193,373 +1178,6 @@ export class Context {
         };
     }
 
-    /**
-     * Merkle-based incremental indexing — the developer-side replacement for
-     * `syncIndexByGit`. Compares the working tree's content hashes against the
-     * last Merkle snapshot (per dev+identity) and indexes only changed files.
-     *
-     * No git commit SHA is used — git reset, rebase, etc. are handled correctly
-     * because we track file content, not commit history.
-     *
-     * Writes to the dev-specific collection (`hcc_repo_branch_dev_hash`),
-     * never touches the shared root collection.
-     */
-    async syncIndexByMerkle(
-        codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void | Promise<void>,
-        additionalIgnorePatterns: string[] = [],
-        additionalSupportedExtensions: string[] = [],
-        requestSplitter?: Splitter,
-        signal?: AbortSignal,
-    ): Promise<{
-        mode: 'full' | 'delta' | 'incremental' | 'up-to-date';
-        indexedFiles: number;
-        totalChunks: number;
-        added: number;
-        modified: number;
-        removed: number;
-        status: 'completed' | 'limit_reached';
-    }> {
-        const devCollectionName = this.getDevCollectionName(codebasePath);
-        const splitter = requestSplitter || this.codeSplitter;
-        const ignorePatterns = await this.ignorePatternManager.loadForCodebase(codebasePath, additionalIgnorePatterns);
-        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
-
-        // Dev-aware identity for the Merkle snapshot, so each dev gets their own.
-        const { getDevRepoIdentity } = require('./utils/dev-fingerprint');
-        const devIdentity = getDevRepoIdentity(codebasePath);
-
-        // Ensure collection exists (creates if first time for this dev+branch).
-        await this.prepareDevCollection(codebasePath, devIdentity);
-
-        // Get or create the dev-aware FileSynchronizer.
-        let synchronizer = this.synchronizers.get(devCollectionName);
-        const isFirstIndex = !synchronizer;
-
-        if (!synchronizer) {
-            synchronizer = new FileSynchronizer(
-                codebasePath,
-                ignorePatterns,
-                supportedExtensions,
-                this.supportedFilenames,
-                devIdentity, // dev-aware identity for Merkle snapshot
-            );
-            await synchronizer.initialize();
-            this.synchronizers.set(devCollectionName, synchronizer);
-        }
-
-        progressCallback?.({ phase: 'Checking for file changes (Merkle)...', current: 0, total: 100, percentage: 0 });
-
-        // Merkle comparison: what changed in the working tree?
-        const { added: rawAdded, removed: rawRemoved, modified: rawModified } = await synchronizer.checkForChanges();
-        const totalChanges = rawAdded.length + rawRemoved.length + rawModified.length;
-
-        if (totalChanges === 0 && !isFirstIndex) {
-            progressCallback?.({ phase: 'Already up to date', current: 100, total: 100, percentage: 100 });
-            console.log('[Context] ✅ No file changes detected (Merkle). Index is up to date.');
-            return {
-                mode: 'up-to-date',
-                indexedFiles: 0,
-                totalChunks: 0,
-                added: 0,
-                modified: 0,
-                removed: 0,
-                status: 'completed',
-            };
-        }
-
-        // ── Delta mode: on first index, check if a shared root (main) index exists.
-        // If it does, only index files that differ from root — the rest come from
-        // the root layer at search time. Masks ensure the dev's version always wins.
-        let added = rawAdded;
-        let modified = rawModified;
-        let removed = rawRemoved;
-        let isDeltaIndex = false;
-        /** Files that this dev's collection owns (changed vs root). Empty → full-index mode. */
-        let devOwnedFiles: string[] = [];
-
-        if (isFirstIndex) {
-            // Check if root collection exists (shared server-side index on main/master)
-            let rootExists = false;
-            try {
-                const rootCollectionName = this.getRootCollectionName(codebasePath);
-                rootExists = await this.vectorDatabase.hasCollection(rootCollectionName).catch(() => false);
-            } catch { /* root check shouldn't block indexing */ }
-
-            if (rootExists) {
-                // Resolve the root branch name to diff the working tree against
-                const rootBranchesStr = String(envManager.get('GIT_ROOT_BRANCHES') || 'main,master');
-                const rootBranchCandidates = rootBranchesStr.split(',').map(s => s.trim()).filter(Boolean);
-
-                let rootRef: string | null = null;
-                for (const branch of rootBranchCandidates) {
-                    try {
-                        execSync(`git -C "${codebasePath}" rev-parse --verify origin/${branch}`, {
-                            encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
-                        });
-                        rootRef = `origin/${branch}`;
-                        break;
-                    } catch {
-                        try {
-                            execSync(`git -C "${codebasePath}" rev-parse --verify ${branch}`, {
-                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
-                            });
-                            rootRef = branch;
-                            break;
-                        } catch { /* try next candidate */ }
-                    }
-                }
-
-                if (rootRef) {
-                    try {
-                        // Compute merge-base so we diff against the fork point, not the
-                        // potentially-diverged root tip — this captures only the dev's own work.
-                        let baseRef = rootRef;
-                        try {
-                            const mergeBase = execSync(`git -C "${codebasePath}" merge-base HEAD ${rootRef}`, {
-                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000,
-                            }).trim();
-                            if (mergeBase) baseRef = mergeBase;
-                        } catch { /* merge-base unavailable, diff against rootRef directly */ }
-
-                        // git diff --name-only gives files changed in working tree vs base.
-                        // --diff-filter=ACMR excludes deleted files (they don't exist in the
-                        // working tree and wouldn't be in the synchronizer's added list).
-                        const diffOutput = execSync(
-                            `git -C "${codebasePath}" diff --name-only --diff-filter=ACMR ${baseRef}`,
-                            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
-                        );
-                        const gitChangedFiles = new Set(
-                            diffOutput.trim().split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/'))
-                        );
-
-                        if (gitChangedFiles.size > 0) {
-                            // Filter `added` to only files that actually differ from root.
-                            // Files NOT in gitChangedFiles are identical to root — they'll be
-                            // served from the root layer at search time (not indexed into dev).
-                            added = rawAdded.filter(f => gitChangedFiles.has(f));
-                            modified = rawModified.filter(f => gitChangedFiles.has(f));
-
-                            const skippedCount = rawAdded.length - added.length;
-                            if (skippedCount > 0) {
-                                console.log(`[Context] 🌿 Delta mode: root collection exists, skipping ${skippedCount} unchanged files (available from root layer)`);
-                            }
-                            devOwnedFiles = [...added, ...modified];
-                        } else {
-                            console.log('[Context] 🌿 No changes vs root — all results come from root layer');
-                            devOwnedFiles = [];
-                        }
-                        isDeltaIndex = true;
-                    } catch (diffErr: any) {
-                        console.warn(`[Context] ⚠️  git diff vs ${rootRef} failed (${diffErr.message}), falling back to full index`);
-                        // Fall through: added/modified stay as rawAdded/rawModified
-                    }
-                }
-            } else {
-                // No root collection exists — reject full local indexing to protect
-                // shared server resources. Only server-managed repos (with a root
-                // collection) can be indexed locally. Administrators can override
-                // this guard with LOCAL_FULL_INDEX_ENABLED=true.
-                const localFullIndexEnabled = String(envManager.get('LOCAL_FULL_INDEX_ENABLED') || '').trim().toLowerCase();
-                if (localFullIndexEnabled !== 'true') {
-                    throw new Error(
-                        `Local full indexing is disabled for repositories without a server-side root index. ` +
-                        `No shared root index was found for this repository. ` +
-                        `Only repositories managed by the server-side git-index-service can be indexed locally (delta mode). ` +
-                        `Please contact your administrator to add this repository to the server-side index, ` +
-                        `or set LOCAL_FULL_INDEX_ENABLED=true if you are authorized to create standalone indexes.`
-                    );
-                }
-                console.log('[Context] ⚠️  LOCAL_FULL_INDEX_ENABLED=true — proceeding with full local index (no root available).');
-            }
-        } else {
-            // ── Rebase/reset reconciliation ─────────────────────────────
-            // The Merkle approach tracks file CONTENTS, so file changes from
-            // rebase/reset are detected naturally. But devChangedFiles — the
-            // set of files this dev "owns" vs root — can become stale after
-            // a rebase: files that WERE different may now be identical to the
-            // new root, and files that newly diverge need to be added.
-            //
-            // We detect this by tracking the merge-base commit hash. When it
-            // changes, we recompute devChangedFiles from git diff and force
-            // re-index all previously-owned files (their delta status may have
-            // changed vs the new root).
-            let rebaseCnt = 0;
-            try {
-                const rootBranchesStr = String(envManager.get('GIT_ROOT_BRANCHES') || 'main,master');
-                const rootBranchCandidates = rootBranchesStr.split(',').map(s => s.trim()).filter(Boolean);
-                let rootRef: string | null = null;
-                for (const branch of rootBranchCandidates) {
-                    try {
-                        execSync(`git -C "${codebasePath}" rev-parse --verify origin/${branch}`, {
-                            encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
-                        });
-                        rootRef = `origin/${branch}`;
-                        break;
-                    } catch {
-                        try {
-                            execSync(`git -C "${codebasePath}" rev-parse --verify ${branch}`, {
-                                encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
-                            });
-                            rootRef = branch;
-                            break;
-                        } catch { /* try next */ }
-                    }
-                }
-                if (rootRef) {
-                    const mergeBase = execSync(`git -C "${codebasePath}" merge-base HEAD ${rootRef}`, {
-                        encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000,
-                    }).trim();
-                    const rebaseDetected = synchronizer.setLastMergeBase(mergeBase);
-                    if (rebaseDetected) {
-                        console.log(`[Context] 🔄 Rebase detected (merge-base changed). Recomputing dev-owned files.`);
-                        // Recompute devChangedFiles: which files differ from the new root?
-                        const diffOutput = execSync(
-                            `git -C "${codebasePath}" diff --name-only --diff-filter=ACMR ${mergeBase}`,
-                            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
-                        );
-                        const newChangedFiles = new Set(
-                            diffOutput.trim().split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/'))
-                        );
-                        // Old dev-owned files that became identical to root → remove from devChangedFiles
-                        // Old dev-owned files that are still different → keep, but force re-index
-                        const oldDevFiles = new Set(synchronizer.getDevChangedFiles());
-                        for (const f of oldDevFiles) {
-                            if (!newChangedFiles.has(f)) {
-                                removed.push(f);
-                                rebaseCnt++;
-                            }
-                        }
-                        // Files that newly diverge but Merkle didn't detect (content same on disk)
-                        for (const f of newChangedFiles) {
-                            if (!oldDevFiles.has(f) && !added.includes(f) && !modified.includes(f)) {
-                                modified.push(f);
-                                rebaseCnt++;
-                            }
-                        }
-                        // Update devOwnedFiles to the new reality
-                        devOwnedFiles = Array.from(newChangedFiles);
-                        console.log(`[Context] 🔄 Rebase reconciliation: ${rebaseCnt} files adjusted to match new root.`);
-                    }
-                }
-            } catch (rebaseErr: any) {
-                console.warn(`[Context] ⚠️  Rebase detection failed: ${rebaseErr.message}`);
-            }
-            // ── End rebase reconciliation ──────────────────────────────
-
-            // Subsequent index: update devChangedFiles to match what's actually indexed
-            const prevDevFiles = new Set(synchronizer.getDevChangedFiles());
-            isDeltaIndex = prevDevFiles.size > 0; // was previously delta-indexed
-            if (isDeltaIndex) {
-                // Remove deleted files from owned set, add newly changed ones
-                for (const f of removed) prevDevFiles.delete(f);
-                for (const f of added) prevDevFiles.add(f);
-                for (const f of modified) prevDevFiles.add(f);
-                // Only override if rebase didn't already set it
-                if (rebaseCnt === 0) {
-                    devOwnedFiles = Array.from(prevDevFiles);
-                } else {
-                    // Rebase already set devOwnedFiles; keep it
-                }
-            }
-        }
-
-        if (isFirstIndex) {
-            if (isDeltaIndex) {
-                console.log(`[Context] 🆕 First index for this dev+branch — delta mode (${added.length} changed files vs root, ${rawAdded.length - added.length} from root layer)`);
-            } else {
-                console.log('[Context] 🆕 First index for this dev+branch — full local index (LOCAL_FULL_INDEX_ENABLED=true, no root available).');
-            }
-        } else {
-            console.log(`[Context] 🔄 Merkle changes: +${rawAdded.length}/~${rawModified.length}/-${rawRemoved.length}, delta=${isDeltaIndex}`);
-        }
-
-        // Persist the dev-owned file list for search-time masking BEFORE indexing,
-        // so that even if indexing crashes, the next search uses the previous mask
-        // (stale is better than none — stale masks the same or fewer files, so root
-        // results may temporarily surface but dev results still win on RRF + dedup).
-        synchronizer.setDevChangedFiles(devOwnedFiles);
-
-        // Delete chunks for removed + modified files (batch query + batch delete).
-        await this.deleteFileChunksBatch(devCollectionName, [...removed, ...modified], signal);
-
-        // Index added + modified files.
-        const filesToIndex = [...added, ...modified].map(f => path.join(codebasePath, f));
-        let processedFiles = 0;
-        let totalChunks = 0;
-        let limitReached = false;
-
-        if (filesToIndex.length > 0 && !signal?.aborted) {
-            const result = await this.processFileList(
-                filesToIndex,
-                codebasePath,
-                (filePath, fileIndex, totalFiles) => {
-                    const pct = Math.round((fileIndex / totalFiles) * 100);
-                    progressCallback?.({ phase: `Indexing (${fileIndex}/${totalFiles})...`, current: fileIndex, total: totalFiles, percentage: pct });
-                },
-                splitter,
-                signal,
-                devCollectionName, // write directly to dev collection — no monkey-patching
-            );
-            processedFiles = result.processedFiles;
-            totalChunks = result.totalChunks;
-            limitReached = result.status === 'limit_reached';
-        }
-
-        // Mark the Merkle snapshot as clean now that chunk processing succeeded.
-        // If we crashed before this point, the dirty flag ensures the next sync
-        // treats all files as "added" instead of falsely reporting "up-to-date".
-        if (synchronizer) {
-            await synchronizer.markClean();
-        }
-
-        if (isFirstIndex) {
-            if (isDeltaIndex) {
-                console.log(`[Context] ✅ Dev-aware delta index complete: ${processedFiles} changed files, ${totalChunks} chunks (root provides ${rawAdded.length - added.length} unchanged files)`);
-            } else {
-                console.log(`[Context] ✅ Dev-aware first index complete: ${processedFiles} files, ${totalChunks} chunks`);
-            }
-        } else {
-            console.log(`[Context] ✅ Dev-aware Merkle sync complete: +${rawAdded.length}/~${rawModified.length}/-${rawRemoved.length}, ${processedFiles} files, ${totalChunks} chunks`);
-        }
-
-        return {
-            mode: isFirstIndex ? (isDeltaIndex ? 'delta' as const : 'full' as const) : 'incremental',
-            indexedFiles: processedFiles,
-            totalChunks,
-            added: rawAdded.length,
-            modified: rawModified.length,
-            removed: rawRemoved.length,
-            status: limitReached ? 'limit_reached' : 'completed',
-        };
-    }
-
-    /**
-     * Ensure the dev-specific collection exists. Creates it if this is the
-     * first time this developer indexes this branch.
-     */
-    private async prepareDevCollection(codebasePath: string, devIdentity: string): Promise<void> {
-        const collectionName = this.getCollectionNameForIdentity(devIdentity);
-        const exists = await this.vectorDatabase.hasCollection(collectionName);
-        if (exists) return;
-
-        const isHybrid = this.getIsHybrid();
-        const collectionType = isHybrid ? 'hybrid vector' : 'vector';
-        console.log(`[Context] 🔧 Creating ${collectionType} collection for dev: ${collectionName}`);
-
-        const dimension = this.embedding.getDimension() || await this.embedding.detectDimension();
-        this.knownDimension = dimension;
-
-        const repoUrl = getRemoteUrl(codebasePath);
-        const description = repoUrl ? `codebasePath:${devIdentity}` : `codebasePath:${devIdentity}`;
-
-        if (isHybrid) {
-            await this.vectorDatabase.createHybridCollection(collectionName, dimension, description);
-        } else {
-            await this.vectorDatabase.createCollection(collectionName, dimension, description);
-        }
-        console.log(`[Context] ✅ Dev collection ${collectionName} created (dim=${dimension})`);
-    }
 
     private async deleteFileChunks(collectionName: string, relativePath: string): Promise<void> {
         // Escape backslashes for Milvus query expression (Windows path compatibility)
@@ -1761,7 +1379,71 @@ export class Context {
         // Apply score cutoff (RRF scores are in ~0.001-0.01 range;
         // threshold is treated as a relative ratio against the top score).
         const filtered = this.applyScoreCutoff(deduped, threshold);
-        return filtered.slice(0, topK);
+        const contentDeduped = this.dedupNearDuplicateContent(filtered);
+        return this.applyFileDiversity(contentDeduped, topK);
+    }
+
+    /**
+     * Drop near-duplicate chunks across DIFFERENT files. Identical boilerplate
+     * (shared credential blocks, license headers, generated stubs) often ranks
+     * high in many files at once and crowds out genuinely distinct results.
+     * We fingerprint each chunk by its normalized content (whitespace/identifier
+     * collapsed) and keep only the highest-scored occurrence of each fingerprint.
+     */
+    private dedupNearDuplicateContent(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        const seen = new Set<string>();
+        const kept: SemanticSearchResult[] = [];
+        for (const r of results) {
+            const fp = this.contentFingerprint(r.content);
+            if (fp !== null && seen.has(fp)) continue;
+            if (fp !== null) seen.add(fp);
+            kept.push(r);
+        }
+        return kept;
+    }
+
+    /**
+     * Normalize a chunk to a dedup fingerprint: lowercase, collapse whitespace,
+     * strip digits/quoted values so trivially-templated blocks (env/credentials)
+     * hash together. Returns null for very short content (don't dedup snippets
+     * that are too small to be meaningful — avoids collapsing legitimate hits).
+     */
+    private contentFingerprint(content: string): string | null {
+        if (!content) return null;
+        // Normalize to a structural skeleton, then hash only the FIRST portion.
+        // Boilerplate blocks (credential/env headers, license stubs, generated
+        // prologues) share an identical opening; hashing a prefix lets us catch
+        // them even when the tail differs, without collapsing legitimately
+        // distinct chunks that merely end alike.
+        const skeleton = content
+            .replace(/"[^"]*"|'[^']*'/g, 'S')     // string literals → S
+            .replace(/\$\{[^}]*\}/g, 'V')          // ${...} interpolations → V
+            .replace(/\d+/g, 'N')                  // numbers → N
+            .replace(/[A-Za-z_$][A-Za-z0-9_$-]*/g, 'I') // identifiers → I
+            .replace(/\s+/g, '')                   // drop ALL whitespace
+            .toLowerCase();
+        if (skeleton.length < 60) return null;     // too small to safely dedup
+        const prefix = skeleton.slice(0, 200);     // shared-opening signature
+        return crypto.createHash('md5').update(prefix).digest('hex');
+    }
+
+    /**
+     * Cap how many chunks a single file can contribute, so one repetitive file
+     * (or several near-identical files) can't fill the whole topK. Keeps the
+     * result set diverse across the codebase.
+     */
+    private applyFileDiversity(results: SemanticSearchResult[], topK: number): SemanticSearchResult[] {
+        const perFileCap = Math.max(1, Math.ceil(topK / 4));
+        const perFile = new Map<string, number>();
+        const kept: SemanticSearchResult[] = [];
+        for (const r of results) {
+            const n = perFile.get(r.relativePath) || 0;
+            if (n >= perFileCap) continue;
+            perFile.set(r.relativePath, n + 1);
+            kept.push(r);
+            if (kept.length >= topK) break;
+        }
+        return kept;
     }
 
     /** Build a `relativePath not in [...]` expression to mask base-layer files. */
@@ -1889,9 +1571,6 @@ export class Context {
         } catch (error) {
             console.warn(`[Context] ⚠️ Failed to remove commit state during clear (non-fatal): ${error}`);
         }
-
-        // Delete snapshot file
-        await FileSynchronizer.deleteSnapshot(codebasePath);
 
         progressCallback?.({ phase: 'Index cleared', current: 100, total: 100, percentage: 100 });
         console.log('[Context] ✅ Index data cleaned');
@@ -2615,15 +2294,6 @@ export class Context {
         return embedding;
     }
 
-    /**
-     * Collection name for the current developer on the current branch.
-     * Identity = `url:branch:devFingerprint` → `hcc_repo_branch_dev_hash`.
-     */
-    getDevCollectionName(codebasePath: string): string {
-        // Late import avoids circular dependency (dev-fingerprint → git-identity)
-        const { getDevRepoIdentity } = require('./utils/dev-fingerprint');
-        return this.getCollectionNameForIdentity(getDevRepoIdentity(codebasePath));
-    }
 
     /**
      * Collection name for the shared root (main/master) branch.

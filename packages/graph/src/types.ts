@@ -466,6 +466,7 @@ export interface GraphStore {
   iterateNodesByKind(project: string, kind: GraphNodeKind): Iterable<GraphNode>;
   getNodesByFile(project: string, filePath: string): GraphNode[];
   getNodesByName(project: string, name: string): GraphNode[];
+  getNodesBySuffix(project: string, name: string): GraphNode[];
   getNodesByLowerName(project: string, lowerName: string): GraphNode[];
   getNodesByQualifiedNameExact(project: string, qn: string): GraphNode[];
   getNodesByIds(ids: number[]): Map<number, GraphNode>;

@@ -15,8 +15,7 @@
         "clean": "pnpm --recursive clean",
         "lint": "pnpm -r lint",
         "lint:fix": "pnpm -r run lint:fix",
-        "typecheck": "pnpm -r run typecheck",
-        "benchmark": "node scripts/build-benchmark.js"
+        "typecheck": "pnpm -r run typecheck"
     },
     "devDependencies": {
         "@types/node": "^20.0.0",

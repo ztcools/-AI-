@@ -134,8 +134,17 @@ export class InMemoryGraphBuffer {
           docstring?: string;
         },
     ): number {
-        const existing = this.nodeByQN.get(qualifiedName);
+        let qn = qualifiedName;
+        const existing = this.nodeByQN.get(qn);
         if (existing) {
+          // Same qualified name. If it's actually the SAME definition (same file,
+          // same start line — e.g. a node re-emitted by another pass), update in
+          // place ("src wins"). But if it's a DIFFERENT definition that merely
+          // shares the qualified name — method overloads (Gson.toJson ×8) or a
+          // same-named symbol in another file — overwriting would silently swallow
+          // nodes. Disambiguate the QN so both survive.
+          const sameDef = existing.filePath === filePath && existing.startLine === startLine;
+          if (sameDef) {
             existing.label = this.intern(label) as GraphNodeLabel;
             existing.name = name;
             existing.filePath = this.intern(filePath);
@@ -154,12 +163,14 @@ export class InMemoryGraphBuffer {
               existing.returnType = meta.returnType;
               existing.docstring = meta.docstring;
               if (meta.language) existing.language = meta.language as any;
-              // Update properties with language info
               if (!existing.properties) existing.properties = {};
               if (meta.language) existing.properties.language = meta.language;
             }
             this.invalidateSecondaryIndexes();
             return existing.id;
+          }
+          // Different definition sharing the QN — make this one unique.
+          qn = `${qualifiedName}@${filePath}:${startLine}`;
         }
 
         const id = this.nextId++;
@@ -170,7 +181,7 @@ export class InMemoryGraphBuffer {
             kind,
             label: kind,
             name,
-            qualifiedName,
+            qualifiedName: qn,
             filePath: this.intern(filePath),
             startLine,
             endLine,

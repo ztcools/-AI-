@@ -15,7 +15,24 @@ export interface RepoSpec {
     name: string;
     url: string;      // canonical origin URL — MUST match what developers use so the shared index lines up
     branch: string;   // main branch to keep authoritative (default resolved by RepoManager)
+    /** Extra protected branches to index alongside main (main itself not included). */
+    protectedBranches?: string[];
     token?: string;   // optional access token for private clone/fetch
+}
+
+/** Normalize a protectedBranches input (array | csv string) into a deduped array. */
+export function normalizeProtectedBranches(input: unknown, mainBranch: string): string[] {
+    let list: string[] = [];
+    if (Array.isArray(input)) list = input.map(s => String(s));
+    else if (typeof input === 'string') list = input.split(',');
+    const main = String(mainBranch || '').trim();
+    const seen = new Set<string>();
+    for (const raw of list) {
+        const b = raw.trim();
+        if (!b || b === main || seen.has(b)) continue;
+        seen.add(b);
+    }
+    return Array.from(seen);
 }
 
 export interface ServiceConfig {
@@ -60,12 +77,16 @@ function parseReposEnv(): RepoSpec[] {
         if (!Array.isArray(parsed)) return [];
         return parsed
             .filter((r: any) => r && r.url)
-            .map((r: any) => ({
-                name: r.name || r.url,
-                url: r.url,
-                branch: r.branch || 'main',
-                token: r.token,
-            }));
+            .map((r: any) => {
+                const branch = r.branch || 'main';
+                return {
+                    name: r.name || r.url,
+                    url: r.url,
+                    branch,
+                    protectedBranches: normalizeProtectedBranches(r.protectedBranches, branch),
+                    token: r.token,
+                };
+            });
     } catch (e) {
         console.error('[Config] Failed to parse GIT_INDEX_REPOS JSON:', e);
         return [];

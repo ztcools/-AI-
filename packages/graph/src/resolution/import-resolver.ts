@@ -35,6 +35,8 @@ export interface ImportMapping {
 export interface ResolutionContext {
   getNodesInFile(filePath: string): GraphNode[];
   getNodesByName(name: string): GraphNode[];
+  /** Suffix-aware lookup: finds nodes where node.name ends with '.name'. */
+  getNodesBySuffix(name: string): GraphNode[];
   getNodesByQualifiedName(qn: string): GraphNode[];
   getAllFiles(): string[];
   getProjectRoot(): string;

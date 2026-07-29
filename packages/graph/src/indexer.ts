@@ -33,11 +33,19 @@ import { ReferenceResolver } from './resolution/index';
 
 const DEFAULT_PARSE_WORKERS = Math.max(1, os.availableParallelism() - 2);
 
+/**
+ * Indexer version. Bump when extractor/resolver/edge-kind logic changes so that
+ * graphs built by an older indexer are detected as outdated and rebuilt (git-diff
+ * incremental sync can't see "the indexer itself changed"). v2 = call-edge import
+ * denoise + true-incremental + awaited phase-3.
+ */
+export const INDEXER_VERSION = 3;
+
 /** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', '.next', '__pycache__',
   '.venv', 'venv', 'vendor', 'target', 'coverage', '.nyc_output', '.cache',
-  '.idea', '.vscode', '.circleci', 'bin', 'obj', 'out', 'tmp', 'temp',
+  '.idea', '.vscode', '.circleci', 'obj', 'out', 'tmp', 'temp',
   '.tox', '.mypy_cache', '.pytest_cache', '.turbo', '.angular', '.nuxt',
   '.svn', '.hg', 'bower_components', '.terraform', '.parcel-cache',
   '.context',  // our own data dir
@@ -49,7 +57,7 @@ const IGNORE_DIRS = new Set([
   'CMakeFiles', '_build', 'third_party', 'external', '_deps',
   '.conan',
   // .NET
-  'packages', '.vs',
+  '.vs',
   // JS/TS bundler artifacts
   '.parcel-cache', '.svelte-kit', '.vinxi', '.nitro', 'out-tsc', '.vercel', '.netlify',
   // iOS/Swift
@@ -61,6 +69,38 @@ const IGNORE_DIRS = new Set([
   // Delphi
   '__history', '__recovery',
 ]);
+
+/**
+ * File-level noise patterns excluded from indexing (matched against the
+ * basename or a trailing extension). These are generated / minified / bundled
+ * artifacts that pollute the graph with thousands of junk symbols and drown
+ * real definitions. Mirrors the file-level entries in core DEFAULT_IGNORE_PATTERNS.
+ */
+const IGNORE_FILE_SUFFIXES = [
+  '.min.js', '.min.css', '.min.map',
+  '.bundle.js', '.bundle.css', '.chunk.js',
+  '.vendor.js', '.polyfills.js', '.runtime.js',
+  '.generated.ts', '.generated.tsx', '.generated.js',
+  '.pb.go', '.pb.cc', '.pb.h', '_pb2.py', '_pb2_grpc.py',
+  '.g.dart', '.freezed.dart', '.gen.dart',
+  '.designer.cs', '.Designer.cs',
+  '.d.ts',           // type-declaration files duplicate the real symbols
+  '.tsbuildinfo',
+];
+const IGNORE_FILE_NAMES = new Set([
+  'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+  'Cargo.lock', 'composer.lock', 'poetry.lock', 'Gemfile.lock', 'go.sum',
+]);
+
+/** True if a file (by relative path) is generated/minified noise. */
+function isIgnoredFile(relPath: string): boolean {
+  const base = relPath.slice(relPath.lastIndexOf('/') + 1);
+  if (IGNORE_FILE_NAMES.has(base)) return true;
+  for (const suffix of IGNORE_FILE_SUFFIXES) {
+    if (base.endsWith(suffix)) return true;
+  }
+  return false;
+}
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -110,6 +150,15 @@ export class GraphIndexer {
     this.store.close();
   }
 
+  /**
+   * True when the on-disk graph was built by an older indexer version (or has no
+   * version stamp at all) and should be rebuilt — git-diff sync can't detect that
+   * the indexer itself changed, only file-content changes.
+   */
+  isOutdated(): boolean {
+    return this.store.getGraphVersion() < INDEXER_VERSION;
+  }
+
   // ── Full index ───────────────────────────────────────────────────
 
   async indexAll(options: GraphIndexerOptions = {}): Promise<IndexResult> {
@@ -122,8 +171,15 @@ export class GraphIndexer {
     let totalEdges = 0;
 
     // Phase 0: Scan files
+    // When options.files is provided we run in incremental mode: only those
+    // files are (re)indexed and their existing graph data is replaced
+    // file-by-file, leaving every other file's nodes/edges untouched. With no
+    // files option this is a full rebuild that wipes the project first.
+    const incremental = Array.isArray(options.files) && options.files.length > 0;
     options.onProgress?.({ phase: 'scanning', current: 0, total: 0 });
-    const files = this.scanFiles(this.projectDir);
+    const files = incremental
+      ? this.resolveRequestedFiles(this.projectDir, options.files!)
+      : this.scanFiles(this.projectDir);
     const total = files.length;
 
     if (options.signal?.aborted) {
@@ -261,12 +317,22 @@ export class GraphIndexer {
     const BATCH_SIZE = 10000;
     this.store.beginBulkLoad();
     try {
-      // Clear existing project data
-      while (this.store.deleteProjectEdgesChunk(this.project, BATCH_SIZE) > 0) {
-        await new Promise<void>(r => setImmediate(r));
-      }
-      while (this.store.deleteProjectNodesChunk(this.project, BATCH_SIZE) > 0) {
-        await new Promise<void>(r => setImmediate(r));
+      if (incremental) {
+        // Incremental: replace only the touched files' graph data. Nodes deleted
+        // from a file vanish; new nodes are added below; untouched files keep
+        // their data. Cross-file edges pointing INTO these files are dropped
+        // (deleteNodesByFile cascades edges) and re-created by Phase 3.
+        for (const file of files) {
+          this.store.deleteNodesByFile(this.project, file.relativePath);
+        }
+      } else {
+        // Full rebuild: clear existing project data
+        while (this.store.deleteProjectEdgesChunk(this.project, BATCH_SIZE) > 0) {
+          await new Promise<void>(r => setImmediate(r));
+        }
+        while (this.store.deleteProjectNodesChunk(this.project, BATCH_SIZE) > 0) {
+          await new Promise<void>(r => setImmediate(r));
+        }
       }
 
       // Flush nodes
@@ -367,24 +433,40 @@ export class GraphIndexer {
     options.onProgress?.({ phase: 'storing', current: 1, total: 1 });
     console.log(`[GraphIndexer] Phase 2 done: nodes/edges flushed to SQLite`);
 
-    // Phase 3: Reference resolution
+    // Phase 3: Reference resolution → cross-file CALLS edges.
+    // AWAITED: fire-and-forget meant the process could exit (or MCP restart)
+    // before cross-file edges persisted, permanently losing call-graph edges.
     options.onProgress?.({ phase: 'resolving', current: 0, total: 1 });
 
-    const resolver = new ReferenceResolver(this.projectDir, this.store, this.project);
-    resolver.warmCaches();
+    if (incremental) {
+      // Re-arm refs that failed earlier (their target may live in a file we
+      // just re-indexed, or one added since) so they get retried this pass.
+      this.store.resetFailedRefs(this.project);
+    }
 
     const refCount = this.store.getUnresolvedRefsCount(this.project);
     if (refCount > 0) {
-      const result = await resolver.resolveAndPersistBatched(
-        (current, total) => {
-          options.onProgress?.({ phase: 'resolving', current, total });
-        },
-      );
-      totalEdges += result.resolved;
-      console.log(`[GraphIndexer] Phase 3 done: ${result.resolved} cross-file edges resolved, ${result.unresolved} remaining`);
+      const resolver = new ReferenceResolver(this.projectDir, this.store, this.project);
+      resolver.warmCaches();
+      try {
+        const result = await resolver.resolveAndPersistBatched(
+          (resolved, totalRefs) => {
+            options.onProgress?.({ phase: 'resolving', current: resolved, total: totalRefs });
+          },
+        );
+        console.log(`[GraphIndexer] Phase 3 done: ${result.resolved} cross-file edges resolved, ${result.unresolved} remaining`);
+      } catch (err: any) {
+        console.warn(`[GraphIndexer] Phase 3 error (non-fatal): ${err.message}`);
+      }
+    } else {
+      options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
     }
 
-    options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
+    // Stamp the indexer version that produced this graph so future opens can
+    // detect an outdated graph (indexer upgraded) and rebuild.
+    if (!incremental) {
+      this.store.setGraphVersion(INDEXER_VERSION);
+    }
 
     // Checkpoint WAL
     try { this.store.checkpoint(); } catch { /* non-critical */ }
@@ -418,8 +500,14 @@ export class GraphIndexer {
       };
     }
 
-    // For now, re-index changed files
-    // Full incremental sync will be added in a follow-up
+    // Purge graph rows for files that were deleted (present in the diff but no
+    // longer on disk) — they can't be re-indexed, so remove their stale data.
+    const deletedFiles = changedFiles.filter(f => !fs.existsSync(path.join(this.projectDir, f)));
+    for (const f of deletedFiles) {
+      this.store.deleteNodesByFile(this.project, f.replace(/\\/g, '/'));
+    }
+
+    // True incremental: re-index only the changed files that still exist.
     const result = await this.indexAll({
       ...options,
       files: changedFiles,
@@ -429,7 +517,7 @@ export class GraphIndexer {
       filesChecked: changedFiles.length,
       filesAdded: result.filesIndexed,
       filesModified: 0,
-      filesRemoved: 0,
+      filesRemoved: deletedFiles.length,
       nodesUpdated: result.nodesCreated,
       durationMs: result.durationMs,
       changedFilePaths: changedFiles,
@@ -471,6 +559,8 @@ export class GraphIndexer {
       for (const line of output.trim().split('\n').filter(Boolean)) {
         // Skip paths under ignored directories
         if (this.isIgnoredPath(line)) continue;
+        // Skip generated / minified / lock-file noise
+        if (isIgnoredFile(line)) continue;
         const ext = path.extname(line);
         if (!exts.has(ext)) continue;
         const abs = path.join(dir, line);
@@ -502,9 +592,11 @@ export class GraphIndexer {
         } else if (entry.isFile()) {
           const ext = path.extname(entry.name);
           if (exts.has(ext)) {
+            const relPath = path.relative(dir, fullPath);
+            if (isIgnoredFile(relPath.replace(/\\/g, '/'))) continue;
             results.push({
               absolutePath: fullPath,
-              relativePath: path.relative(dir, fullPath),
+              relativePath: relPath,
               language: GraphExtractor.extToLanguage(ext) || 'javascript',
             });
           }
@@ -523,5 +615,42 @@ export class GraphIndexer {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * Map a list of changed file paths (git-relative, may include deletions) to
+   * indexable FileToIndex entries: keeps only supported extensions, skips
+   * ignored dirs, drops files that no longer exist on disk (deletions — their
+   * graph rows are removed by the caller via deleteNodesByFile).
+   */
+  private resolveRequestedFiles(dir: string, files: string[]): FileToIndex[] {
+    const exts = new Set([
+      '.js', '.jsx', '.mjs', '.cjs',
+      '.ts', '.tsx',
+      '.py', '.pyi', '.pyx',
+      '.java', '.kt', '.kts', '.scala',
+      '.cpp', '.c', '.h', '.hpp', '.hh', '.cc', '.cxx', '.hxx', '.inl',
+      '.go', '.rs', '.cs',
+      '.php', '.rb', '.swift', '.m', '.mm', '.dart', '.sol',
+      '.lua', '.r', '.ex', '.exs', '.erl', '.hs',
+      '.vue', '.svelte', '.astro',
+      '.zig', '.nim', '.vb',
+    ]);
+    const results: FileToIndex[] = [];
+    for (const rel of files) {
+      const norm = rel.replace(/\\/g, '/');
+      if (this.isIgnoredPath(norm)) continue;
+      if (isIgnoredFile(norm)) continue;
+      const ext = path.extname(norm);
+      if (!exts.has(ext)) continue;
+      const abs = path.join(dir, norm);
+      if (!fs.existsSync(abs)) continue; // deleted file — stale rows purged by caller
+      results.push({
+        absolutePath: abs,
+        relativePath: norm,
+        language: GraphExtractor.extToLanguage(ext) || 'javascript',
+      });
+    }
+    return results;
   }
 }

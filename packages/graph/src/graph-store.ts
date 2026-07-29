@@ -208,6 +208,27 @@ export class SqliteGraphStore implements GraphStore {
     return this.dbPath;
   }
 
+  /**
+   * Indexer/schema version stamped on the graph (via PRAGMA user_version).
+   * Bump INDEXER_VERSION whenever the extractor/resolver/traversal logic changes
+   * in a way that makes graphs built by an older version stale or wrong. On open,
+   * a graph whose stored version differs is treated as outdated so the caller can
+   * rebuild — git-diff incremental sync can't detect "the indexer itself changed".
+   */
+  getGraphVersion(): number {
+    try {
+      const row = this.readDB.pragma('user_version', { simple: true });
+      return typeof row === 'number' ? row : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Stamp the graph with the indexer version that built it. */
+  setGraphVersion(v: number): void {
+    this.db.pragma(`user_version = ${Math.floor(v)}`);
+  }
+
   // ── Schema ────────────────────────────────────────────────────────
 
   private _ensureSchema(): void {
@@ -356,6 +377,20 @@ export class SqliteGraphStore implements GraphStore {
     return rows.map(r => this.rowToNode(r));
   }
 
+  /**
+   * Suffix-aware name lookup. Matches both exact name AND names ending
+   * with `.<name>` (e.g. "getNodesById" matches "SqliteGraphStore.getNodesById").
+   * Uses a UNION of two indexed lookups — no full-table scan.
+   */
+  getNodesBySuffix(project: string, name: string): GraphNode[] {
+    const rows = this.readDB.prepare(`
+      SELECT * FROM nodes WHERE project = ? AND name = ?
+      UNION ALL
+      SELECT * FROM nodes WHERE project = ? AND name LIKE ('%.' || ?)
+    `).all(project, name, project, name) as Array<Record<string, unknown>>;
+    return rows.map(r => this.rowToNode(r));
+  }
+
   getNodesByLowerName(project: string, lowerName: string): GraphNode[] {
     const rows = this.readDB.prepare(
       'SELECT * FROM nodes WHERE project = ? AND LOWER(name) = ?'
@@ -433,6 +468,34 @@ export class SqliteGraphStore implements GraphStore {
       const seenIds = new Set<number>();
       const allRows: Array<Record<string, unknown>> = [];
       let totalCount = 0;
+
+      // Pass 0: EXACT-name match. A query that is itself a symbol name ("toJson",
+      // "dispatch_request") should rank the node literally named that above any
+      // fuzzy/substring hit ("toString", "ToNumberStrategy"). FTS tokenizes and
+      // stems, so it can't express "this exact name". Exact hits get the top score.
+      const exactName = options.query.trim();
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(exactName)) {
+        try {
+          // Match the bare name OR the trailing segment of a qualified name —
+          // extractors store method names qualified ("Gson.toJson"), so a query
+          // for "toJson" must hit name="Gson.toJson" via suffix match, not just
+          // name="toJson". Both bare and qualified-suffix forms are covered.
+          const exactRows = rdb.prepare(
+            `SELECT n.*, 1000.0 AS score FROM nodes n
+             WHERE (n.name = ? OR n.qualified_name = ? OR n.name LIKE ? OR n.qualified_name LIKE ?) AND ${whereClause}
+             ORDER BY n.kind LIMIT ?`
+          ).all(exactName, exactName, `%.${exactName}`, `%.${exactName}`, ...params, limit) as Array<Record<string, unknown>>;
+          for (const row of exactRows) {
+            if (!seenIds.has(row.id as number)) {
+              seenIds.add(row.id as number);
+              allRows.push(row);
+            }
+          }
+          totalCount += exactRows.length;
+        } catch {
+          // exact match failed — continue to FTS
+        }
+      }
 
       // First pass: FTS (BM25 ranked). bm25() returns negative values
       // (closer to 0 = better), so we use -bm25() for a positive descending score.
@@ -650,6 +713,19 @@ export class SqliteGraphStore implements GraphStore {
         outDegree,
       });
     }
+
+    // Source-over-test ranking: when several definitions share a name ("send" in
+    // sessions.py vs test_sessions.py), the production definition is almost
+    // always the intended answer, not the test double. Demote test/spec files by
+    // a large score margin so they rank after real definitions, without being
+    // filtered out entirely (tests are still searchable when asked for).
+    const TEST_PATH = /(^|\/)(test|tests|testing|spec|__tests__|test_|conftest)|(_test|_spec|\.test|\.spec|Test|Tests|Spec)\.(py|js|ts|jsx|tsx|go|java|rs|cpp|c|cc)$/i;
+    for (const r of results) {
+      const fp = r.node.filePath || '';
+      const isTest = TEST_PATH.test(fp) || /(^|\/)test(s)?\//i.test(fp);
+      if (isTest) r.score -= 100;
+    }
+    results.sort((a, b) => b.score - a.score);
 
     const hasDegreeFilter = options.minDegree !== undefined || options.maxDegree !== undefined;
     const effectiveTotal = hasDegreeFilter ? results.length : countRow.total;
@@ -920,6 +996,18 @@ export class SqliteGraphStore implements GraphStore {
 
   markReferencesFailedByRowIds(rows: Array<{ rowId: number; referenceName: string }> | number[]): number {
     return this.markRefsFailedByRowIds(rows);
+  }
+
+  /**
+   * Reset failed refs back to pending so a later pass can retry them.
+   * Used by incremental sync: refs that failed in a prior full index (target
+   * file not yet parsed, or target added later) become resolvable once the
+   * target file is (re)indexed. Returns how many refs were re-armed.
+   */
+  resetFailedRefs(project: string): number {
+    return this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'pending' WHERE project = ? AND status = 'failed'"
+    ).run(project).changes;
   }
 
   // ── File-level operations ─────────────────────────────────────────

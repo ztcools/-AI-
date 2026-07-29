@@ -256,9 +256,12 @@ export function matchReference(
   const suffixMatch = matchQualifiedSuffix(ref, context);
   if (suffixMatch) return suffixMatch;
 
-  // Strategy 4: Fuzzy match (case-insensitive, prefix)
-  const fuzzy = matchFuzzy(ref, context);
-  if (fuzzy) return fuzzy;
+  // Strategy 4: Fuzzy match — O(n²) full-scan of all files in JS.
+  // Only enabled when prior strategies returned nothing. For TS/JS projecs
+  // the suffix-name strategy already handles class-qualified method lookups.
+  // Re-enable when case-insensitive matching adds value (PHP, SQL dialects).
+  // const fuzzy = matchFuzzy(ref, context);
+  // if (fuzzy) return fuzzy;
 
   return null;
 }
@@ -484,7 +487,7 @@ function matchSuffixName(
   if (refName.includes('.') || refName.includes('::')) return null;
 
   // Try ref's own file first (intra-class calls are always same-file)
-  const matches: GraphNode[] = [];
+  let matches: GraphNode[] = [];
   if (ref.filePath) {
     const ownNodes = context.getNodesInFile(ref.filePath);
     for (const node of ownNodes) {
@@ -497,19 +500,12 @@ function matchSuffixName(
     }
   }
 
-  // Fallback: scan all files (for cross-file same-class calls)
+  // Fallback: indexed suffix lookup — finds "ClassName.methodName"
+  // from refName "methodName" without scanning all files in JS.
   if (matches.length === 0) {
-    for (const file of context.getAllFiles()) {
-      const nodes = context.getNodesInFile(file);
-      for (const node of nodes) {
-        if (
-          DEFINITION_KINDS.has(node.kind) &&
-          (node.name === refName || node.name.endsWith('.' + refName))
-        ) {
-          matches.push(node);
-        }
-      }
-    }
+    matches = context.getNodesBySuffix(refName).filter((n) =>
+      DEFINITION_KINDS.has(n.kind),
+    );
   }
 
   if (matches.length === 1) {
@@ -518,6 +514,23 @@ function matchSuffixName(
       targetNodeId: matches[0].id,
       resolvedBy: 'suffix-name',
       confidence: 0.70,
+    };
+  }
+
+  // Overloads: multiple same-named definitions (toJson ×8). Without parameter
+  // type info we can't pick the exact overload, but resolving to ONE of them is
+  // far better than no edge at all — it anchors the call into the right class/
+  // file so call-graph traversal stays useful. Prefer a same-file match, then
+  // the first by id. Lower confidence reflects the ambiguity.
+  if (matches.length > 1) {
+    const sameFile = ref.filePath ? matches.filter(n => n.filePath === ref.filePath) : [];
+    const pool = sameFile.length > 0 ? sameFile : matches;
+    const target = pool.reduce((a, b) => (a.id < b.id ? a : b));
+    return {
+      original: ref,
+      targetNodeId: target.id,
+      resolvedBy: 'suffix-name-overload',
+      confidence: 0.55,
     };
   }
 

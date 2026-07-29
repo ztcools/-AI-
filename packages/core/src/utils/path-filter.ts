@@ -1,7 +1,7 @@
 /**
  * Shared dotfile / dot-directory path filtering.
  *
- * Used by both FileSynchronizer (file discovery) and Context (index filtering)
+ * Used by Context (index filtering) and file discovery.
  * to keep dot-file handling consistent. Dot-directories are skipped unless
  * they are well-known CI/config directories; dot-files (e.g. .eslintrc.js)
  * are always allowed since they contain meaningful configuration/code.

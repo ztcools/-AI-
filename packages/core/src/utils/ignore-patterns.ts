@@ -102,7 +102,7 @@ export class IgnorePatternManager {
     matches(filePath: string, basePath: string, patterns?: string[]): boolean {
         const relativePath = path.relative(basePath, filePath);
 
-        // Dot-directory / dot-file filtering (shared with FileSynchronizer).
+        // Dot-directory / dot-file filtering.
         if (shouldSkipDotPath(relativePath)) return true;
 
         const effectivePatterns = patterns ?? this.ignorePatterns;

@@ -24,10 +24,13 @@ INSTALL_DIR="$REAL_HOME/.claude-context"
 REPO_URL="https://github.com/ztcools/context.git"
 
 # 向量后端地址(默认指向公司服务器,开箱即用;如需改用其它后端,先 export 覆盖再运行)
+# 本地只做"查询向量化 + 直连云端 Milvus 只读检索 + 本地图索引"，不做任何向量写入。
 OLLAMA_HOST="${OLLAMA_HOST:-http://10.50.4.149:11435}"
 MILVUS_ADDRESS="${MILVUS_ADDRESS:-http://10.50.4.149:19530}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 EMBEDDING_DIMENSION="${EMBEDDING_DIMENSION:-768}"
+# 云端索引服务（保护分支列表 / 索引进度），供 /seeway-link 列出可链接分支
+GIT_INDEX_SERVICE_URL="${GIT_INDEX_SERVICE_URL:-http://10.50.4.149:8795}"
 
 echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}  Seeway Claude Context 安装脚本${NC}"
@@ -129,7 +132,7 @@ data['mcpServers']['claude-context'] = {
         'OLLAMA_HOST': '$OLLAMA_HOST',
         'EMBEDDING_DIMENSION': '$EMBEDDING_DIMENSION',
         'MILVUS_ADDRESS': '$MILVUS_ADDRESS',
-        'EMBEDDING_BATCH_SIZE': '256'
+        'GIT_INDEX_SERVICE_URL': '$GIT_INDEX_SERVICE_URL'
     }
 }
 with open('$json_file', 'w') as f:
@@ -153,7 +156,7 @@ if command -v claude &> /dev/null; then
             -e OLLAMA_HOST="$OLLAMA_HOST" \
             -e EMBEDDING_DIMENSION="$EMBEDDING_DIMENSION" \
             -e MILVUS_ADDRESS="$MILVUS_ADDRESS" \
-            -e EMBEDDING_BATCH_SIZE=256 \
+            -e GIT_INDEX_SERVICE_URL="$GIT_INDEX_SERVICE_URL" \
 -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."
                 add_mcp_to_json "$CLAUDE_JSON" && echo -e "${GREEN}  ✓ MCP 已写入 $CLAUDE_JSON${NC}"
@@ -167,7 +170,7 @@ if command -v claude &> /dev/null; then
             -e OLLAMA_HOST="$OLLAMA_HOST" \
             -e EMBEDDING_DIMENSION="$EMBEDDING_DIMENSION" \
             -e MILVUS_ADDRESS="$MILVUS_ADDRESS" \
-            -e EMBEDDING_BATCH_SIZE=256 \
+            -e GIT_INDEX_SERVICE_URL="$GIT_INDEX_SERVICE_URL" \
 -- node "$MCP_ENTRY" 2>/dev/null && echo -e "${GREEN}  ✓ MCP 已配置到用户级${NC}" || {
                 echo "  CLI 配置失败，尝试直接写入配置文件..."
                 add_mcp_to_json "$CLAUDE_JSON" && echo -e "${GREEN}  ✓ MCP 已写入 $CLAUDE_JSON${NC}"
@@ -228,7 +231,7 @@ if [ -d "$COMMANDS_SRC" ]; then
     if [ -n "$SUDO_USER" ]; then
         chown -R "$SUDO_USER":"$SUDO_USER" "$COMMANDS_DST" 2>/dev/null || true
     fi
-    echo -e "${GREEN}  ✓ 已安装命令: /seeway-index /seeway-search /seeway-clear /seeway-status${NC}"
+    echo -e "${GREEN}  ✓ 已安装命令: /seeway-link /seeway-unlink /seeway-search /seeway-clear /seeway-status${NC}"
 else
     echo -e "${YELLOW}  未找到 $COMMANDS_SRC，跳过 /seeway 命令安装${NC}"
 fi
@@ -244,4 +247,4 @@ echo "  上下文策略: $CLAUDE_MD（仅在 claude-context 工具可用的会�
 echo "  自定义命令: $COMMANDS_DST/seeway-*.md"
 echo ""
 echo -e "${YELLOW}  下一步: 重启 Claude Code，输入 /mcp 确认 claude-context 已连接。${NC}"
-echo -e "${YELLOW}  然后可用 /seeway-index <路径> 索引、/seeway-search <查询> 检索。${NC}"
+echo -e "${YELLOW}  然后 /seeway-link 链接云端索引（建本地图），再用 /seeway-search <查询> 检索。${NC}"

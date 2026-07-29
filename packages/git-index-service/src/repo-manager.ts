@@ -127,4 +127,37 @@ export class RepoManager {
 
         return { dir, branch };
     }
+
+    /**
+     * List remote branches of a repo via `git ls-remote --heads`. Used by the
+     * management API so clients (e.g. /seeway-link) can offer a pick-list of
+     * branches to link/index. Throws on auth/network failure.
+     */
+    listRemoteBranches(repo: RepoSpec, timeoutMs = 30_000): string[] {
+        const fetchUrl = this.fetchUrl(repo);
+        const useSsh = this.useSsh(repo);
+        const out = this.gitWithTimeout(this.workdir, `ls-remote --heads "${fetchUrl}"`, useSsh, timeoutMs);
+        const branches: string[] = [];
+        for (const line of out.split('\n')) {
+            const m = line.match(/refs\/heads\/(\S+)\s*$/);
+            if (m && m[1]) branches.push(m[1]);
+        }
+        return branches.sort();
+    }
+
+    /** git() variant with a caller-supplied timeout (for ls-remote listing). */
+    private gitWithTimeout(dir: string, args: string, useSsh: boolean, timeoutMs: number): string {
+        const noVerify = String(process.env.GIT_SSL_NO_VERIFY || '').toLowerCase();
+        const sslOpt = (noVerify === 'true' || noVerify === '1') ? '-c http.sslVerify=false ' : '';
+        const env = { ...process.env };
+        if (useSsh) env.GIT_SSH_COMMAND = this.ssh.sshCommand();
+        return execSync(`git ${sslOpt}${args}`, {
+            cwd: dir,
+            env,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: timeoutMs,
+            maxBuffer: 64 * 1024 * 1024,
+        }).trim();
+    }
 }

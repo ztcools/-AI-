@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     });
 
     if (config.httpPort) {
-        startHttpServer(config.httpPort, indexer, store, scheduler, sshKeys);
+        startHttpServer(config.httpPort, indexer, store, scheduler, sshKeys, repoManager);
     }
 
     if (config.runOnStart) {
