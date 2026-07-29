@@ -3,6 +3,30 @@
 > 评估对象：claude-context 重构版（云端向量只读检索 + 本地图索引 + link 模式）
 > 评估方法：①真实仓库 pipeline @ main 端到端实测 ②GitHub 8 仓库多语言评估数据集（96 题，flask/requests/gin/cobra/gson/json/bat/trpc）调用图精度批量评估。
 
+---
+
+## 📌 最新一轮（2026-07-29）：search vs Read/Grep 受控对照 + 图实时性
+
+> 完整报告见 [docs/search-evaluation-20260729.md](docs/search-evaluation-20260729.md)。
+
+**对照实验**（flask/requests，8 个真实开发场景，search 三种模式 vs 纯 Read/Grep 基线 agent）：
+
+| 发现 | 结论 |
+|------|------|
+| 小型组织良好库上基线 8/8 全胜 | **search 是"定位第一跳"而非替代品**；工具描述已按"按库规模分档"重写 |
+| search 符号命中率 17/18 | 找得到，但富化阶段把关键符号弄丢了（已修） |
+
+**本轮修复（均已端到端验证 + 提交）**：
+
+| 修复 | 修复前 → 修复后 |
+|------|----------------|
+| 富化丢失关键符号 | requests 查 send/get_adapter 的 Call Graph 全是 cookies.py 噪声 → `Session.send ← request → ...` 真实链路 |
+| 文档淹没代码 | requests-flow top10 里 5 条 docs/*.rst → 代码文件升至 top（penalizeDocResults + dedup + diversity） |
+| **图索引实时性** | 改完代码 search 看不到新符号 → 工作区变更自动增量重建（`[GRAPH-SYNC]`），修复 3 层叠加 bug |
+| 富化噪声 | 多行签名/自指/同名/测试调用者 → 单行签名 + 去重 + 测试隐藏 |
+
+---
+
 ## 一、修复的硬伤（全部经端到端验证）
 
 | 问题 | 修复前实测 | 修复后实测 |

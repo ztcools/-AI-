@@ -79,6 +79,8 @@ class ContextMcpServer {
         // reaches for each tool. Keep them compact and verifiable.
         const link_description = `
 Bind this repo to its cloud vector index (pre-built per protected branch) and build/incrementally update the local knowledge graph. Prerequisite for search to return vector results. Once per session per repo. Omit branch to list cloud candidates.
+
+link also builds the local call-graph index automatically in the background (no separate index step needed — users must NOT run any manual indexing; local vector indexing is disabled by design, only protected branches are indexed on the server daily). The graph then stays fresh automatically as you edit files.
 `;
 
         const unlink_description = `
