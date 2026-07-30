@@ -37,9 +37,15 @@ cd /home/zt/claude-context-local-stack
 ./push-to-server.sh --verify-only  # 只跑只读验证（含"服务器上是新镜像还是旧镜像"判定）
 ```
 
-密码只需输一次（脚本用 SSH ControlMaster 复用连接），配了公钥则全程免密。
-脚本是幂等的：`.env` 只追加缺失的键、`docker tag backup-<日期>` 留底、
-`docker compose up -d` 只重建配置变了的容器、不 `down`、不动 `data/`。
+密码只需输一次（脚本用 SSH ControlMaster 复用连接），配了公钥则全程免密；
+`SSHPASS=<密码> ./push-to-server.sh --yes` 可全非交互（密码不进命令行）。
+
+脚本是幂等的：`docker tag backup-<日期>` 留底、`docker compose up -d` 只重建配置变了的容器、
+不 `down`、不动 `data/`。`.env` 按键分三种情形处理 —— **缺失则追加、值不同则原地更新、
+一致则不动**，只碰 `ENV_KEYS` 里那几个键，人工加的其他键与注释一概不动。
+
+> 早先的版本是"键已存在就跳过"，结果改了默认值（如 `GIT_INDEX_CONCURRENCY` 3→6）
+> 永远推不到服务器上：服务器 `.env` 里已有那个键，就被当成"已是期望值"跳过了。
 
 下面各节是同一套动作的手工版，供排查用。
 
@@ -114,13 +120,13 @@ put deploy.sh                 /data1/users/haoming.ju/claude-context/stack/deplo
 
 ```bash
 # 索引并发与内存回收
-GIT_INDEX_CONCURRENCY=3          # 瓶颈是 Ollama 向量化，超过 OLLAMA_NUM_PARALLEL 只会互相排队
+GIT_INDEX_CONCURRENCY=6          # 实测 embedding 吞吐饱和点：1/3/6/8/12 流 → 27/75/136/140/142 embed/s
 GIT_INDEX_RELEASE_AFTER=true     # 每个 collection 写完即从 Milvus 内存 release
 
 # 各服务资源上限（几百个仓库 × 多分支的关键防崩措施）
 MILVUS_MEM_LIMIT=64g   MILVUS_CPU_LIMIT=24     # 最大消耗方；配 milvus-user.yaml 的 mmap 后实际远低于上限
 OLLAMA_MEM_LIMIT=32g   OLLAMA_CPU_LIMIT=16
-GIT_INDEX_MEM_LIMIT=16g GIT_INDEX_CPU_LIMIT=12 # 约每个 worker 4~5 GiB，调 CONCURRENCY 时同步上调
+GIT_INDEX_MEM_LIMIT=16g GIT_INDEX_CPU_LIMIT=12 # 实测单 worker 峰值 ~1 GiB（多在堆外），并发 6 最坏 ~6 GiB
 MINIO_MEM_LIMIT=8g     MINIO_CPU_LIMIT=4
 ETCD_MEM_LIMIT=4g      ETCD_CPU_LIMIT=2
 PHIGENT_MEM_LIMIT=2g   PHIGENT_CPU_LIMIT=2
@@ -174,6 +180,19 @@ docker stats --no-stream claude-milvus-standalone
 
 客户端侧端到端验证：在任一被索引的仓库里 `link` → `search`，或跑
 `node benchmarks/harness.mjs <repo> main benchmarks/scenarios/ap-client-api.json`（见 [benchmarks/](benchmarks/README.md)）。
+
+> **`~/.context/.env` 的 `OLLAMA_HOST` 必须是 `:11435`**（本栈发布的端口）。
+> 这台机器上 `:11434` 是**他人的** Ollama（另装了十来个模型），它恰好也有
+> `nomic-embed-text`、digest 相同，所以指错了照样能出向量、召回一模一样 ——
+> 只是蹭了别人的推理服务，且不受我们给 ollama 设的 32g/16cpu 上限保护。
+> 代价是每次搜索多 ~30–40ms（我们的 ollama 被限了 CPU），换来资源隔离。
+
+容量参数不要照抄默认值，用两个测量脚本重新定（见 [benchmarks/](benchmarks/README.md)）：
+
+```bash
+OLLAMA_HOST=http://10.50.4.149:11435 node benchmarks/embed-throughput.mjs   # → GIT_INDEX_CONCURRENCY
+node benchmarks/worker-mem.mjs /path/to/big-repo                            # → GIT_INDEX_MEM_LIMIT
+```
 
 ## 六、给仓库配保护分支
 

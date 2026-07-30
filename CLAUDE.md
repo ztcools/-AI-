@@ -226,6 +226,10 @@ pnpm test
 
 # 3. 端到端（需真实 Milvus + Ollama，跑真实 MCP handler）
 node benchmarks/harness.mjs <repoPath> main benchmarks/scenarios/ap-client-api.json
+
+# 4. 容量参数测量（定部署参数用，不是回归）
+OLLAMA_HOST=http://10.50.4.149:11435 node benchmarks/embed-throughput.mjs   # → GIT_INDEX_CONCURRENCY
+node benchmarks/worker-mem.mjs <repoPath>                                   # → GIT_INDEX_MEM_LIMIT
 ```
 
 图索引单点验证（不依赖 Milvus）：
@@ -307,6 +311,21 @@ await ix.indexAll();
 | 响应 token | 均值 2597t → **2216t**（−15%） | 最差单次 5922t → 3888t（−34%） |
 | FTS 搜索延迟 | **0.6ms** | 单次 BM25 搜索 |
 | 并发吞吐 | **2,273 qps** | 50 searches in 22ms |
+| 云端索引并发 | 3 → **6**（吞吐 +82%） | Ollama embedding 饱和点，见下 |
+| 单索引 worker 内存 | **~1 GiB** 峰值 RSS | 956 MiB 在 tree-sitter 堆外，V8 heap 仅 55 MiB |
+
+**云端索引并发的定法**（`GIT_INDEX_CONCURRENCY`）：这个值由 embedding 吞吐决定，不是由核数决定 ——
+索引侧每个仓库是一条串行 embed 流。实测（`benchmarks/embed-throughput.mjs`，本栈 ollama 32g/16cpu、4 卡）：
+
+| 并发流 | 1 | 3 | 6 | 8 | 12 |
+|--------|---|---|---|---|----|
+| 吞吐 (embed/s) | 27 | 75 | **136** | 140 | 142 |
+| 相对 1 流 | 1.00× | 2.74× | **4.98×** | 5.16× | 5.22× |
+| 单流延迟 | 37ms | 40ms | 44ms | 57ms | 84ms |
+
+6 之后吞吐不动、单流延迟翻倍 —— 纯排队。原默认 3 只用到约 55% 的向量化能力。
+内存侧不必跟着线性上调：单 worker 峰值 ~1 GiB 且绝大部分在堆外，约束是 cgroup 上限
+而非 V8 old-space（4.1 GiB），并发 6 最坏 ~6 GiB，`GIT_INDEX_MEM_LIMIT=16g` 留 2.5×。
 
 > 已知取舍：`vector` 单模式召回从 88% 降到 81%，因为 `SyncToStorage` 埋在一个很长的 chunk 深处，
 > 要捞回它需要 4000 字符片段（预算 40000）多花 ~2000 token —— 而 `both`/`graph` 本来就能正常给出该符号，

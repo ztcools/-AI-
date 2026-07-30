@@ -1,6 +1,8 @@
-# 检索质量基准
+# 基准与容量测量
 
-调检索排序时的两个回归工具。CLAUDE.md「搜索质量基准」和 SEARCH-EVALUATION.md 的数字都出自这里。
+前两个是**检索质量**回归工具（改排序时跑），后两个是**容量/资源**测量工具（定部署参数时跑）。
+CLAUDE.md「搜索质量基准」、SEARCH-EVALUATION.md、以及 local-stack 的 `.env.example`／README
+里的数字都出自这里。
 
 ## graphbench.mjs — 离线图召回（秒级）
 
@@ -31,6 +33,39 @@ node benchmarks/harness.mjs <repoPath> main benchmarks/scenarios/ap-client-api.j
 
 harness 会先等图就绪、再打一次 warmup 查询：collection 被 release 后首查要付 Milvus load
 （~900ms vs warm ~220ms），不预热量出来的是冷启动而不是稳态。
+
+## embed-throughput.mjs — 定 `GIT_INDEX_CONCURRENCY`
+
+`GIT_INDEX_CONCURRENCY` 该由 embedding 服务的吞吐决定，**不是由核数决定** ——
+索引侧每个仓库是一条串行的 embed 流，所以"N 条并发流的总吞吐"就是把并发调到 N 的收益上限。
+
+```bash
+OLLAMA_HOST=http://10.50.4.149:11435 node benchmarks/embed-throughput.mjs
+LEVELS=1,2,4,8,16 SECONDS=20 node benchmarks/embed-throughput.mjs   # 自定义档位
+```
+
+逐档加压，吞吐相比上一档提升不足 10% 就判为饱和并给出建议值。实测本栈
+（ollama 32g / 16cpu、4 卡共享）：1/3/6/8/12 流 → 27/75/136/140/142 embed/s，
+**饱和点 6**；12 流时单流延迟从 44ms 涨到 84ms 而吞吐只多 4%。
+
+> 只读操作（纯 embedding API 调用），但会给 embedding 服务施加满载压力约
+> `档位数 × SECONDS` 秒。共享机器上别在别人的高峰期跑。
+
+## worker-mem.mjs — 定 `GIT_INDEX_MEM_LIMIT`
+
+复现单个索引 worker 的内存主导项（文件列表 + AST 切分 + `EMBEDDING_BATCH_SIZE` 缓冲），
+不连 Milvus / Ollama。git-index 的 worker 跑在**同一个 Node 进程**里
+（[indexer.ts:273](../packages/git-index-service/src/indexer.ts#L273) 是 `Promise.all`），
+所以要分清两种上限：V8 old-space 与容器 cgroup。
+
+```bash
+pnpm build
+node benchmarks/worker-mem.mjs /path/to/repo 2>&1 | grep -v '^🌳' | tail -10
+```
+
+实测 ap-client-api（28.7K chunks）：峰值 RSS ~1 GiB，其中 **956 MiB 在堆外**
+（tree-sitter 原生 buffer），V8 `heapUsed` 峰值只有 55 MiB。结论是约束为 cgroup 上限
+而非 old-space（4.1 GiB），**不需要设 `NODE_OPTIONS`**；并发 6 最坏约 6 GiB。
 
 ## 场景文件
 
