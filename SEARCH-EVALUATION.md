@@ -1,7 +1,64 @@
 # search 功能评估报告（重构后实测，含多语言深化轮）
 
 > 评估对象：claude-context 重构版（云端向量只读检索 + 本地图索引 + link 模式）
-> 评估方法：①真实仓库 pipeline @ main 端到端实测 ②GitHub 8 仓库多语言评估数据集（96 题，flask/requests/gin/cobra/gson/json/bat/trpc）调用图精度批量评估。
+> 评估方法：①真实仓库 pipeline @ main 端到端实测 ②GitHub 8 仓库多语言评估数据集（96 题，flask/requests/gin/cobra/gson/json/bat/trpc）调用图精度批量评估
+> ③公司真实 C++ 仓库（ap-client-api / PhiLog）离线图召回 + 端到端实测（2026-07-30 轮，见下）。
+> 复现脚本：[benchmarks/](benchmarks/README.md)。
+
+---
+
+## 📌 最新一轮（2026-07-30）：公司真实 C++ 仓库，图召回 58%→79% / 76%→88%
+
+**测试床**：ap-client-api（AUTOSAR AP 客户端，8,700 节点 / 8,793 边）+ PhiLog（C++ 日志库）。
+两个仓库都是**测试数据里的真实仓库**，期望符号全部查图 DB 逐一确认存在（不凭想象写期望）。
+场景与期望：`benchmarks/scenarios/*.json`。
+
+### 离线图召回（`benchmarks/graphbench.mjs`，不碰 Milvus）
+
+| 仓库 | 优化前 | 优化后 | 延迟 |
+|------|--------|--------|------|
+| ap-client-api | 58% (11/19) | **79% (15/19)** | 3–16ms |
+| PhiLog | 76% (13/17) | **88% (15/17)** | 2–8ms |
+| 合计 | 67% (24/36) | **83% (30/36)** | — |
+
+### 六项改动与各自的证据
+
+| 改动 | 修的是什么 | 证据 |
+|------|-----------|------|
+| **查询词去重**（`meaningfulQueryTokens`） | 每个词是一条 OR 臂，重复词被 BM25 数两次；还会抬高 LIKE 层的多数阈值 | "error code and error domain definition" 因 error 出现两次，把 ErrorDomain 顶到 ErrorCode 之上 |
+| **bigram 短语臂** | 纯前缀 OR 只数"命中几个词"，对**词序完全无感** | `{name search_text} : "log manager"` 让 LogManager 从落榜到首位 |
+| **缩写归一只在短语里展开** | 缩写做独立前缀是灾难 | 给 "execute" 加 `"exec"*` 把整个 `ara::exec` 树扫进来，ap 召回 79%→**68%**、丢了 PushTask/RecoveryAction。改为短语内展开后回到 79% |
+| **`module` 计入结果噪声** | C++ `namespace` / Rust `mod` 是容器不是答案，且会匹配自己所在目录名 | ap 的 8,700 节点里 **777 个是 namespace**；`namespace supervised_entity` 抢走了 `class SupervisedEntity` 的头名 |
+| **概念多样性**（`diversifyByConcept`，MMR-lite） | 近重复行霸榜造成的边界丢失 | `RecoveryAction` 以 **20.81 vs 20.83** 落到第 11 名，被 10 条 `SupervisedEntity*` 挤出。同短语最多占 `max(3, ceil(limit/3))`，超出**下溢到尾部而非丢弃**（保 `offset` 分页一致） |
+| **响应 token 预算**（`snippetBudget`） | 单条上限管不住总量：10 条 × 4000 = 10k 字符 | 最差单次 5922t→**3888t**（−34%），均值 2597t→**2216t**（−15%）。单条下限 600 字符——低于此就不是可读代码了 |
+
+### 端到端实测（真实 Milvus + Ollama，`benchmarks/harness.mjs`，warm）
+
+| 仓库 | both | vector | graph |
+|------|------|--------|-------|
+| ap-client-api | **94%** / 219ms / 2216t | 81% / 55ms | **100%** / 89ms / 442t |
+| PhiLog @ main | **93%** / 128ms / 2123t | 86% / 49ms | 88% / 55ms / 212t |
+
+强制全部场景走 `graph`（含自然语言提问）：ap **84%** @ 412t，PhiLog **88%** @ 212t
+—— 这是"graph 模式不必点出符号名"的直接证据，也是工具描述据此重写的依据（commit 5d53316）。
+
+### 两个"看起来是 bug 其实不是"的观测
+
+- **`both` 首轮 934–953ms vs warm 219–223ms**：Milvus 冷 collection load，不是回归。
+  harness 现在会先打一次 warmup 查询。
+- **PhiLog vector 模式 37 token / 0% 召回**：不是代码问题——`link PhiLog @ ap_debug_0304` 报
+  "Cloud index not found"，因为早前清理只保留了 main 分支的 collection。换 `main` 后 vector 召回 86%。
+
+### 已知取舍
+
+`vector` 单模式召回从 88% 降到 81%：`SyncToStorage` 埋在一个很长 chunk 的深处，
+捞回它需要 4000 字符片段（`SEARCH_TOTAL_MAX_CHARS=40000`）多花 ~2000 token。
+而 `both` / `graph` 本来就能正常给出该符号 —— 不值得为它抬高全局预算。
+
+### 回归护栏
+
+每次改动后：图测试套件 7/7 通过；`graphbench` 双仓库跑一遍；索引产物比对不变
+（9146 节点 / 8793 边 / 8850 跨文件 / 9684 remaining，3.4s）。
 
 ---
 

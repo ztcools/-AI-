@@ -19,11 +19,20 @@
 
 ## 三种模式，各司其职
 
-| mode | 何时用 | 示例 |
-|------|-------|------|
-| `both`（默认） | 探索流程、理解子系统 | "how does auth work" |
-| `vector` | 找具体实现、搜概念 | "find the User model" |
-| `graph` | 追踪调用关系、影响面、死代码 | "who calls sendEmail" |
+实测（2026-07-30，两个真实 C++ 仓库，36 个期望符号，warm）：
+
+| mode | 召回 | token | 延迟 | 何时用 |
+|------|------|-------|------|-------|
+| `graph` | 86% | ~300 | 60–105ms | 关系/影响面/死代码/入口；**只要位置+调用链时先用它**（不需要 link） |
+| `both`（默认） | 93% | ~2200 | 128–220ms | 需要代码片段本身；或目标概念没被任何标识符拼出来 |
+| `vector` | 83% | ~1700 | ~50ms | 语义找实现，不需要调用图 |
+
+`graph` 接受自然语言，**不必点出符号名**：标识符按词切分 + 词干化，
+"initialize logging and create the log manager" 能命中 `InitLogging` / `LogManager`。
+
+省 token：`style:"compact"`（只给 file:line，约 1/10）、`limit:5`、`enrich:false`。
+片段共享整体预算，`limit` 越大每条越短——要完整片段就少要几条。
+文档/测试默认降权，找 README/用例时传 `docs:true` / `tests:true`。
 
 ## 优先用 search 的场景
 - **理解陌生代码/流程**：search 拿到 file:line + 调用链，替代十几次盲读
@@ -47,6 +56,11 @@
 5. 未链接 → 先 `link`；纯调用图/影响面问题可直接 `mode: "graph"`
 
 ## 规模参考
-- 大仓库：优先 search（grep 噪声太多，向量检索更精准）
-- 小模块（<50 文件）：直接 read/grep 也可能更快
-- 判定依据是**问题性质**，不是项目大小
+
+search 输出头会标注 `[repo: N files, small/medium/large]` 辅助判断：
+
+- **关系问题** → `graph`，**任意规模**（grep 从原理上答不了）
+- **大库（>2000 文件）**且不知位置 → `both`（grep 在这个规模下噪声淹没）
+- **小库（<300 文件）** → 直接 Grep/Read。实测 flask/requests 上 grep 基线 8 个场景全胜，
+  输出头也会直接提示"grep/read 更省"
+- 判定的**主**依据是问题性质（关系 vs 定位 vs 已知符号），规模只作次要修正

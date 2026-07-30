@@ -1,0 +1,102 @@
+[
+ {
+  "name": "理解陌生子系统(proxy 创建流程)",
+  "query": "how is a proxy created for a service handle",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "ProxyFactory",
+   "CreateProxy",
+   "proxy_factory.cpp"
+  ]
+ },
+ {
+  "name": "关系查询: 谁调用 CreateProxy",
+  "query": "who calls CreateProxy",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "CreateProxy",
+   "ProxyFactory"
+  ]
+ },
+ {
+  "name": "语义: 线程池任务队列",
+  "query": "thread pool worker task queue execute",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "ThreadPool",
+   "PushTask",
+   "thread_pool.h"
+  ]
+ },
+ {
+  "name": "持久化: 键值存储读写",
+  "query": "persist key value pairs and sync to storage",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "KeyValueStorage",
+   "SetValue",
+   "SyncToStorage"
+  ]
+ },
+ {
+  "name": "错误处理: error domain 定义",
+  "query": "error code and error domain definition",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "ErrorDomain",
+   "ErrorCode"
+  ]
+ },
+ {
+  "name": "影响面: 谁调用 SyncToStorage",
+  "query": "callers of SyncToStorage",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "SyncToStorage"
+  ]
+ },
+ {
+  "name": "IPC 绑定: 共享内存零拷贝",
+  "query": "shared memory zero copy inter process communication binding",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "iceoryx"
+  ]
+ },
+ {
+  "name": "健康监控: 监督实体与恢复动作",
+  "query": "supervised entity health monitoring recovery action",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "SupervisedEntity",
+   "RecoveryAction"
+  ]
+ },
+ {
+  "name": "配置解析: manifest 读取",
+  "query": "parse manifest configuration json for instance specifier",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "manifest",
+   "InstanceSpecifier"
+  ]
+ }
+]

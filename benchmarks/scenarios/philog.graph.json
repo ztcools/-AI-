@@ -1,0 +1,109 @@
+[
+ {
+  "name": "理解陌生子系统(日志初始化)",
+  "query": "initialize logging and create the log manager",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "LogManager",
+   "InitLogging",
+   "log_manager.hpp"
+  ]
+ },
+ {
+  "name": "找配置结构定义",
+  "query": "log configuration structure and settings",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "LogConfig",
+   "log_manager.hpp"
+  ]
+ },
+ {
+  "name": "关系查询: 谁调用 InitLogging",
+  "query": "who calls InitLogging",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "InitLogging"
+  ]
+ },
+ {
+  "name": "语义: 线程池/异步日志",
+  "query": "asynchronous logger thread pool message queue",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "thread_pool",
+   "async_logger"
+  ]
+ },
+ {
+  "name": "文件轮转: rotating sink",
+  "query": "rotating file sink rollover when size limit reached",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "rotating_file_sink",
+   "rotate_"
+  ]
+ },
+ {
+  "name": "按天切分日志文件",
+  "query": "daily file sink filename calculator",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "daily_file_sink",
+   "daily_filename_calculator"
+  ]
+ },
+ {
+  "name": "格式化: pattern formatter",
+  "query": "set pattern formatter for log output",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "set_pattern",
+   "pattern_formatter"
+  ]
+ },
+ {
+  "name": "kafka 上报 sink",
+  "query": "kafka sink configuration for remote log delivery",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "kafka_sink_config"
+  ]
+ },
+ {
+  "name": "刷盘: flush 策略",
+  "query": "flush log buffers to disk",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "Flush"
+  ]
+ },
+ {
+  "name": "文件监控",
+  "query": "monitor log directory for file changes",
+  "modes": [
+   "graph"
+  ],
+  "expect": [
+   "file_monitor"
+  ]
+ }
+]
