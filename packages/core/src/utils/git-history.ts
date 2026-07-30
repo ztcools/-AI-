@@ -104,12 +104,16 @@ export function getRemoteUrl(codebasePath: string): string | null {
 }
 
 /**
- * Current branch name (abbrev ref), or null if detached / unavailable.
+ * Current branch name, or null if detached / unavailable.
+ *
+ * Reads the full symbolic ref and strips `refs/heads/` — neither
+ * `rev-parse --abbrev-ref` nor `symbolic-ref --short` is safe, both return
+ * `heads/<branch>` when a same-named tag exists. See getCheckedOutBranch.
  */
 export function getCurrentBranch(codebasePath: string): string | null {
     try {
-        const branch = runGit('rev-parse --abbrev-ref HEAD', path.resolve(codebasePath));
-        return branch && branch !== 'HEAD' ? branch : null;
+        const ref = runGit('symbolic-ref -q HEAD', path.resolve(codebasePath));
+        return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : null;
     } catch {
         return null;
     }

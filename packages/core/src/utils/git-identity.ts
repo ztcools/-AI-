@@ -32,6 +32,31 @@ export function normalizeGitUrl(raw: string): string {
     }
 }
 
+/**
+ * Short name of the checked-out branch, or '' when HEAD is detached.
+ *
+ * Reads the FULL symbolic ref and strips `refs/heads/` ourselves. Both
+ * `git rev-parse --abbrev-ref HEAD` and `git symbolic-ref --short HEAD` share
+ * git's shorten_unambiguous_ref(), which abbreviates only as far as stays
+ * unambiguous: a repo that also has a *tag* named like the branch yields
+ * `heads/<branch>`. Real repos do this (a release process that tags a branch
+ * name — verified on PhiLog's ap_debug_0304), and the fallout is silent: the
+ * identity becomes `<url>:heads/main`, addressing a different collection than
+ * the `<url>:main` everyone else uses, so the index just looks empty.
+ */
+export function getCheckedOutBranch(cwd: string): string {
+    try {
+        const ref = execSync('git symbolic-ref -q HEAD', {
+            cwd,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : '';
+    } catch {
+        return ''; // detached HEAD, or not a git repo
+    }
+}
+
 export function getRepoIdentity(codebasePath: string): string {
     const resolvedPath = path.resolve(codebasePath);
 
@@ -42,11 +67,7 @@ export function getRepoIdentity(codebasePath: string): string {
             stdio: ['pipe', 'pipe', 'pipe']
         }).trim();
 
-        const branch = execSync('git rev-parse --abbrev-ref HEAD', {
-            cwd: resolvedPath,
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe']
-        }).trim();
+        const branch = getCheckedOutBranch(resolvedPath);
 
         if (url && branch) {
             return `${normalizeGitUrl(url)}:${branch}`;

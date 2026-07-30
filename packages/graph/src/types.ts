@@ -19,6 +19,7 @@ export type GraphNodeKind =
   | 'protocol'
   | 'function'
   | 'method'
+  | 'constructor'
   | 'property'
   | 'field'
   | 'variable'
@@ -35,6 +36,25 @@ export type GraphNodeKind =
 
 /** Legacy label type — kept for DB compatibility during transition. */
 export type GraphNodeLabel = GraphNodeKind;
+
+/**
+ * Kinds that own a body, and so can be either end of a CALLS edge.
+ *
+ * Constructors belong here even though search results hide them: a C++ ctor
+ * body calls plenty of things, and leaving it out of the extractor's scope
+ * tracking silently dropped every call made inside one (measured: 3,134 lost
+ * references on a 353-file AUTOSAR repo).
+ */
+export const CALLABLE_KINDS: ReadonlySet<GraphNodeKind> = new Set([
+  'function',
+  'method',
+  'constructor',
+]);
+
+/** True when the kind can be the source or target of a call. */
+export function isCallableKind(kind: GraphNodeKind | string | undefined): boolean {
+  return !!kind && CALLABLE_KINDS.has(kind as GraphNodeKind);
+}
 
 // ── Edge kind ────────────────────────────────────────────────────────
 

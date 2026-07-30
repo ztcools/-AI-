@@ -147,6 +147,62 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
 END;
 `;
 
+/**
+ * Kinds never worth returning as a search hit: import pseudo-nodes, data,
+ * file/parameter/enum-member scaffolding, and constructors (an agent gains
+ * nothing from `OrderService.constructor` alongside `OrderService`).
+ *
+ * `constructor` is a kind for languages whose grammar marks ctors/dtors
+ * structurally — C++ tells them by having no return type — while JS/TS needs the
+ * `.constructor` name check in buildNodeResults. Filtered from results only:
+ * the nodes stay in the graph so "who instantiates X" traversals keep the edge.
+ */
+const RESULT_NOISE_KINDS = new Set([
+  'import',
+  'variable',
+  'parameter',
+  'file',
+  'enum_member',
+  'constructor',
+]);
+
+/**
+ * Words that carry no locating power in a code query.
+ *
+ * Both the FTS pass and the LIKE fallback expand every token to a prefix-OR, so
+ * one function word is enough to swamp the real term: `how is a proxy created
+ * for a service handle` matched on `service`/`create` and put a Python codegen
+ * script above `ProxyFactory::CreateProxy`, which never ranked at all. The
+ * interrogatives matter specifically because an agent asking a relationship
+ * question phrases it as a question ("who calls X", "where is Y handled").
+ *
+ * Filtering is best-effort: a query made entirely of these words keeps them,
+ * since an empty MATCH is worse than a vague one.
+ */
+const QUERY_NOISE_WORDS = new Set([
+  // generic code vocabulary
+  'class', 'function', 'method', 'type', 'interface', 'object',
+  'string', 'number', 'data', 'import', 'export', 'module', 'file',
+  'code', 'use', 'get', 'set', 'add', 'new',
+  // interrogatives / relationship phrasing
+  'how', 'what', 'where', 'when', 'why', 'who', 'whom', 'which',
+  'does', 'did', 'do', 'is', 'are', 'was', 'were', 'be', 'been', 'can',
+  // articles, prepositions, conjunctions, pronouns
+  'the', 'and', 'for', 'an', 'of', 'to', 'in', 'on', 'at', 'by', 'or',
+  'with', 'from', 'into', 'that', 'this', 'these', 'those', 'it', 'its',
+  'as', 'via', 'any', 'all',
+]);
+
+/** Query tokens worth searching for, noise words dropped where something remains. */
+function meaningfulQueryTokens(query: string): string[] {
+  const raw = query
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(/[\s_\-.:/]+/)
+    .filter(t => t.length > 1);
+  const meaningful = raw.filter(t => !QUERY_NOISE_WORDS.has(t.toLowerCase()));
+  return meaningful.length > 0 ? meaningful : raw;
+}
+
 // ── Edge dedup: handled by UNIQUE constraint on (source_id, target_id, kind, line, col) ──
 
 // ── Implementation ──────────────────────────────────────────────────
@@ -523,21 +579,9 @@ export class SqliteGraphStore implements GraphStore {
       }
 
       // Second pass: LIKE substring (supplements, not replaces, FTS).
-      // Strategy: filter noise words (>2 chars, skip common programming terms
-      // that match almost everything). For short queries (≤3 meaningful words),
-      // use OR semantics. For longer queries (4+ words), require majority match.
-      const NOISE_WORDS = new Set([
-        'class','function','method','type','interface','object',
-        'string','number','data','import','export','module','file',
-        'code','the','and','for','use','get','set','add','new',
-      ]);
-      let rawWords = (options.query || '')
-        .replace(/([a-z])([A-Z])/g, '$1 $2')
-        .split(/[\s_\-.:/]+/)
-        .filter((t: string) => t.length > 1);
-      // Only filter noise words if we have enough meaningful ones left
-      const meaningful = rawWords.filter(t => !NOISE_WORDS.has(t.toLowerCase()));
-      const words = meaningful.length > 0 ? meaningful : rawWords;
+      // For short queries (≤3 meaningful words) use OR semantics; for longer
+      // ones require a majority match. See QUERY_NOISE_WORDS.
+      const words = meaningfulQueryTokens(options.query || '');
       if (words.length > 0) {
         const useOr = words.length <= 3;
         const likeParams = words.flatMap((t: string) => [`%${t}%`, `%${t}%`]);
@@ -616,9 +660,8 @@ export class SqliteGraphStore implements GraphStore {
       }
 
       // Apply offset/limit after merging, excluding noise kinds
-      const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
       const filtered = allRows.filter(row =>
-        !NOISE_KINDS.has(row.kind as string) && !NOISE_KINDS.has(row.label as string)
+        !RESULT_NOISE_KINDS.has(row.kind as string) && !RESULT_NOISE_KINDS.has(row.label as string)
       );
       const start = offset || 0;
       const sliced = filtered.slice(start, start + limit);
@@ -682,14 +725,11 @@ export class SqliteGraphStore implements GraphStore {
     options: GraphSearchOptions,
     offset: number,
   ): GraphSearchResponse {
-    // Exclude noise: import pseudo-nodes, variables, file nodes, parameter/enum_member,
-    // and constructor methods (no agent benefit from seeing OrderService.constructor).
-    const NOISE_KINDS = new Set(['import', 'variable', 'parameter', 'file', 'enum_member']);
     const filteredRows = rows.filter(row => {
       const k = (row.kind || row.label) as string;
       const name = (row.name as string) || '';
-      // Exclude by kind
-      if (NOISE_KINDS.has(k)) return false;
+      // Exclude by kind — see RESULT_NOISE_KINDS
+      if (RESULT_NOISE_KINDS.has(k)) return false;
       // Exclude constructor methods
       if (k === 'method' && name.endsWith('.constructor')) return false;
       return true;
@@ -1290,12 +1330,10 @@ export class SqliteGraphStore implements GraphStore {
   // ── Helpers ────────────────────────────────────────────────────────
 
   private buildFtsQuery(query: string): string {
-    const tokens = query
-      .replace(/([a-z])([A-Z])/g, '$1 $2')
-      .split(/[\s_\-.:/]+/)
-      .filter(t => t.length > 1);
     // Prefix matching: "ord"* matches "OrderService" stored as single token
-    return tokens.map(t => `"${t.replace(/"/g, '""')}"*`).join(' OR ');
+    return meaningfulQueryTokens(query)
+      .map(t => `"${t.replace(/"/g, '""')}"*`)
+      .join(' OR ');
   }
 
   private regexToLike(pattern: string): string {

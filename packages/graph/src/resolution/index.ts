@@ -211,11 +211,18 @@ function getRepoIdentity(projectRoot: string): string {
       encoding: 'utf-8',
       timeout: 5000,
     }).trim();
-    const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+    // Full symbolic ref + manual strip: both `rev-parse --abbrev-ref` and
+    // `symbolic-ref --short` return `heads/<branch>` when a tag shares the
+    // branch's name, which would silently split one project's graph across two
+    // project ids. Mirrors core/src/utils/git-identity.ts:getCheckedOutBranch
+    // (graph has no core dep).
+    const ref = execSync('git symbolic-ref -q HEAD', {
       cwd: resolvedPath,
       encoding: 'utf-8',
       timeout: 5000,
     }).trim();
+    const branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : '';
+    if (!branch) return path.basename(resolvedPath);
     const normalizedUrl = normalizeGitUrl(url);
     return `${normalizedUrl}:${branch}`;
   } catch {
@@ -262,6 +269,21 @@ export class ReferenceResolver {
   private nodeCache: Map<number, GraphNode> = new Map();
   /** Names that failed all strategies — persist across batches. */
   private unresolvableCache: Set<string> = new Set();
+  /**
+   * Positive-outcome memo, scoped to one (file, referenceKind, name) triple.
+   *
+   * Every input the strategy chain reads is that triple plus immutable graph
+   * state, so the same triple always resolves to the same target — yet without
+   * this each repetition re-ran the full chain. Measured on a 1360-file AUTOSAR
+   * repo: 52,405 refs collapse to 7,610 distinct triples, so 85% of the work was
+   * recomputation (`_cpptest_TestObject` alone appeared 5,781 times, each time
+   * re-scoring ~886 same-named candidates).
+   *
+   * Reset per file group in resolveAll. `same-file-closest-scope` outcomes are
+   * deliberately NOT memoized: that strategy reads ref.startLine, so two refs to
+   * one name in one file can legitimately resolve to different enclosing scopes.
+   */
+  private perFileResolutionMemo: Map<string, { targetNodeId: number; resolvedBy: string; confidence: number }> = new Map();
   private stats: ResolutionResult['stats'] = {
     total: 0,
     resolved: 0,
@@ -385,6 +407,8 @@ export class ReferenceResolver {
       // Pre-extract import mappings for this file
       let importMappings: ImportMapping[] | null = null;
       let importMappingsLoaded = false;
+      // Memo is (file, kind, name)-scoped — a new file starts fresh.
+      this.perFileResolutionMemo.clear();
 
       for (const ref of fileRefs) {
         const refName = ref.referenceName;
@@ -394,6 +418,15 @@ export class ReferenceResolver {
         if (this.unresolvableCache.has(refName)) {
           unresolved.push(ref);
           incrementStat(byMethod, 'unresolvable-cache');
+          continue;
+        }
+
+        // Step 0b: Positive memo — this exact (file, kind, name) already resolved.
+        const memoKey = `${ref.referenceKind || ''} ${refName}`;
+        const memoized = this.perFileResolutionMemo.get(memoKey);
+        if (memoized) {
+          resolved.push({ original: ref, ...memoized });
+          incrementStat(byMethod, memoized.resolvedBy);
           continue;
         }
 
@@ -430,12 +463,25 @@ export class ReferenceResolver {
           importMappingsLoaded = true;
         }
 
+        // Record a hit so the file's remaining refs to this name skip the chain.
+        // Line-sensitive strategies must stay per-ref, so they are not memoized.
+        const accept = (r: ResolvedRef): void => {
+          resolved.push(r);
+          incrementStat(byMethod, r.resolvedBy);
+          if (r.resolvedBy !== 'same-file-closest-scope') {
+            this.perFileResolutionMemo.set(memoKey, {
+              targetNodeId: r.targetNodeId,
+              resolvedBy: r.resolvedBy,
+              confidence: r.confidence,
+            });
+          }
+        };
+
         if (importMappings && importMappings.length > 0) {
           // Try standard import resolution
           const importResolved = resolveViaImport(ref, ctx, importMappings);
           if (importResolved) {
-            resolved.push(importResolved);
-            incrementStat(byMethod, importResolved.resolvedBy);
+            accept(importResolved);
             continue;
           }
 
@@ -443,8 +489,7 @@ export class ReferenceResolver {
           if (language === 'java' || language === 'scala') {
             const jvmResolved = resolveJvmImport(ref, ctx, importMappings);
             if (jvmResolved) {
-              resolved.push(jvmResolved);
-              incrementStat(byMethod, jvmResolved.resolvedBy);
+              accept(jvmResolved);
               continue;
             }
           }
@@ -454,8 +499,7 @@ export class ReferenceResolver {
         if (refName.includes('.') && ref.referenceKind === 'calls') {
           const methodResolved = matchMethodCall(ref, ctx);
           if (methodResolved) {
-            resolved.push(methodResolved);
-            incrementStat(byMethod, methodResolved.resolvedBy);
+            accept(methodResolved);
             continue;
           }
         }
@@ -463,8 +507,7 @@ export class ReferenceResolver {
         // Step 4: Name matching pipeline
         const nameResolved = matchReference(ref, ctx);
         if (nameResolved) {
-          resolved.push(nameResolved);
-          incrementStat(byMethod, nameResolved.resolvedBy);
+          accept(nameResolved);
           continue;
         }
 

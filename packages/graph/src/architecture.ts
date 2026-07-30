@@ -2,7 +2,7 @@
  * Architecture analyzer. Provides high-level architecture overview
  * including package structure, entry points, and simple clustering.
  */
-import { GraphStore, GraphNode, GraphEdge, ArchitectureOverview, ArchitectureCluster, PackageTreeNode, GraphEdgeType } from './types';
+import { GraphStore, GraphNode, GraphEdge, ArchitectureOverview, ArchitectureCluster, PackageTreeNode, GraphEdgeType, isCallableKind } from './types';
 
 export class ArchitectureAnalyzer {
     private store: GraphStore;
@@ -81,7 +81,7 @@ export class ArchitectureAnalyzer {
         const candidates: Array<{ node: GraphNode; score: number }> = [];
 
         // Filter to Function/Method nodes first
-        const funcNodes = nodes.filter(n => n.kind === 'function' || n.kind === 'method');
+        const funcNodes = nodes.filter(n => isCallableKind(n.kind));
 
         // Batch-load degrees for all candidate nodes to avoid N+1 queries
         const degreeMap = this.store.getNodeDegreesBatch(funcNodes.map(n => n.id));

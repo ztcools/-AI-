@@ -21,6 +21,36 @@ import {
 } from '@seeway/claude-context-graph';
 import { getRepoIdentity } from '@seeway/claude-context-core';
 
+/**
+ * Is this path one of our own on-disk artifacts rather than user code?
+ *
+ * The graph database lives at `<project>/.context/graph/`, and most repos do not
+ * gitignore `.context/` — so `git ls-files --others` reports the database (plus its
+ * -wal/-shm siblings) as "changed" every time. Without this filter every search
+ * saw pending changes and kicked off an incremental re-index of the graph's own
+ * storage: work that can never converge, because writing the graph re-dirties the
+ * very files that triggered it. The graph package's own change detection already
+ * excludes them (graph/src/indexer.ts); this is the same rule on the MCP path.
+ */
+function isOwnArtifact(file: string): boolean {
+  return /^\.context\//.test(file.replace(/\\/g, '/'));
+}
+
+/**
+ * A node's qualified name with the repo-identity prefix removed.
+ *
+ * Nodes are keyed `<identity>.<path>.<name>`, and the identity is a full clone
+ * URL plus branch — so printing it raw spent ~110 characters per line restating
+ * the repo the agent is already asking about. An architecture block with ten
+ * entry points burned over a kilobyte of context on the same URL.
+ */
+function displayQualifiedName(node: { qualifiedName: string; project?: string }): string {
+  const { qualifiedName, project } = node;
+  return project && qualifiedName.startsWith(`${project}.`)
+    ? qualifiedName.slice(project.length + 1)
+    : qualifiedName;
+}
+
 export class GraphToolHandlers {
   private store: SqliteGraphStore;
   private traverser: GraphTraverser;
@@ -213,7 +243,7 @@ export class GraphToolHandlers {
 
     for (const r of result.results) {
       const n = r.node;
-      lines.push(`- ${n.kind}: ${n.name} (${n.qualifiedName})`);
+      lines.push(`- ${n.kind}: ${n.name} (${displayQualifiedName(n)})`);
       lines.push(`  File: ${n.filePath}:${n.startLine}-${n.endLine}`);
       if (n.signature) lines.push(`  Sig: ${n.signature}`);
       lines.push(`  Degree: in=${r.inDegree}, out=${r.outDegree}`);
@@ -264,7 +294,7 @@ export class GraphToolHandlers {
       const callees = direction !== 'inbound' ? this.traverser.getCallees(root.id, depth) : [];
 
       const lines: string[] = [];
-      lines.push(`Trace for: ${root.name} (${root.qualifiedName})`);
+      lines.push(`Trace for: ${root.name} (${displayQualifiedName(root)})`);
       lines.push(`File: ${root.filePath}:${root.startLine}-${root.endLine}`);
       if (root.signature) lines.push(`Signature: ${root.signature}`);
       lines.push('');
@@ -272,7 +302,7 @@ export class GraphToolHandlers {
       if (callers.length > 0) {
         lines.push(`Callers (${callers.length}):`);
         for (const c of callers) {
-          lines.push(`  ${c.node.name} (${c.node.qualifiedName})`);
+          lines.push(`  ${c.node.name} (${displayQualifiedName(c.node)})`);
           lines.push(`    ${c.node.filePath}:${c.node.startLine} —${c.edge.kind}→ ${root.name}`);
         }
         lines.push('');
@@ -281,7 +311,7 @@ export class GraphToolHandlers {
       if (callees.length > 0) {
         lines.push(`Callees (${callees.length}):`);
         for (const c of callees) {
-          lines.push(`  ${c.node.name} (${c.node.qualifiedName})`);
+          lines.push(`  ${c.node.name} (${displayQualifiedName(c.node)})`);
           lines.push(`    ${c.node.filePath}:${c.node.startLine} ${root.name} —${c.edge.kind}→`);
         }
         lines.push('');
@@ -378,7 +408,7 @@ export class GraphToolHandlers {
     if (arch.entryPoints.length > 0) {
       lines.push(`Entry points (${arch.entryPoints.length}):`);
       for (const ep of arch.entryPoints) {
-        lines.push(`  - ${ep.name} (${ep.qualifiedName})`);
+        lines.push(`  - ${ep.name} (${displayQualifiedName(ep)})`);
       }
       lines.push('');
     }
@@ -411,7 +441,10 @@ export class GraphToolHandlers {
         const refHead = execSync('git symbolic-ref refs/remotes/origin/HEAD', {
           cwd: repoPath, encoding: 'utf-8', timeout: 5000,
         }).trim();
-        diffBranch = refHead.split('/').pop() || 'main';
+        // refs/remotes/origin/<branch> — strip the prefix, don't split on '/':
+        // a default branch like `release/2.0` would become just `2.0`.
+        const prefix = 'refs/remotes/origin/';
+        diffBranch = refHead.startsWith(prefix) ? refHead.slice(prefix.length) : (refHead.split('/').pop() || 'main');
       } catch {
         for (const candidate of ['main', 'master', 'develop']) {
           try {
@@ -431,7 +464,8 @@ export class GraphToolHandlers {
         const unstaged = execSync('git diff --name-only', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
         const staged = execSync('git diff --name-only --cached', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
         const untracked = execSync('git ls-files --others --exclude-standard', { cwd: repoPath, encoding: 'utf-8', timeout: 10000 });
-        worktreeFiles = (unstaged + '\n' + staged + '\n' + untracked).trim().split('\n').filter(Boolean);
+        worktreeFiles = (unstaged + '\n' + staged + '\n' + untracked)
+          .trim().split('\n').filter(Boolean).filter(f => !isOwnArtifact(f));
       } catch { /* non-git or read error */ }
 
       // 未提交改动优先返回：这是"图实时性"的核心，与分支分叉检测解耦，
@@ -454,7 +488,7 @@ export class GraphToolHandlers {
         } catch { /* ignore */ }
       }
 
-      const changedFiles = Array.from(new Set(branchFiles));
+      const changedFiles = Array.from(new Set(branchFiles.filter(f => !isOwnArtifact(f))));
       return { changedFiles, diffBranch };
     } catch {
       return null;

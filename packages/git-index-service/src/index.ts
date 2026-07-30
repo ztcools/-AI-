@@ -1,14 +1,17 @@
-import { loadServiceConfig, buildContext } from './config.js';
+import * as path from 'path';
+import { loadServiceConfig, buildContextPool, indexConcurrency, releaseAfterIndex } from './config.js';
 import { createRepoProvider, StoreRepoProvider } from './repo-provider.js';
 import { RepoManager } from './repo-manager.js';
 import { GitIndexer } from './indexer.js';
 import { Scheduler } from './scheduler.js';
 import { startHttpServer } from './server.js';
 import { ConfigStore } from './config-store.js';
+import { RunStore } from './run-store.js';
 import { SshKeyManager } from './ssh-key.js';
 
 async function main(): Promise<void> {
     const config = loadServiceConfig();
+    const concurrency = indexConcurrency();
     console.log('[GitIndexService] Starting with config:', {
         source: config.source,
         workdir: config.workdir,
@@ -18,9 +21,11 @@ async function main(): Promise<void> {
         dailyHour: config.dailyHour,
         intervalMs: config.intervalMs,
         httpPort: config.httpPort,
+        concurrency,
+        releaseAfterIndex: releaseAfterIndex(),
     });
 
-    const context = buildContext();
+    const contexts = buildContextPool(concurrency);
     const sshKeys = new SshKeyManager(config.sshDir);
     sshKeys.ensureKeyPair();
     const repoManager = new RepoManager(config.workdir, sshKeys);
@@ -33,14 +38,26 @@ async function main(): Promise<void> {
         updatedAt: 0,
     });
 
+    // Per-branch run status, in its own file so a status write can never corrupt
+    // the repo list. Without it every restart blanks the console's index history.
+    const runStore = new RunStore(path.join(path.dirname(config.configFile), 'git-index-runs.json'));
+
     // GitLab-source keeps API auto-discovery; otherwise repos come live from the store.
     const repoProvider = config.source === 'gitlab'
         ? createRepoProvider(config)
         : new StoreRepoProvider(store);
-    const indexer = new GitIndexer(context, repoManager, repoProvider, store);
+    const indexer = new GitIndexer({
+        contexts,
+        repoManager,
+        repoProvider,
+        store,
+        runStore,
+        releaseAfterIndex: releaseAfterIndex(),
+    });
 
     if (config.runOnce) {
         const results = await indexer.indexAll();
+        runStore.flush();
         const failed = results.filter(r => !r.ok).length;
         process.exit(failed > 0 ? 1 : 0);
     }
@@ -64,6 +81,9 @@ async function main(): Promise<void> {
     const shutdown = () => {
         console.log('[GitIndexService] Shutting down...');
         scheduler.stop();
+        // Flush any status coalesced but not yet written, so a redeploy mid-pass
+        // doesn't lose the branches that already finished.
+        runStore.flush();
         process.exit(0);
     };
     process.on('SIGINT', shutdown);

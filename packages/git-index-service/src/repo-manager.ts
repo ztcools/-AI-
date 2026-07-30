@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { RepoSpec } from './config.js';
 import { SshKeyManager } from './ssh-key.js';
+import { tokenUserCandidates } from './git-host.js';
 
 /**
  * Owns local mirrors of the main repositories and keeps them at the tip of their
@@ -12,12 +13,55 @@ import { SshKeyManager } from './ssh-key.js';
  * touches Milvus (that is delegated to the core Context by the Indexer).
  */
 export class RepoManager {
+    /** host → basic-auth username that authenticated successfully (see authUrls). */
+    private hostTokenUser = new Map<string, string>();
+
     constructor(private workdir: string, private ssh: SshKeyManager) {}
 
+    /**
+     * One checkout per *repository*, not per branch. A per-branch directory meant a
+     * full clone of the same objects for every protected branch — measured 6 × 30 MB
+     * for one 6-branch repo, which at the planned scale (hundreds of repos × several
+     * branches) becomes the binding constraint on a shared data partition. Branches
+     * of one repo are indexed sequentially in the same directory instead, so their
+     * objects are stored once and only the working tree is switched.
+     *
+     * Keyed by name + url so two configs pointing at the same remote stay isolated:
+     * a worker owns a whole repo, which is what makes cross-repo concurrency safe.
+     */
     private dirFor(repo: RepoSpec): string {
-        const hash = crypto.createHash('md5').update(`${repo.url}#${repo.branch}`).digest('hex').slice(0, 12);
+        const hash = crypto.createHash('md5').update(`${repo.name}#${repo.url}`).digest('hex').slice(0, 12);
         const safe = repo.name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 60);
         return path.join(this.workdir, `${safe}_${hash}`);
+    }
+
+    /**
+     * Delete checkout directories that no longer belong to any configured repo —
+     * repos removed from the console, and the per-branch directories left behind by
+     * the older layout. Without this the workdir only ever grows: stale clones of
+     * deleted repos are never reclaimed. Called at the start of each indexing pass.
+     */
+    pruneStale(repos: RepoSpec[]): { removed: string[]; freedBytes: number } {
+        const removed: string[] = [];
+        let freedBytes = 0;
+        if (!fs.existsSync(this.workdir)) return { removed, freedBytes };
+
+        const keep = new Set(repos.map(r => path.basename(this.dirFor(r))));
+        for (const entry of fs.readdirSync(this.workdir, { withFileTypes: true })) {
+            if (!entry.isDirectory() || keep.has(entry.name)) continue;
+            const full = path.join(this.workdir, entry.name);
+            // Only ever remove something that is itself a git checkout — never an
+            // unrelated directory that happens to share the workdir.
+            if (!fs.existsSync(path.join(full, '.git'))) continue;
+            try {
+                freedBytes += dirSize(full);
+                fs.rmSync(full, { recursive: true, force: true });
+                removed.push(entry.name);
+            } catch (e: any) {
+                console.warn(`[RepoManager] failed to prune '${entry.name}': ${e?.message || e}`);
+            }
+        }
+        return { removed, freedBytes };
     }
 
     /** A repo authenticates over SSH whenever no token is configured. */
@@ -38,32 +82,120 @@ export class RepoManager {
     }
 
     /**
-     * The URL git actually fetches from: token → https with oauth2 basic auth;
-     * no token → SSH (using the service deploy key). `origin` always stays the
-     * canonical token-free URL so the index identity matches developer checkouts.
+     * A token may be given as `<basicAuthUser>:<secret>` to pin the basic-auth
+     * username explicitly (e.g. `private-token:abc123`), or as a bare secret and
+     * let the host flavor decide it.
      */
-    private fetchUrl(repo: RepoSpec): string {
-        if (repo.token) {
-            try {
-                const u = new URL(repo.url);
-                if (u.protocol === 'https:') {
-                    u.username = 'oauth2';
-                    u.password = repo.token;
-                    return u.toString();
-                }
-            } catch { /* not an http url — use as-is */ }
-            return repo.url;
-        }
-        return this.toSshUrl(repo.url);
+    private splitToken(token: string): { user?: string; secret: string } {
+        const i = token.indexOf(':');
+        if (i > 0) return { user: token.slice(0, i), secret: token.slice(i + 1) };
+        return { secret: token };
     }
 
-    /** Strip any embedded credentials from a git error message before it can
-     *  reach logs or an HTTP response (oauth2:<token>@host → oauth2:***@host). */
+    /**
+     * Convert an scp-style or ssh:// URL to https form, so a token can be attached
+     * to it. Pasting a repo's SSH clone URL together with a token is a natural
+     * thing to do, and silently dropping the token would fail on a missing deploy
+     * key instead — an error that points nowhere near the real cause.
+     */
+    private toHttpsUrl(url: string): string {
+        if (/^https?:\/\//i.test(url)) return url;
+        const ssh = url.match(/^(?:ssh|git):\/\/(?:[^@/]+@)?([^:/]+)(?::\d+)?\/(.+)$/i);
+        if (ssh) return `https://${ssh[1]}/${ssh[2]}`;
+        const scp = url.match(/^(?:[A-Za-z0-9._-]+@)?([^:/\s]+):(?!\/)(.+)$/);
+        if (scp) return `https://${scp[1]}/${scp[2]}`;
+        return url;
+    }
+
+    /**
+     * Candidate URLs git may fetch from, in order to try: token → https with basic
+     * auth (one entry per credential flavor still worth trying); no token → SSH
+     * with the service deploy key. `origin` always stays the canonical token-free
+     * URL so the index identity matches developer checkouts.
+     */
+    private authUrls(repo: RepoSpec): string[] {
+        if (!repo.token) return [this.toSshUrl(repo.url)];
+
+        // A token only travels over https basic auth — normalize SSH forms first.
+        const httpsUrl = this.toHttpsUrl(repo.url);
+        let parsed: URL;
+        try {
+            parsed = new URL(httpsUrl);
+        } catch {
+            return [repo.url]; // unparseable — hand it to git as-is
+        }
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return [repo.url];
+
+        const { user, secret } = this.splitToken(repo.token);
+        const cached = this.hostTokenUser.get(parsed.host);
+        const users = user ? [user] : cached ? [cached] : tokenUserCandidates(parsed.hostname);
+
+        return users.map(name => {
+            const withAuth = new URL(httpsUrl);
+            withAuth.username = name;
+            withAuth.password = secret;
+            return withAuth.toString();
+        });
+    }
+
+    /** Remember which basic-auth username worked, so later commands skip the probing. */
+    private rememberTokenUser(url: string): void {
+        try {
+            const u = new URL(url);
+            if (u.username && u.password) this.hostTokenUser.set(u.host, u.username);
+        } catch { /* ssh form — nothing to remember */ }
+    }
+
+    /** Credential rejection (worth retrying with another username) vs any other failure. */
+    private isAuthError(err: any): boolean {
+        const m = String(err?.message || err).toLowerCase();
+        return m.includes('authentication failed')
+            || m.includes('access denied')
+            || m.includes('401')
+            || m.includes('403')
+            || m.includes('could not read username');
+    }
+
+    /**
+     * Run a git command that talks to the remote, trying each candidate credential
+     * URL until one authenticates. `build` receives the fetch URL and returns the
+     * git argument string. Non-auth failures propagate immediately.
+     */
+    private async gitRemote(
+        dir: string,
+        build: (fetchUrl: string) => string,
+        repo: RepoSpec,
+        timeoutMs?: number,
+    ): Promise<string> {
+        const urls = this.authUrls(repo);
+        const useSsh = this.useSsh(repo);
+        let lastErr: any;
+        for (let i = 0; i < urls.length; i++) {
+            try {
+                const args = build(urls[i]);
+                const out = timeoutMs === undefined
+                    ? await this.git(dir, args, useSsh)
+                    : await this.gitWithTimeout(dir, args, useSsh, timeoutMs);
+                this.rememberTokenUser(urls[i]);
+                return out;
+            } catch (e: any) {
+                lastErr = e;
+                const more = i < urls.length - 1;
+                if (!this.isAuthError(e) || !more) throw e;
+                console.warn(`[RepoManager] '${repo.name}': credentials rejected, retrying with a different token username.`);
+            }
+        }
+        throw lastErr;
+    }
+
+    /** Strip the secret from any credentials embedded in a git error message before
+     *  it reaches logs or an HTTP response (private-token:<token>@host →
+     *  private-token:***@host). The username survives — it tells an admin which
+     *  credential flavor was rejected. */
     private sanitizeError(err: any): Error {
         const msg = String(err?.message || err);
         const cleaned = msg
-            .replace(/(oauth2:)[^@\s]+(@)/gi, '$1***$2')
-            .replace(/(https?:\/\/)[^/\s:]+:[^@\s]+(@)/gi, '$1***:***$2');
+            .replace(/(https?:\/\/)([^/\s:@]+):[^@\s]+(@)/gi, '$1$2:***$3');
         const e = new Error(cleaned);
         (e as any).code = (err as any)?.code;
         return e;
@@ -98,13 +230,13 @@ export class RepoManager {
      * This makes "add repo, leave branch as main" work for repos whose default is
      * master/dev/etc., instead of failing with "couldn't find remote ref".
      */
-    private async resolveBranch(cwd: string, fetchUrl: string, requested: string, useSsh: boolean): Promise<string> {
+    private async resolveBranch(cwd: string, repo: RepoSpec, requested: string): Promise<string> {
         try {
-            const heads = await this.git(cwd, `ls-remote --heads "${fetchUrl}" "${requested}"`, useSsh);
+            const heads = await this.gitRemote(cwd, u => `ls-remote --heads "${u}" "${requested}"`, repo);
             if (heads.trim()) return requested;
         } catch { /* fall through to default */ }
         try {
-            const symref = await this.git(cwd, `ls-remote --symref "${fetchUrl}" HEAD`, useSsh);
+            const symref = await this.gitRemote(cwd, u => `ls-remote --symref "${u}" HEAD`, repo);
             const m = symref.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
             if (m && m[1]) {
                 console.warn(`[RepoManager] Branch '${requested}' not found on remote; using default '${m[1]}'.`);
@@ -123,10 +255,8 @@ export class RepoManager {
      */
     async ensureCheckout(repo: RepoSpec): Promise<{ dir: string; branch: string }> {
         fs.mkdirSync(this.workdir, { recursive: true });
-        const fetchUrl = this.fetchUrl(repo);
-        const useSsh = this.useSsh(repo);
 
-        const branch = await this.resolveBranch(this.workdir, fetchUrl, repo.branch, useSsh);
+        const branch = await this.resolveBranch(this.workdir, repo, repo.branch);
         const dir = this.dirFor({ ...repo, branch });
 
         if (!fs.existsSync(path.join(dir, '.git'))) {
@@ -139,10 +269,18 @@ export class RepoManager {
         }
 
         // Fetch full history (needed for commit-to-commit diffs) from the auth URL.
-        await this.git(dir, `fetch --prune "${fetchUrl}" "${branch}"`, useSsh);
+        await this.gitRemote(dir, u => `fetch --prune "${u}" "${branch}"`, repo);
+
+        // The directory is shared by every branch of this repo, so the previous
+        // branch's working tree has to be cleared before switching: `git ls-files
+        // --others` (how the indexer enumerates files) counts untracked leftovers,
+        // which would otherwise index a file from branch A into branch B.
+        try { await this.git(dir, 'reset -q --hard'); } catch { /* unborn HEAD on a fresh init */ }
+        try { await this.git(dir, 'clean -fdq'); } catch { /* nothing to clean */ }
         // Point a named local branch at the fetched tip so identity resolves to url:branch.
-        await this.git(dir, `checkout -B "${branch}" FETCH_HEAD`);
-        await this.git(dir, 'reset --hard FETCH_HEAD');
+        await this.git(dir, `checkout -q -B "${branch}" FETCH_HEAD`);
+        await this.git(dir, 'reset -q --hard FETCH_HEAD');
+        try { await this.git(dir, 'clean -fdq'); } catch { /* nothing to clean */ }
 
         return { dir, branch };
     }
@@ -153,9 +291,8 @@ export class RepoManager {
      * branches to link/index. Throws on auth/network failure.
      */
     async listRemoteBranches(repo: RepoSpec, timeoutMs = 30_000): Promise<string[]> {
-        const fetchUrl = this.fetchUrl(repo);
-        const useSsh = this.useSsh(repo);
-        const out = await this.gitWithTimeout(this.workdir, `ls-remote --heads "${fetchUrl}"`, useSsh, timeoutMs);
+        fs.mkdirSync(this.workdir, { recursive: true });
+        const out = await this.gitRemote(this.workdir, u => `ls-remote --heads "${u}"`, repo, timeoutMs);
         const branches: string[] = [];
         for (const line of out.split('\n')) {
             const m = line.match(/refs\/heads\/(\S+)\s*$/);
@@ -184,4 +321,19 @@ export class RepoManager {
             });
         });
     }
+}
+
+/** Recursive size of a directory, best-effort (only used to report freed space). */
+function dirSize(dir: string): number {
+    let total = 0;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        try {
+            if (e.isDirectory()) total += dirSize(full);
+            else if (e.isFile()) total += fs.statSync(full).size;
+        } catch { /* raced with deletion */ }
+    }
+    return total;
 }

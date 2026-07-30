@@ -519,6 +519,43 @@ export class MilvusVectorDatabase implements VectorDatabase {
         });
     }
 
+    /**
+     * Seal growing segments so getCollectionStatistics stops reporting 0 for a
+     * just-indexed collection. Best-effort: a failed flush costs nothing but a
+     * stale row count, so it must never fail the indexing pass that called it.
+     */
+    async flush(collectionName: string): Promise<void> {
+        await this.ensureInitialized();
+        if (!this.client) return;
+
+        try {
+            await this.client.flushSync({ collection_names: [collectionName] });
+        } catch (error: any) {
+            console.warn(`[MilvusDB] flush failed for '${collectionName}' (row count may lag): ${error?.message || error}`);
+        }
+    }
+
+    /**
+     * Release a collection from query-node memory and forget it in the load cache,
+     * so the next search re-loads it on demand.
+     *
+     * Called by the indexing service after writing a collection it does not intend
+     * to search — otherwise a pass over every repo/branch leaves all of them
+     * resident (see `VectorDatabase.release`). Best-effort: a failed release only
+     * costs memory, so it must never fail the pass that called it.
+     */
+    async release(collectionName: string): Promise<void> {
+        await this.ensureInitialized();
+        if (!this.client) return;
+
+        try {
+            await this.client.releaseCollection({ collection_name: collectionName });
+            this.loadedCollections.delete(collectionName);
+        } catch (error: any) {
+            console.warn(`[MilvusDB] release failed for '${collectionName}' (stays resident): ${error?.message || error}`);
+        }
+    }
+
     async delete(collectionName: string, ids: string[]): Promise<void> {
         await this.ensureInitialized();
         await this.ensureLoaded(collectionName);

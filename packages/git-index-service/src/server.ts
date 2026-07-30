@@ -5,6 +5,7 @@ import { Scheduler } from './scheduler.js';
 import { RepoSpec, normalizeProtectedBranches } from './config.js';
 import { SshKeyManager } from './ssh-key.js';
 import { RepoManager } from './repo-manager.js';
+import { detectGitHost } from './git-host.js';
 
 /**
  * Management HTTP API for the git index service. Framework-free. Enables CORS so
@@ -13,6 +14,7 @@ import { RepoManager } from './repo-manager.js';
  *   GET  /status                 overall status (schedule, repos, per-branch last runs)
  *   GET  /repos                  list repos (tokens masked)
  *   GET  /branches?name=<repo>   list remote branches of a repo (for /seeway-link pick-list)
+ *   GET  /detect?url=<repoUrl>   detect hosting platform + expected token flavor
  *   GET  /ssh-key                the service SSH deploy public key
  *   POST /repos                  add/replace a repo {name,url,branch,protectedBranches?,token?}
  *   PUT  /repos/:name            update a repo (protectedBranches: omitted = keep, [] = clear)
@@ -30,15 +32,25 @@ export function startHttpServer(
     sshKeys: SshKeyManager,
     repoManager: RepoManager,
 ): http.Server {
-    const maskRepo = (r: RepoSpec) => ({
-        name: r.name,
-        url: r.url,
-        branch: r.branch,
-        protectedBranches: r.protectedBranches || [],
-        hasToken: !!r.token,
-        // token → https clone/pull; no token → ssh with the service deploy key
-        auth: r.token ? 'https' : 'ssh',
-    });
+    const maskRepo = (r: RepoSpec) => {
+        const host = detectGitHost(r.url);
+        return {
+            name: r.name,
+            url: r.url,
+            branch: r.branch,
+            protectedBranches: r.protectedBranches || [],
+            hasToken: !!r.token,
+            // token → https clone/pull; no token → ssh with the service deploy key
+            auth: r.token ? 'https' : 'ssh',
+            // Detected hosting platform. The console displays it and uses it to
+            // tell the operator which token flavor this host expects — the same
+            // table the fetch path uses to pick a basic-auth username.
+            platform: host.platform,
+            platformLabel: host.label,
+            tokenUser: host.tokenUser,
+            urlScheme: host.scheme,
+        };
+    };
 
     const send = (res: http.ServerResponse, code: number, body: unknown) => {
         res.writeHead(code, {
@@ -65,7 +77,11 @@ export function startHttpServer(
         const sched = scheduler.getSchedule();
         return {
             running: indexer.isRunning(),
+            // `current` is the first in-flight repo — kept for console builds that
+            // predate parallel passes. `currentAll` is every repo being indexed now.
             current: indexer.getCurrent(),
+            currentAll: indexer.getCurrentAll(),
+            concurrency: indexer.getConcurrency(),
             lastPassAt: indexer.getLastPassAt(),
             schedule: {
                 dailyHour: sched.dailyHour,
@@ -111,6 +127,15 @@ export function startHttpServer(
                     console.warn(`[Server] ls-remote failed for '${name}': ${msg}`);
                     return send(res, 502, { error: 'failed to list remote branches', message: msg });
                 }
+            }
+            if (method === 'GET' && url === '/detect') {
+                // Platform detection for a URL the operator is about to add. The
+                // console previews the result (which token flavor, https vs ssh)
+                // before the repo is saved, so a wrong paste is caught up front
+                // rather than as an opaque "Access denied" at index time.
+                const target = query.get('url') || '';
+                if (!target) return send(res, 400, { error: 'url query param is required' });
+                return send(res, 200, detectGitHost(target));
             }
             if (method === 'GET' && url === '/ssh-key') {
                 return send(res, 200, { publicKey: sshKeys.getPublicKey() });

@@ -17,6 +17,7 @@ import {
   GraphEdgeKind,
   GraphLanguage,
   UnresolvedReference,
+  isCallableKind,
 } from './types';
 
 // Lazy-load language parsers with fallback — any single parser failure
@@ -65,6 +66,12 @@ interface LanguageConfig {
   nameFields?: string[];
   /** Types that are nested definitions (must be parent-aware) */
   nestedDefTypes?: string[];
+  /**
+   * C/C++ declarator grammar: the name sits at the end of a `declarator` chain,
+   * after the return type, and function-vs-data is a property of that chain
+   * rather than of the node type. See extractCDeclaratorName.
+   */
+  declaratorNames?: boolean;
 }
 
 const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
@@ -133,11 +140,16 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
       struct_specifier: 'struct',
       namespace_definition: 'module',
       declaration: 'variable',
+      // In-class declarations: `bool Has(int) const;` and every non-virtual
+      // member API. Without this the declared half of a C++ interface is
+      // invisible — refineKind below drops the data members.
+      field_declaration: 'variable',
     },
     importNodeTypes: ['preproc_include'],
     callNodeTypes: ['call_expression'],
     nameFields: ['name'],
     nestedDefTypes: [],
+    declaratorNames: true,
   },
   go: {
     parser: loadParser('go'),
@@ -459,7 +471,7 @@ export class GraphExtractor {
     language: GraphLanguage,
     parentNodeIndex?: number,
   ): void {
-    const nodeKind = config.nodeTypes[node.type];
+    const nodeKind = this.resolveKind(node, source, config);
 
     if (nodeKind) {
       const name = this.extractName(node, source, config);
@@ -486,13 +498,13 @@ export class GraphExtractor {
 
         // Extract signature for functions/methods
         const signature =
-          nodeKind === 'function' || nodeKind === 'method'
+          isCallableKind(nodeKind)
             ? this.extractSignature(node, source, ctx.language)
             : undefined;
 
         // Extract visibility for class methods
         const visibility =
-          nodeKind === 'method' || nodeKind === 'function' || nodeKind === 'class'
+          isCallableKind(nodeKind) || nodeKind === 'class'
             ? this.extractVisibility(node, source, ctx.language)
             : undefined;
 
@@ -745,7 +757,7 @@ export class GraphExtractor {
     language: GraphLanguage,
     parentDefIdx?: number,
   ): void {
-    const nodeKind = config.nodeTypes[node.type];
+    const nodeKind = this.resolveKind(node, source, config);
 
     // Track current parent definition for scoping calls.
     // Only function/method/class nodes create scope — variable declarations
@@ -756,7 +768,7 @@ export class GraphExtractor {
       const name = this.extractName(node, source, config);
       if (name) {
         const entry = registry.get(name);
-        if (entry && (nodeKind === 'function' || nodeKind === 'method' || nodeKind === 'class')) {
+        if (entry && (isCallableKind(nodeKind) || nodeKind === 'class')) {
           currentDefIdx = entry.nodeIndex;
         }
       }
@@ -885,11 +897,118 @@ export class GraphExtractor {
 
   // ── Private: Name extraction helpers ───────────────────────────
 
+  /**
+   * Name of a C/C++ declaration, read off the end of its `declarator` chain.
+   *
+   * C++ writes the return type *before* the name, so extractName's generic
+   * "first identifier descendant" fallback picks up the type instead:
+   * `std::shared_ptr<ProxyBase> ProxyFactory::CreateProxy(...)` was indexed as a
+   * function literally named `shared_ptr`. Measured on a 1.3k-file AUTOSAR repo,
+   * that turned the C++ half of the graph into type names (`basic_string`,
+   * `unique_ptr`, `bool`, `size_t` were among the most common "functions") and
+   * left the real methods unreachable by both search and the call graph.
+   *
+   * Every declaration shape — out-of-line definition, prototype, member, pure
+   * virtual, method on a template, destructor, operator — nests the name at the
+   * bottom of `declarator`, under pointer/reference/array/parenthesized/init
+   * wrappers. Walk to that leaf. Whether the walk passed through a
+   * `function_declarator` is also the only thing that distinguishes a function
+   * from data: `char* buf;` and `char* getBuf(int);` are both `declaration`.
+   */
+  private extractCDeclaratorName(
+    node: Parser.SyntaxNode,
+    source: string,
+  ): { name: string; isFunction: boolean } | null {
+    let cur: Parser.SyntaxNode | null =
+      node.childForFieldName?.('declarator') ?? null;
+    let isFunction = false;
+    // Declarator nesting is shallow in real code; the cap only guards against a
+    // cycle in a malformed tree.
+    for (let depth = 0; cur && depth < 16; depth++) {
+      switch (cur.type) {
+        case 'function_declarator':
+          isFunction = true;
+          cur = cur.childForFieldName?.('declarator') ?? null;
+          break;
+        case 'pointer_declarator':
+        case 'reference_declarator':
+        case 'array_declarator':
+        case 'parenthesized_declarator':
+        case 'init_declarator':
+        case 'attributed_declarator':
+          // reference/parenthesized declarators carry no `declarator` field.
+          cur = cur.childForFieldName?.('declarator') ?? cur.namedChild(0);
+          break;
+        case 'qualified_identifier': // ProxyFactory::CreateProxy, ara::core::X
+        case 'template_function': // Wrap<T>(...)
+        case 'template_type':
+          cur = cur.childForFieldName?.('name') ?? null;
+          break;
+        case 'identifier':
+        case 'field_identifier':
+        case 'type_identifier':
+        case 'destructor_name': // ~Foo
+        case 'operator_name': // operator==
+          return {
+            name: source.slice(cur.startIndex, cur.endIndex),
+            isFunction,
+          };
+        default:
+          // structured_binding_declarator (auto [a,b]) and anything else with no
+          // single name: nothing useful to index.
+          return null;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Node kind, refined by grammar shape where the node type alone is ambiguous.
+   * Returning undefined skips the definition (children are still visited).
+   */
+  private resolveKind(
+    node: Parser.SyntaxNode,
+    source: string,
+    config: LanguageConfig,
+  ): GraphNodeKind | undefined {
+    const kind = config.nodeTypes[node.type];
+    if (!kind || !config.declaratorNames) return kind;
+
+    // C++ constructors and destructors have no return type at all, which is
+    // exactly what distinguishes them: `ThreadPool(size_t)` vs `void Run()`.
+    // Naming them after the declarator (correct) makes every class match its own
+    // ctors, so a search for `ThreadPool` returned the class plus three
+    // `function ThreadPool` rows. buildNodeResults already drops `constructor`.
+    if (!node.childForFieldName?.('type')) {
+      const ctor = this.extractCDeclaratorName(node, source);
+      if (ctor?.isFunction) return 'constructor';
+    }
+
+    if (node.type !== 'declaration' && node.type !== 'field_declaration') {
+      return kind;
+    }
+    const decl = this.extractCDeclaratorName(node, source);
+    if (!decl) return undefined;
+    if (decl.isFunction) {
+      return node.type === 'field_declaration' ? 'method' : 'function';
+    }
+    // Data members: `variable` is filtered out by buildNodeResults and by
+    // GraphTraverser.isNoise alike, so indexing every struct field only costs
+    // rows. File-scope globals keep their existing behaviour.
+    return node.type === 'field_declaration' ? undefined : kind;
+  }
+
   private extractName(
     node: Parser.SyntaxNode,
     source: string,
     config: LanguageConfig,
   ): string | null {
+    if (config.declaratorNames) {
+      const decl = this.extractCDeclaratorName(node, source);
+      if (decl) return decl.name;
+      // class/struct/namespace have a `name` field and no declarator — fall
+      // through to the generic path below.
+    }
     // Try named fields first
     if (config.nameFields) {
       for (const field of config.nameFields) {

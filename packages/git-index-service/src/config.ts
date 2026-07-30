@@ -166,10 +166,42 @@ function createEmbedding(): Embedding {
 }
 
 export function buildContext(): Context {
+    return buildContextPool(1)[0];
+}
+
+/**
+ * A pool of Contexts that share one embedding client and one Milvus connection.
+ *
+ * Indexing used to be strictly serial because the service held a single Context,
+ * and a Context carries per-index mutable state (the commit being indexed, the
+ * resolved extension set) — running two repos through the same instance would
+ * cross-contaminate them. At a few hundred repos the serial pass is dominated by
+ * waiting on the embedding backend, so the fix is N Contexts, one per concurrent
+ * worker, over shared clients: Ollama is already configured for parallel requests
+ * and one Milvus connection multiplexes fine (its init is a single shared promise
+ * and its load cache is shared, which is what we want).
+ */
+export function buildContextPool(size: number): Context[] {
     const embedding = createEmbedding();
     const vectorDatabase = new MilvusVectorDatabase({
         address: envManager.get('MILVUS_ADDRESS'),
         ...(envManager.get('MILVUS_TOKEN') && { token: envManager.get('MILVUS_TOKEN') }),
     });
-    return new Context({ embedding, vectorDatabase });
+    const n = Math.max(1, Math.floor(size));
+    return Array.from({ length: n }, () => new Context({ embedding, vectorDatabase }));
+}
+
+/**
+ * How many repositories to index at once. Kept modest by default: each worker
+ * holds a checkout plus a chunk/embed pipeline, and the shared embedding backend
+ * (not the CPU) is the real bottleneck — oversubscribing it slows every worker
+ * down instead of speeding the pass up.
+ */
+export function indexConcurrency(): number {
+    return Math.max(1, Math.min(16, num('GIT_INDEX_CONCURRENCY', 3)));
+}
+
+/** Release each collection from Milvus memory right after indexing it (see VectorDatabase.release). */
+export function releaseAfterIndex(): boolean {
+    return bool('GIT_INDEX_RELEASE_AFTER', true);
 }

@@ -18,6 +18,7 @@ import {
   GraphEdgeKind,
   UnresolvedReference,
   ResolvedRef,
+  isCallableKind,
 } from '../types';
 import { ResolutionContext } from './import-resolver';
 
@@ -205,6 +206,13 @@ const BUILTIN_BLACKLISTS: Record<string, Set<string>> = {
   scala: JAVA_BUILTINS, // Java + Scala share many common types
 };
 
+/**
+ * Above this many same-named candidates, a suffix match with nothing to
+ * disambiguate it is treated as unresolvable rather than resolved to an
+ * arbitrary one. See matchSuffixName for the measured rationale.
+ */
+const SUFFIX_AMBIGUITY_CAP = 12;
+
 /** Node kinds that are considered "definition" targets for CALLS edges. */
 const DEFINITION_KINDS = new Set<GraphNodeKind>([
   'function',
@@ -333,7 +341,7 @@ export function matchMethodCall(
     for (const node of nodes) {
       if (
         node.name === methodName &&
-        (node.kind === 'method' || node.kind === 'function') &&
+        isCallableKind(node.kind) &&
         node.qualifiedName.includes(receiverType)
       ) {
         return {
@@ -351,7 +359,7 @@ export function matchMethodCall(
   const methodCandidates = context.getNodesByName(methodName);
   for (const cand of methodCandidates) {
     if (
-      (cand.kind === 'method' || cand.kind === 'function') &&
+      isCallableKind(cand.kind) &&
       cand.qualifiedName.includes(receiverType)
     ) {
       return {
@@ -524,6 +532,13 @@ function matchSuffixName(
   // the first by id. Lower confidence reflects the ambiguity.
   if (matches.length > 1) {
     const sameFile = ref.filePath ? matches.filter(n => n.filePath === ref.filePath) : [];
+    // Past a point "one of N" stops anchoring anything. A C++ repo yields names
+    // with hundreds of same-named definitions (measured: basic_string ×15611,
+    // CPPTEST_TEST ×10680); picking the lowest id there invents an edge into an
+    // arbitrary unrelated file, and scoring the whole pool on every one of
+    // thousands of references is what made resolution the slowest phase. With no
+    // same-file candidate to disambiguate, no edge beats a fabricated one.
+    if (sameFile.length === 0 && matches.length > SUFFIX_AMBIGUITY_CAP) return null;
     const pool = sameFile.length > 0 ? sameFile : matches;
     const target = pool.reduce((a, b) => (a.id < b.id ? a : b));
     return {

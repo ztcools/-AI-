@@ -19,6 +19,7 @@ import {
   GraphEdgeKind,
   UnresolvedReference,
   ResolvedRef,
+  isCallableKind,
 } from '../types';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -139,7 +140,7 @@ export function resolveViaImport(
     // Search for matching function/method nodes by name in the imported file
     const targetName = dotIndex > 0 ? refName.slice(dotIndex + 1) : refName;
     let candidates = context.getNodesInFile(relativeResolved)
-      .filter(n => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
+      .filter(n => isCallableKind(n.kind) || n.kind === 'class');
 
     // Filter by name: exact match preferred
     let nodes = candidates.filter(n => n.name === targetName);

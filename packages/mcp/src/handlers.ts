@@ -23,6 +23,17 @@ import { linkState, LinkInfo } from "./link-state.js";
  *  - 本地只做两件事：link（绑定云端 collection） + search（直连云端 Milvus + 本地图富化）。
  *  - 本地图索引仍然按需构建（SQLite），与云端向量索引并行工作。
  */
+/**
+ * `Owner::name` when the symbol belongs to a type, else the bare name.
+ *
+ * `::` rather than `.` because every language whose grammar nests methods this
+ * way here (C++, C#) writes it that way, and it reads as one copy-pasteable
+ * symbol.
+ */
+function symbolLabel(s: { name: string; owner?: string }): string {
+    return s.owner && s.owner !== s.name ? `${s.owner}::${s.name}` : s.name;
+}
+
 export class ToolHandlers {
     private context: Context;
     private currentWorkspace: string;
@@ -452,7 +463,7 @@ export class ToolHandlers {
 
             // ── 并行执行向量 + 图搜索 ──
             let vectorResults: any[] = [];
-            let graphSymbols: Array<{ name: string; kind: string; filePath: string; line: number; inDegree: number; outDegree: number }> = [];
+            let graphSymbols: Array<{ name: string; kind: string; owner?: string; filePath: string; line: number; inDegree: number; outDegree: number }> = [];
             let searchSourceNote = link ? ` (cloud: ${link.branch})` : ' (graph-only)';
 
             let vectorError: string | null = null;
@@ -486,9 +497,35 @@ export class ToolHandlers {
                         const store = this.graphToolHandlers!.getStore();
                         const gr = store.findNodes({ project, query, limit: Math.min(resultLimit, 10) });
                         if (gr.results.length > 0) {
+                            // Owning type, from the CONTAINS edge that already exists.
+                            // Without it a hit reads `method CreateProxy` twice over
+                            // (declaration + definition) with nothing to say one is
+                            // ProxyFactory's — the single most common C++ shape, and the
+                            // thing that tells overloads apart. Two batched queries.
+                            const ids = gr.results.map(r => r.node.id);
+                            const owners = new Map<number, string>();
+                            try {
+                                const containsEdges = store.getEdgesByTargetBatch(ids, 'contains');
+                                const parentIds = [...new Set(
+                                    [...containsEdges.values()].flat().map(e => e.sourceId),
+                                )];
+                                const parents = store.getNodesById(parentIds);
+                                for (const [childId, edges] of containsEdges) {
+                                    for (const e of edges) {
+                                        const p = parents.get(e.sourceId);
+                                        // `file` containers repeat the path already printed.
+                                        if (p && p.kind !== 'file' && p.kind !== 'module') {
+                                            owners.set(childId, p.name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } catch { /* owner is decoration — never fail the search for it */ }
+
                             graphSymbols = gr.results.map(r => ({
                                 name: r.node.name,
                                 kind: r.node.kind,
+                                owner: owners.get(r.node.id),
                                 filePath: r.node.filePath,
                                 line: r.node.startLine,
                                 inDegree: r.inDegree,
@@ -540,7 +577,7 @@ export class ToolHandlers {
                             s.line <= r.endLine
                         );
                         const graphNote = graphMatch.length > 0
-                            ? `  graph: ${graphMatch.map(s => `${s.kind} \`${s.name}\` (↖${s.inDegree} ↗${s.outDegree})`).join(' | ')}\n`
+                            ? `  graph: ${graphMatch.map(s => `${s.kind} \`${symbolLabel(s)}\` (↖${s.inDegree} ↗${s.outDegree})`).join(' | ')}\n`
                             : '';
                         parts.push(`[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}\n${graphNote}\`\`\`${r.language}\n${code}\n\`\`\``);
                     }
@@ -555,7 +592,7 @@ export class ToolHandlers {
                 parts.push('');
                 parts.push('### Graph symbols');
                 for (const s of unmatchedSymbols.slice(0, 5)) {
-                    parts.push(`- ${s.kind} \`${s.name}\` (${s.filePath}:${s.line}) ↖${s.inDegree} ↗${s.outDegree}`);
+                    parts.push(`- ${s.kind} \`${symbolLabel(s)}\` (${s.filePath}:${s.line}) ↖${s.inDegree} ↗${s.outDegree}`);
                 }
             }
 
@@ -962,6 +999,11 @@ export class ToolHandlers {
             };
             const callerFiltered = pick(callerEdges, (e) => e.sourceId, true);
             const calleeFiltered = pick(calleeEdges, (e) => e.targetId, false);
+
+            // 去噪后可能两头都空（自指、同名重载互调、调用者全在测试里）。
+            // 那样的行在 "Call Graph" 里没有调用关系可言，只是把符号清单
+            // 又抄了一遍：spdlog 的 `log` 重载让 6 行里有 3 行是这种空行。
+            if (callerFiltered.length === 0 && calleeFiltered.length === 0) continue;
 
             // 签名折叠为单行（多行签名会把调用链撑成几十行）。
             const sig = node.signature ? String(node.signature).replace(/\s+/g, ' ').trim() : '';

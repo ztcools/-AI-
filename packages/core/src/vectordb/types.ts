@@ -119,6 +119,34 @@ export interface VectorDatabase {
     sparseSearch?(collectionName: string, queryText: string, options?: SearchOptions): Promise<VectorSearchResult[]>;
 
     /**
+     * Seal the collection's growing segments so freshly inserted rows become
+     * visible to segment-statistics readers (getCollectionStatistics).
+     *
+     * Search paths don't need this — they read the live state. It exists for
+     * external consumers that report row counts from stats (the PhiGent
+     * console's collection list, Attu's row-count column), which otherwise show
+     * 0 for a just-indexed collection until Milvus auto-seals.
+     *
+     * Optional: implementations without segment semantics may omit it.
+     */
+    flush?(collectionName: string): Promise<void>;
+
+    /**
+     * Drop the collection's loaded segments from query-node memory.
+     *
+     * Searching a collection requires it to be loaded, and nothing ever unloads it
+     * again — so a writer that touches every collection (the nightly indexing pass)
+     * would keep the union of all of them resident. At a few hundred repos with
+     * several branches each that is hundreds of GB on a shared server. Releasing
+     * right after a write bounds the resident set to what is actively *searched*:
+     * the next search re-loads on demand, and the search path already retries once
+     * on a load-state error.
+     *
+     * Optional: implementations without load/release semantics may omit it.
+     */
+    release?(collectionName: string): Promise<void>;
+
+    /**
      * Delete documents
      * @param collectionName Collection name
      * @param ids Document ID array

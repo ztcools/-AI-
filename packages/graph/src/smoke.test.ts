@@ -145,6 +145,57 @@ class Greeter {
     const callRef = result.unresolvedRefs.find(r => r.referenceName === 'hello');
     assert.ok(callRef);
   });
+
+  it('names C++ definitions after the declarator, not the return type', () => {
+    // C++ puts the return type before the name, so a generic "first identifier
+    // descendant" name lookup picks the type: this whole file used to index as a
+    // function called `shared_ptr`, making the real methods unfindable.
+    const extractor = new GraphExtractor();
+    const source = `
+class ThreadPool {
+ public:
+  explicit ThreadPool(size_t n);
+  ~ThreadPool();
+  virtual ara::core::Result<void> SyncToStorage() noexcept = 0;
+  bool Has(int k) const;
+  int count_;
+};
+std::shared_ptr<ProxyBase> ProxyFactory::CreateProxy(HandleType const &h) { return nullptr; }
+char* getBuf(int n);
+static int g_flag = 0;
+template <typename T> Result<T> Wrap(T v) { return v; }
+`;
+    const { nodes } = extractor.extract(source, {
+      project: 'test',
+      filePath: 'src/pool.cpp',
+      language: 'cpp',
+    });
+    // `ThreadPool` is deliberately both a class and a ctor, so index by
+    // (name, kind) presence rather than a name→kind map.
+    const byName = new Map(
+      nodes.filter(n => n.kind !== 'constructor').map(n => [n.name, n.kind]),
+    );
+
+    assert.equal(byName.get('CreateProxy'), 'function'); // was `shared_ptr`
+    assert.equal(byName.get('Wrap'), 'function'); // templated return type
+    assert.equal(byName.get('getBuf'), 'function'); // pointer_declarator wrapper
+    assert.equal(byName.get('SyncToStorage'), 'function'); // pure virtual
+    assert.equal(byName.get('Has'), 'method'); // in-class declaration
+    assert.equal(byName.get('ThreadPool'), 'class');
+    assert.equal(byName.get('g_flag'), 'variable'); // file-scope data still data
+
+    // ctor/dtor are told apart by having no return type, and hidden from search
+    // results rather than crowding out the class they belong to.
+    assert.ok(nodes.some(n => n.name === 'ThreadPool' && n.kind === 'constructor'));
+    assert.ok(nodes.some(n => n.name === '~ThreadPool' && n.kind === 'constructor'));
+
+    // Data members carry no query path and are not worth a row.
+    assert.ok(!byName.has('count_'));
+    // No node is named after a return type.
+    for (const t of ['shared_ptr', 'Result', 'ara', 'size_t']) {
+      assert.ok(!nodes.some(n => n.name === t && n.kind !== 'module'), `leaked type name: ${t}`);
+    }
+  });
 });
 
 describe('GraphTraverser (v2)', () => {
