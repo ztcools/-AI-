@@ -27,8 +27,6 @@ export type { GraphIndexerOptions } from './indexer';
 // Multi-threading infrastructure (v2)
 export { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs, readGrammarWasmBytes } from './parse-pool';
 export type { ParseTask, ParseWorkerResult, ParseWorkerPoolOptions } from './parse-pool';
-export { StoreWriter } from './store-writer';
-export type { StoreBundle } from './store-writer';
 
 /** Path to the parse-worker-v2 script for Worker Thread-based parallel parsing. */
 export const parseWorkerPath = path.join(__dirname, 'parse-worker-v2.js');
