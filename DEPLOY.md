@@ -90,8 +90,24 @@ ls -lh
 > `images/` 已 gitignore，tar 不进仓库。`gzip -1` 比默认级别快得多，
 > 体积只差几个百分点（171M vs 168M），传输时间的差远小于压缩时间的差。
 
-**当前产物**（2026-07-30 21:00 已就绪）：`claude-git-index.tar.gz` 171M、
-`claude-phigent.tar.gz` 293M，上一版留底为 `.bak-20260717` / `.bak-20260720`。
+**当前产物**（2026-07-30 已就绪）：`claude-git-index.tar.gz` 171M（21:00 构建）、
+`claude-phigent.tar.gz` 293M（22:47 构建，config `86df39d7`），
+上一版留底为 `.bak-20260717` / `.bak-20260730`。
+
+> **覆盖 tar 之前一定要核对镜像是不是刚构建的那个**。同一天翻过两次车：一次镜像
+> 是 14:12 的旧构建（修复在 19:21 才提交），一次 21:55 导出的 tar 里是上一版 config。
+> 两个正交的检查：
+>
+> ```bash
+> # ① tar 里的 config digest 要等于构建日志末尾的 "exporting config sha256:…"
+> gunzip -c images/claude-phigent.tar.gz | tar -xO manifest.json | grep -o 'sha256/[0-9a-f]\{12\}'
+> # ② 前端产物里要真能 grep 到本次改动（先用一个必然存在的串做正对照）
+> cid=$(docker create claude-phigent:latest); docker cp $cid:/app/build /tmp/pg; docker rm -f $cid
+> grep -c codebasePath /tmp/pg/assets/index-*.js     # 正对照，必须 > 0
+> ```
+>
+> 注意前端是 **Vite** 构建，产物在 `assets/index-<hash>.js`，不在 CRA 的 `static/js/`；
+> 路径错了会全部 0 命中，看起来跟"修复没进去"一模一样。
 
 ## 二、上传（sftp）
 
