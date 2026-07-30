@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS nodes (
      * seek. Filled by upsertNode; there is no other writer.
      */
     suffix_name TEXT,
+    /*
+     * The name split into words: CreateProxy -> "create proxy".
+     *
+     * The FTS tokenizer splits on punctuation, so createProxy is one token and a
+     * query term "proxy" cannot match it — FTS5 prefix search only matches from
+     * the start, which is why "handle*" found HandleEventMessage while "proxy*"
+     * never found CreateProxy. Splitting has to happen before the tokenizer sees
+     * the text, and a custom tokenizer needs the C API, so the split text is
+     * stored as its own column and indexed alongside name. Filled by upsertNode;
+     * there is no other writer.
+     */
+    search_text TEXT,
     qualified_name TEXT NOT NULL,
     file_path TEXT NOT NULL,
     language TEXT,
@@ -129,34 +141,54 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (path)
 );
 
--- FTS5 index: stores camelCase-split names so "order" matches "createOrder"
--- The trigger_fn helper splits camelCase strings (e.g. "createOrder" → "create Order")
+`;
+
+/**
+ * FTS5 index over the identifier, its word-split form (see nodes.search_text),
+ * the qualified name and the path.
+ *
+ * Kept out of SCHEMA_SQL because an FTS5 table's columns and tokenizer are fixed
+ * at creation: changing either on an existing graph means dropping and
+ * recreating this table, so _ensureFtsIndex has to be able to re-run it — and it
+ * compares this exact text against sqlite_master to decide whether to.
+ * External-content table — the text lives in `nodes`, so every column here must
+ * exist there.
+ *
+ * The porter stemmer is what makes a question match code: an agent types "how
+ * are logs uploaded", the identifier is UploadLogFile, and only stemming gets
+ * uploaded → upload. Without it the query term had to be a literal prefix of the
+ * stored token, which matched by accident more than by meaning — "created"
+ * pulled in CreateDirectoryIfNotExists and createData (both start with
+ * "created") while never reaching CreateProxy.
+ */
+const NODES_FTS_SQL = `
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name,
+    search_text,
     qualified_name,
     file_path,
     content='nodes',
     content_rowid='id',
-    tokenize='unicode61 remove_diacritics 1'
+    tokenize='porter unicode61 remove_diacritics 1'
 );
 `;
 
 const FTS_TRIGGERS_SQL = `
 CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-    INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+    INSERT INTO nodes_fts(rowid, name, search_text, qualified_name, file_path)
+    VALUES (new.id, new.name, new.search_text, new.qualified_name, new.file_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, search_text, qualified_name, file_path)
+    VALUES ('delete', old.id, old.name, old.search_text, old.qualified_name, old.file_path);
 END;
 
 CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
-    INSERT INTO nodes_fts(nodes_fts, rowid, name, qualified_name, file_path)
-    VALUES ('delete', old.id, old.name, old.qualified_name, old.file_path);
-    INSERT INTO nodes_fts(rowid, name, qualified_name, file_path)
-    VALUES (new.id, new.name, new.qualified_name, new.file_path);
+    INSERT INTO nodes_fts(nodes_fts, rowid, name, search_text, qualified_name, file_path)
+    VALUES ('delete', old.id, old.name, old.search_text, old.qualified_name, old.file_path);
+    INSERT INTO nodes_fts(rowid, name, search_text, qualified_name, file_path)
+    VALUES (new.id, new.name, new.search_text, new.qualified_name, new.file_path);
 END;
 `;
 
@@ -164,6 +196,26 @@ END;
 function lastNameSegment(name: string): string {
   const dot = name.lastIndexOf('.');
   return dot < 0 ? name : name.slice(dot + 1);
+}
+
+/**
+ * Identifier → space-separated lowercase words, for nodes.search_text.
+ *
+ * `CreateProxy` → `create proxy`, `key_value_storage` → `key value storage`,
+ * `HTTPServer` → `http server` (an acronym run keeps its last capital for the
+ * word that follows it), `Gson.toJson` → `gson to json`. Returns '' when the
+ * split adds nothing over the name itself, so single-word identifiers don't
+ * double their weight in the index.
+ */
+function splitIdentifier(name: string): string {
+  const words = name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map(w => w.toLowerCase());
+  if (words.length < 2) return '';
+  return words.join(' ');
 }
 
 /**
@@ -183,6 +235,11 @@ const RESULT_NOISE_KINDS = new Set([
   'file',
   'enum_member',
   'constructor',
+  // C++ `namespace foo {` and Rust `mod foo {` — a container, not an answer, and
+  // one that matches whatever its own directory is called. 777 of ap-client-api's
+  // 8,700 nodes are namespaces, and `namespace supervised_entity` took the top
+  // slot away from `class SupervisedEntity` in the same header tree.
+  'module',
 ]);
 
 /**
@@ -198,11 +255,21 @@ const RESULT_NOISE_KINDS = new Set([
  * Filtering is best-effort: a query made entirely of these words keeps them,
  * since an empty MATCH is worse than a vague one.
  */
-const QUERY_NOISE_WORDS = new Set([
-  // generic code vocabulary
+/**
+ * Vocabulary that describes code in general rather than naming anything in it.
+ *
+ * Dropped as standalone search terms — but NOT when it sits next to another word
+ * (see queryPhrases): "code" alone matches half the repo, while "error code" is
+ * the identifier the question was about.
+ */
+const QUERY_GENERIC_WORDS = new Set([
   'class', 'function', 'method', 'type', 'interface', 'object',
   'string', 'number', 'data', 'import', 'export', 'module', 'file',
   'code', 'use', 'get', 'set', 'add', 'new',
+]);
+
+/** Grammar words: they never name anything, alone or in a phrase. */
+const QUERY_STOP_WORDS = new Set([
   // interrogatives / relationship phrasing
   'how', 'what', 'where', 'when', 'why', 'who', 'whom', 'which',
   'does', 'did', 'do', 'is', 'are', 'was', 'were', 'be', 'been', 'can',
@@ -212,14 +279,189 @@ const QUERY_NOISE_WORDS = new Set([
   'as', 'via', 'any', 'all',
 ]);
 
-/** Query tokens worth searching for, noise words dropped where something remains. */
-function meaningfulQueryTokens(query: string): string[] {
-  const raw = query
+const QUERY_NOISE_WORDS = new Set([...QUERY_GENERIC_WORDS, ...QUERY_STOP_WORDS]);
+
+/** Query split into words, camelCase and punctuation both treated as breaks. */
+function queryWords(query: string): string[] {
+  return query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .split(/[\s_\-.:/]+/)
     .filter(t => t.length > 1);
+}
+
+/**
+ * Query tokens worth searching for: noise words dropped where something remains,
+ * and each remaining word kept once.
+ *
+ * De-duplication is not cosmetic. Every token becomes another OR arm, so a word
+ * the user happened to repeat was counted twice by BM25: "error code and error
+ * domain definition" scored the ErrorDomain classes above the ErrorCode class
+ * the question was about, purely because "error" appeared twice. It also inflates
+ * the LIKE pass's majority threshold, which counts distinct arms.
+ */
+function meaningfulQueryTokens(query: string): string[] {
+  const raw = queryWords(query);
   const meaningful = raw.filter(t => !QUERY_NOISE_WORDS.has(t.toLowerCase()));
-  return meaningful.length > 0 ? meaningful : raw;
+  const kept = meaningful.length > 0 ? meaningful : raw;
+  const seen = new Set<string>();
+  return kept.filter(t => {
+    const k = t.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+
+/**
+ * Word pairs where code writes one and prose writes the other.
+ *
+ * The stemmer cannot bridge these — "configuration" stems to `configur` and
+ * `config` stems to itself, so a prefix search for one never reaches the other.
+ * That is not a corner case: an agent asks "initialize logging and create the log
+ * manager" and the symbol is `InitLogging`, or asks about "configuration" and the
+ * struct is `LogConfig`. Both were misses until each query word also searched for
+ * its counterpart. Kept deliberately short — only shortenings so standard that
+ * both spellings mean the same thing in code.
+ */
+const ABBREVIATION_PAIRS: Array<[string, string]> = [
+  ['config', 'configuration'],
+  ['cfg', 'configuration'],
+  ['init', 'initialize'],
+  ['init', 'initialization'],
+  ['impl', 'implementation'],
+  ['msg', 'message'],
+  ['mgr', 'manager'],
+  ['ctx', 'context'],
+  ['db', 'database'],
+  ['auth', 'authentication'],
+  ['err', 'error'],
+  ['req', 'request'],
+  ['res', 'response'],
+  ['resp', 'response'],
+  ['buf', 'buffer'],
+  ['addr', 'address'],
+  ['dir', 'directory'],
+  ['num', 'number'],
+  ['len', 'length'],
+  ['util', 'utility'],
+  ['exec', 'execute'],
+  ['calc', 'calculate'],
+  ['sync', 'synchronize'],
+  ['async', 'asynchronous'],
+  ['temp', 'temporary'],
+  ['spec', 'specification'],
+  ['proc', 'process'],
+  ['stats', 'statistics'],
+  ['env', 'environment'],
+  ['repo', 'repository'],
+];
+
+/** Both directions of ABBREVIATION_PAIRS, keyed by lowercase word. */
+const ABBREVIATION_MAP: Map<string, string[]> = (() => {
+  const m = new Map<string, string[]>();
+  const add = (from: string, to: string) => {
+    const list = m.get(from);
+    if (list) list.push(to);
+    else m.set(from, [to]);
+  };
+  for (const [short, long] of ABBREVIATION_PAIRS) {
+    add(short, long);
+    add(long, short);
+  }
+  return m;
+})();
+
+/** A word plus the spellings code might use instead, the word itself first. */
+function wordVariants(word: string): string[] {
+  const alt = ABBREVIATION_MAP.get(word.toLowerCase());
+  return alt ? [word, ...alt] : [word];
+}
+
+/** Bound on phrase arms per query, so a long sentence can't balloon the MATCH. */
+const MAX_QUERY_PHRASES = 8;
+
+/** Bound on total MATCH arms, once abbreviation variants have multiplied them. */
+const MAX_FTS_ARMS = 28;
+
+/**
+ * Re-order scored rows so one concept in the query can't take every slot.
+ *
+ * A question naming two things — "supervised entity health monitoring recovery
+ * action" — scores every `SupervisedEntity*` symbol in the tree just above
+ * `RecoveryAction`, which landed 11th of 10 by 0.02 points. Ten near-identical
+ * names from one header tree teach an agent less than four of them plus the other
+ * half of what it asked about.
+ *
+ * A row's concept is the first query word-pair its identifier spells out (the
+ * same pairs buildFtsQuery searches for, abbreviations included), so this only
+ * engages where a phrase actually matched: single-concept queries leave every row
+ * unkeyed and the order untouched. Rows past the per-concept cap are moved to the
+ * back rather than dropped, which keeps paging with `offset` consistent.
+ */
+function diversifyByConcept(
+  rows: Array<Record<string, unknown>>,
+  query: string,
+  limit: number,
+): Array<Record<string, unknown>> {
+  if (rows.length <= limit) return rows;
+  const phrases: string[] = [];
+  for (const phrase of queryPhrases(query)) {
+    const [a, b] = phrase.split(' ');
+    for (const va of wordVariants(a)) {
+      for (const vb of wordVariants(b)) phrases.push(`${va} ${vb}`);
+    }
+  }
+  if (phrases.length < 2) return rows;
+
+  const perConcept = Math.max(3, Math.ceil(limit / 3));
+  const counts = new Map<string, number>();
+  const kept: Array<Record<string, unknown>> = [];
+  const spilled: Array<Record<string, unknown>> = [];
+  for (const row of rows) {
+    const text = String(row.search_text || row.name || '').toLowerCase();
+    const concept = phrases.find(p => text.includes(p));
+    if (!concept) {
+      kept.push(row);
+      continue;
+    }
+    const n = (counts.get(concept) ?? 0) + 1;
+    counts.set(concept, n);
+    if (n <= perConcept) kept.push(row);
+    else spilled.push(row);
+  }
+  return spilled.length === 0 ? rows : [...kept, ...spilled];
+}
+
+/**
+ * Adjacent word pairs from the query, as identifiers spell them.
+ *
+ * A prefix-OR over single words ranks by how many query words a row matches, and
+ * is blind to their order — so "error code and error domain definition" put ten
+ * *ErrorDomain* classes above `ErrorCode` (which matches "error" and nothing
+ * else, "code" being generic), and "supervised entity health monitoring recovery
+ * action" never reached `SupervisedEntity` because rows in recovery_action.cpp
+ * matched three words via their path. Searching the pairs as FTS phrases against
+ * the identifier columns restores what the word split threw away: `ErrorCode`'s
+ * search_text is literally "error code", so the phrase hits it and nothing whose
+ * name merely shares one word.
+ *
+ * Built from a stop-word-only filter, since it is exactly the generic half of the
+ * vocabulary ("code", "file", "get") that carries meaning once paired.
+ */
+function queryPhrases(query: string): string[] {
+  const words = queryWords(query)
+    .map(t => t.toLowerCase())
+    .filter(t => !QUERY_STOP_WORDS.has(t));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i + 1 < words.length && out.length < MAX_QUERY_PHRASES; i++) {
+    if (words[i] === words[i + 1]) continue;
+    const phrase = `${words[i]} ${words[i + 1]}`;
+    if (seen.has(phrase)) continue;
+    seen.add(phrase);
+    out.push(phrase);
+  }
+  return out;
 }
 
 // ── Edge dedup: handled by UNIQUE constraint on (source_id, target_id, kind, line, col) ──
@@ -351,6 +593,11 @@ export class SqliteGraphStore implements GraphStore {
     this.db.pragma('cache_size = -64000'); // 64MB
     this.db.exec(SCHEMA_SQL);
     this._ensureSuffixName();
+    // Order matters: search_text has to exist on `nodes` before an FTS table can
+    // index it, and both must precede the triggers — _ensureFtsIndex drops the
+    // triggers along with the table it replaces.
+    this._ensureSearchText();
+    this._ensureFtsIndex();
     this.db.exec(FTS_TRIGGERS_SQL);
   }
 
@@ -379,6 +626,50 @@ export class SqliteGraphStore implements GraphStore {
       }
     }
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_suffix ON nodes(project, suffix_name)');
+  }
+
+  /**
+   * Guarantee `nodes.search_text` exists and is filled, backfilling from the
+   * names already stored rather than forcing a reindex of the whole repo.
+   */
+  private _ensureSearchText(): void {
+    const cols = this.db.pragma('table_info(nodes)') as Array<{ name: string }>;
+    if (cols.some(c => c.name === 'search_text')) return;
+    this.db.exec('ALTER TABLE nodes ADD COLUMN search_text TEXT');
+    const rows = this.db.prepare('SELECT id, name FROM nodes').all() as Array<{ id: number; name: string }>;
+    if (rows.length === 0) return;
+    const upd = this.db.prepare('UPDATE nodes SET search_text = ? WHERE id = ?');
+    this.db.transaction(() => {
+      for (const r of rows) upd.run(splitIdentifier(r.name), r.id);
+    })();
+  }
+
+  /**
+   * Guarantee nodes_fts matches NODES_FTS_SQL, recreating it if it doesn't.
+   *
+   * Compares against the definition SQLite stored rather than probing for one
+   * known difference, because an FTS5 table's columns *and* its tokenizer are
+   * both fixed at creation: a graph on disk can be stale in either way, and
+   * a mismatched tokenizer is invisible — queries keep working and quietly stop
+   * matching. Rebuilding reads the text back out of `nodes`, so it costs one
+   * table scan and never touches the graph.
+   */
+  private _ensureFtsIndex(): void {
+    const norm = (s: string) =>
+      s.replace(/if\s+not\s+exists\s+/i, '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes_fts'")
+      .get() as { sql?: string } | undefined;
+    if (row?.sql && norm(row.sql) === norm(NODES_FTS_SQL.replace(/;\s*$/, ''))) return;
+
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS nodes_ai;
+      DROP TRIGGER IF EXISTS nodes_ad;
+      DROP TRIGGER IF EXISTS nodes_au;
+      DROP TABLE IF EXISTS nodes_fts;
+    `);
+    this.db.exec(NODES_FTS_SQL);
+    this.db.exec("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')");
   }
 
   initialize(): void {
@@ -440,15 +731,15 @@ export class SqliteGraphStore implements GraphStore {
 
   upsertNode(node: Omit<GraphNode, 'id'>): number {
     const result = this.stmt(`
-      INSERT INTO nodes (project, kind, name, suffix_name, qualified_name, file_path,
+      INSERT INTO nodes (project, kind, name, suffix_name, search_text, qualified_name, file_path,
         language, start_line, end_line,
         signature, visibility, is_exported, is_async, is_static, is_abstract,
         decorators_json, type_parameters_json, return_type, docstring,
         properties_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project, qualified_name) DO UPDATE SET
         kind = excluded.kind, name = excluded.name,
-        suffix_name = excluded.suffix_name,
+        suffix_name = excluded.suffix_name, search_text = excluded.search_text,
         file_path = excluded.file_path, language = excluded.language,
         start_line = excluded.start_line, end_line = excluded.end_line,
         signature = excluded.signature, visibility = excluded.visibility,
@@ -463,6 +754,7 @@ export class SqliteGraphStore implements GraphStore {
       node.kind || node.label,
       node.name,
       lastNameSegment(node.name),
+      splitIdentifier(node.name),
       node.qualifiedName,
       node.filePath,
       node.language || null,
@@ -620,7 +912,6 @@ export class SqliteGraphStore implements GraphStore {
       const ftsQuery = this.buildFtsQuery(options.query);
       const seenIds = new Set<number>();
       const allRows: Array<Record<string, unknown>> = [];
-      let totalCount = 0;
 
       // Pass 0: EXACT-name match. A query that is itself a symbol name ("toJson",
       // "dispatch_request") should rank the node literally named that above any
@@ -644,7 +935,6 @@ export class SqliteGraphStore implements GraphStore {
               allRows.push(row);
             }
           }
-          totalCount += exactRows.length;
         } catch {
           // exact match failed — continue to FTS
         }
@@ -652,9 +942,19 @@ export class SqliteGraphStore implements GraphStore {
 
       // First pass: FTS (BM25 ranked). bm25() returns negative values
       // (closer to 0 = better), so we use -bm25() for a positive descending score.
+      //
+      // Weights (name, search_text, qualified_name, file_path): a hit on the
+      // symbol's own name is what the caller asked for; a hit on the path only
+      // says "somewhere in this directory". qualified_name is deliberately the
+      // lowest — it is project + path + name concatenated, so weighting it would
+      // count every name and path match a second time. Under the old
+      // (1.0, 2.0, 0.5) split a path match scored 2.5 against a name match's 3.0,
+      // which is how "how is a proxy created for a service handle" filled its top
+      // ten with diag-api's Handle*Message functions and never returned
+      // ProxyFactory::CreateProxy at all.
       try {
         const ftsRows = rdb.prepare(`
-          SELECT n.*, -bm25(nodes_fts, 1.0, 2.0, 0.5) AS score
+          SELECT n.*, -bm25(nodes_fts, 3.0, 3.0, 0.5, 1.0) AS score
           FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
           WHERE nodes_fts MATCH ? AND ${whereClause}
           ORDER BY score DESC LIMIT ?
@@ -665,12 +965,12 @@ export class SqliteGraphStore implements GraphStore {
             allRows.push(row);
           }
         }
-        const ftsCount = rdb.prepare(`
-          SELECT COUNT(*) as total
-          FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
-          WHERE nodes_fts MATCH ? AND ${whereClause}
-        `).get(ftsQuery, ...params) as { total: number };
-        totalCount += ftsCount.total;
+        // No COUNT(*) companion here on purpose. The reported total is the
+        // number of merged, de-noised rows (see mergedCount below), so the count
+        // this used to run was written and never read — and once the noise kinds
+        // moved into the WHERE clause it stopped being free: counting every one
+        // of 8,770 FTS matches against nodes took 1,235ms of a 1,285ms search,
+        // where fetching the top 20 takes 5ms.
       } catch {
         // FTS failed — skip
       }
@@ -761,7 +1061,10 @@ export class SqliteGraphStore implements GraphStore {
         !RESULT_NOISE_KINDS.has(row.kind as string) && !RESULT_NOISE_KINDS.has(row.label as string)
       );
       const start = offset || 0;
-      const sliced = filtered.slice(start, start + limit);
+      const sliced = diversifyByConcept(filtered, options.query || '', limit).slice(
+        start,
+        start + limit,
+      );
       const mergedCount = { total: filtered.length };
       return this.buildNodeResults(sliced, mergedCount, options, offset);
     } else {
@@ -795,6 +1098,26 @@ export class SqliteGraphStore implements GraphStore {
     if (kind) {
       conditions.push('n.kind = ?');
       params.push(kind);
+    } else {
+      /*
+       * Drop noise kinds in SQL, not after the fact.
+       *
+       * Every pass ends in LIMIT, and the post-query filter used to run on what
+       * came back — so on a C++ repo, where most of the top-ranked FTS rows are
+       * variables and parameters, a limit of 10 fetched 20 rows, threw away 12 of
+       * them, and returned 8: the functions ranked 21st onward were never
+       * fetched. "supervised entity health monitoring recovery action" returned 9
+       * rows and CreateSupervisedEntity was not among them. An explicit
+       * options.kind means the caller asked for that kind — even a noisy one — so
+       * the exclusion only applies when they didn't.
+       */
+      conditions.push(
+        `n.kind NOT IN (${[...RESULT_NOISE_KINDS].map(() => '?').join(', ')})`,
+      );
+      params.push(...RESULT_NOISE_KINDS);
+      // JS/TS constructors are methods named `<Class>.constructor`; C++ ones are
+      // caught by the kind list above.
+      conditions.push(`NOT (n.kind = 'method' AND n.name LIKE '%.constructor')`);
     }
     if (options.namePattern) {
       conditions.push('n.name LIKE ?');
@@ -1427,10 +1750,34 @@ export class SqliteGraphStore implements GraphStore {
   // ── Helpers ────────────────────────────────────────────────────────
 
   private buildFtsQuery(query: string): string {
-    // Prefix matching: "ord"* matches "OrderService" stored as single token
-    return meaningfulQueryTokens(query)
-      .map(t => `"${t.replace(/"/g, '""')}"*`)
-      .join(' OR ');
+    const esc = (s: string) => s.replace(/"/g, '""');
+    const arms: string[] = [];
+    const seen = new Set<string>();
+    const push = (arm: string) => {
+      if (seen.has(arm) || arms.length >= MAX_FTS_ARMS) return;
+      seen.add(arm);
+      arms.push(arm);
+    };
+    // Prefix matching: "ord"* matches "OrderService" stored as single token.
+    for (const token of meaningfulQueryTokens(query)) push(`"${esc(token)}"*`);
+    // ...plus the query's word pairs as phrases against the identifier columns
+    // only (see queryPhrases). A phrase arm scores like any other matched term,
+    // so a row whose name spells out two adjacent query words outranks one that
+    // happens to share a word with the path — no extra query, no second pass.
+    //
+    // Abbreviations (ABBREVIATION_PAIRS) are expanded HERE and not on the single
+    // words above, because a short form is a terrible prefix on its own: adding
+    // "exec"* for the word "execute" swept in every ara::exec symbol in the repo
+    // and pushed the thread-pool query's actual answer out of the top ten. Inside
+    // a phrase the short form is precise — "init logging" hits InitLogging and
+    // essentially nothing else.
+    for (const phrase of queryPhrases(query)) {
+      const [a, b] = phrase.split(' ');
+      for (const va of wordVariants(a)) {
+        for (const vb of wordVariants(b)) push(`{name search_text} : "${esc(va)} ${esc(vb)}"`);
+      }
+    }
+    return arms.join(' OR ');
   }
 
   private regexToLike(pattern: string): string {

@@ -86,7 +86,13 @@ export class ToolHandlers {
      * Search precision / token knobs, read from env so operators can tune the
      * read-vs-search tradeoff without a rebuild.
      */
-    private getSearchTuning(): { defaultLimit: number; threshold: number; snippetMaxChars: number; scoreRatio: number } {
+    private getSearchTuning(): {
+        defaultLimit: number;
+        threshold: number;
+        snippetMaxChars: number;
+        totalMaxChars: number;
+        scoreRatio: number;
+    } {
         const num = (name: string, fallback: number): number => {
             const raw = envManager.get(name);
             if (raw === undefined || raw === null || String(raw).trim() === '') return fallback;
@@ -97,8 +103,27 @@ export class ToolHandlers {
             defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
             threshold: num('SEARCH_THRESHOLD', 0.4),
             snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 4000)),
+            totalMaxChars: Math.max(2000, num('SEARCH_TOTAL_MAX_CHARS', 20000)),
             scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
         };
+    }
+
+    /**
+     * Per-snippet character allowance for one response.
+     *
+     * The per-snippet cap alone bounds nothing that matters: ten hits of 4,000
+     * chars is a 10k-char answer, and a search over a repo with long functions
+     * really did come back at ~5,900 tokens — more than the file it was meant to
+     * save reading. Dividing a whole-response budget across the hits keeps a
+     * small result set at full length (2 hits still get 4,000 chars each) and
+     * only tightens when the count is what makes the answer big. The floor
+     * matters more than the budget: a snippet cut below it stops being readable
+     * code, and at that point the caller is better served by fewer, whole hits.
+     */
+    private snippetBudget(resultCount: number, tuning: { snippetMaxChars: number; totalMaxChars: number }): number {
+        if (resultCount <= 1) return tuning.snippetMaxChars;
+        const share = Math.floor(tuning.totalMaxChars / resultCount);
+        return Math.max(600, Math.min(tuning.snippetMaxChars, share));
     }
 
     /** 云端 git-index-service 基础 URL */
@@ -562,6 +587,7 @@ export class ToolHandlers {
                 const modeTag = searchMode === 'both' && graphSymbols.length > 0 ? ' vector+graph' : '';
                 parts.push(`${vectorResults.length}${modeTag} hits for "${query}"${searchSourceNote}`);
 
+                const perSnippetChars = this.snippetBudget(vectorResults.length, tuning);
                 for (let i = 0; i < vectorResults.length; i++) {
                     const r = vectorResults[i];
                     const loc = `${r.relativePath}:${r.startLine}-${r.endLine}`;
@@ -570,7 +596,7 @@ export class ToolHandlers {
                         const graphNote = graphMatch.length > 0 ? ` [graph: ${graphMatch.map(s => s.name).join(', ')}]` : '';
                         parts.push(`[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}${graphNote}`);
                     } else {
-                        const code = truncateContent(r.content, tuning.snippetMaxChars);
+                        const code = truncateContent(r.content, perSnippetChars);
                         const graphMatch = graphSymbols.filter(s =>
                             s.filePath === r.relativePath &&
                             s.line >= r.startLine &&

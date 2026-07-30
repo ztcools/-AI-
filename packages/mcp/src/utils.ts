@@ -3,13 +3,22 @@ import * as fs from "fs";
 import * as os from "os";
 
 /**
- * Truncate content to specified length
+ * Truncate a code snippet to `maxLength`, cutting on a line boundary.
+ *
+ * Cutting mid-line hands the caller a half-written statement it may well try to
+ * read as code; ending on the last complete line inside the budget costs at most
+ * one line and says plainly how many were dropped. Falls back to a hard cut when
+ * the first line alone is longer than the budget (minified or generated files).
  */
 export function truncateContent(content: string, maxLength: number): string {
     if (content.length <= maxLength) {
         return content;
     }
-    return content.substring(0, maxLength) + '...';
+    const head = content.substring(0, maxLength);
+    const lastNewline = head.lastIndexOf('\n');
+    const kept = lastNewline > 0 ? head.substring(0, lastNewline) : head;
+    const droppedLines = content.substring(kept.length).split('\n').length - (lastNewline > 0 ? 1 : 0);
+    return `${kept}\n// ... ${droppedLines} more line(s) truncated — Read the file for the rest`;
 }
 
 /**

@@ -206,6 +206,8 @@ Environment Variables:
   SEARCH_THRESHOLD        Relative score cutoff (default: 0.4)
   SEARCH_DEFAULT_LIMIT    Default max results (default: 10)
   SEARCH_SNIPPET_MAX_CHARS  Per-snippet character cap (default: 4000)
+  SEARCH_TOTAL_MAX_CHARS  Whole-response snippet budget, split across hits
+                          (default: 20000; per-snippet floor 600)
   SEARCH_SCORE_RATIO      Relative tail cutoff ratio in [0,1] (default: 0 = disabled)
 
 Examples:
