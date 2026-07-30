@@ -26,6 +26,23 @@
 - 服务器栈目录：`/data1/users/haoming.ju/claude-context/stack/`
   （`docker-compose.yml` + `.env` + `assets/` + `images/` + `data/`）。
 
+## 零、一条命令走完（推荐）
+
+第一～四节的全部动作已经脚本化，在**本机**跑：
+
+```bash
+cd /home/zt/claude-context-local-stack
+./push-to-server.sh --dry-run      # 先看它要做什么，不连服务器不改任何东西
+./push-to-server.sh                # 传文件 → 补 .env → 留底 → load → 重建 → 验证
+./push-to-server.sh --verify-only  # 只跑只读验证（含"服务器上是新镜像还是旧镜像"判定）
+```
+
+密码只需输一次（脚本用 SSH ControlMaster 复用连接），配了公钥则全程免密。
+脚本是幂等的：`.env` 只追加缺失的键、`docker tag backup-<日期>` 留底、
+`docker compose up -d` 只重建配置变了的容器、不 `down`、不动 `data/`。
+
+下面各节是同一套动作的手工版，供排查用。
+
 ## 一、构建镜像（本地）
 
 ```bash
