@@ -34,6 +34,8 @@ interface ParseMessage {
     filePath: string;
     content: string;
     language: string;
+    /** Repo identity — qualifiedNames are prefixed with it. */
+    project?: string;
 }
 
 interface RecycleMessage {
@@ -138,12 +140,19 @@ parentPort?.on('message', (msg: WorkerMessage) => {
                 errors.push(`Unsupported file extension: ${msg.filePath}`);
             } else {
                 const result = ext.extract(msg.content, {
-                    project: '', // project is filled in by the caller
+                    // Must match what the in-process path passes: qualifiedName
+                    // is `<project>.<path>.<name>`, and an empty project silently
+                    // yields keys nothing else in the pipeline can match.
+                    project: msg.project ?? '',
                     filePath: msg.filePath,
                     language,
                 });
                 nodes = result.nodes;
                 edges = result.edges;
+                // Calls resolve in a later phase, keyed by the *node index* this
+                // result carries. Dropping them (as this worker used to) costs
+                // every cross-file CALLS edge in the repo.
+                unresolvedRefs.push(...result.unresolvedRefs);
             }
         } catch (e: any) {
             errors.push(`Parse error: ${e?.message ?? String(e)}`);

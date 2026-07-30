@@ -422,7 +422,7 @@ export class ReferenceResolver {
         }
 
         // Step 0b: Positive memo — this exact (file, kind, name) already resolved.
-        const memoKey = `${ref.referenceKind || ''} ${refName}`;
+        const memoKey = `${ref.referenceKind || ''}\0${refName}`;
         const memoized = this.perFileResolutionMemo.get(memoKey);
         if (memoized) {
           resolved.push({ original: ref, ...memoized });

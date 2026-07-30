@@ -26,20 +26,34 @@ import {
 } from './types';
 import { SqliteGraphStore, getGraphDbPath } from './graph-store';
 import { InMemoryGraphBuffer } from './graph-buffer';
-import { GraphExtractor } from './extractor';
+import { GraphExtractor, ExtractionResult } from './extractor';
 import { ReferenceResolver } from './resolution/index';
+import {
+  ParseWorkerPool,
+  resolveParsePoolSize,
+  resolveParseTimeoutMs,
+} from './parse-pool';
 
 // ── Constants ───────────────────────────────────────────────────────
 
-const DEFAULT_PARSE_WORKERS = Math.max(1, os.availableParallelism() - 2);
+/**
+ * Below this file count the parse pool is skipped and everything runs in
+ * process. Spawning workers costs a Node boot plus a tree-sitter grammar load
+ * each (~250ms measured), so on a small repo the pool loses to the extractor it
+ * is meant to accelerate. Full index of the mcp package (49 files) takes 60ms
+ * single-threaded — there is nothing there to parallelise.
+ */
+const PARSE_POOL_MIN_FILES = 120;
 
 /**
  * Indexer version. Bump when extractor/resolver/edge-kind logic changes so that
  * graphs built by an older indexer are detected as outdated and rebuilt (git-diff
  * incremental sync can't see "the indexer itself changed"). v2 = call-edge import
- * denoise + true-incremental + awaited phase-3.
+ * denoise + true-incremental + awaited phase-3. v4 = C/C++ declarator naming
+ * (every C++ definition used to be named after its return type) + constructor
+ * kind — any pre-v4 C/C++ graph is wrong, not merely stale.
  */
-export const INDEXER_VERSION = 3;
+export const INDEXER_VERSION = 4;
 
 /** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
@@ -111,7 +125,10 @@ function isIgnoredFile(relPath: string): boolean {
 // ── Types ───────────────────────────────────────────────────────────
 
 export interface GraphIndexerOptions {
-  /** Number of parse workers (default: max(1, cores-2)) */
+  /**
+   * Parse worker threads. Default: `CODEGRAPH_PARSE_WORKERS`, else
+   * `clamp(cores - 2, 1, 8)`. `1` keeps parsing in-process (no workers).
+   */
   workerCount?: number;
   /** Force full reindex even if graph already exists */
   force?: boolean;
@@ -198,110 +215,167 @@ export class GraphIndexer {
     const graphBuffer = new InMemoryGraphBuffer(this.project);
     const allUnresolvedRefs: UnresolvedReference[] = [];
 
-    const workerCount = options.workerCount ?? DEFAULT_PARSE_WORKERS;
-    const chunkSize = Math.ceil(files.length / Math.min(workerCount, files.length));
-    const chunks: FileToIndex[][] = [];
-
-    for (let i = 0; i < files.length; i += chunkSize) {
-      chunks.push(files.slice(i, i + chunkSize));
-    }
-
     let processed = 0;
 
-    // Process files in parallel batches
-    const parseChunk = async (chunk: FileToIndex[]): Promise<void> => {
-      for (const file of chunk) {
-        if (options.signal?.aborted) return;
+    /**
+     * Fold one file's extraction into the buffer.
+     *
+     * Node ids inside an ExtractionResult are indices into its own `nodes`
+     * array, so every edge endpoint and unresolved ref has to be remapped
+     * through idMap before it can reference a buffer row.
+     */
+    const mergeResult = (file: FileToIndex, result: ExtractionResult): void => {
+      if (result.nodes.length === 0 && result.unresolvedRefs.length === 0) {
+        filesSkipped++;
+        return;
+      }
 
-        try {
-          const absPath = file.absolutePath;
-          if (!fs.existsSync(absPath)) continue;
-
-          const content = await fsp.readFile(absPath, 'utf-8');
-          const result = this.extractor.extract(content, {
-            project: this.project,
-            filePath: file.relativePath,
+      const idMap = new Map<number, number>();
+      for (let i = 0; i < result.nodes.length; i++) {
+        const n = result.nodes[i];
+        const realId = graphBuffer.upsertNode(
+          n.kind || n.label,
+          n.name,
+          n.qualifiedName,
+          n.filePath,
+          n.startLine,
+          n.endLine,
+          n.properties || {},
+          {
             language: file.language,
+            signature: n.signature,
+            visibility: n.visibility,
+            isExported: n.isExported,
+            isAsync: n.isAsync,
+            isStatic: n.isStatic,
+            isAbstract: n.isAbstract,
+            decorators: n.decorators,
+            docstring: n.docstring,
+          }
+        );
+        idMap.set(i, realId);
+      }
+
+      // Structural edges (CONTAINS, IMPORTS) with remapped IDs
+      for (const e of result.edges) {
+        const srcId = idMap.get(e.sourceId as unknown as number);
+        const tgtId = idMap.get(e.targetId as unknown as number);
+        if (srcId != null && tgtId != null) {
+          graphBuffer.insertEdge(srcId, tgtId, e.kind || e.type, e.properties || {}, {
+            line: e.line,
+            column: e.column,
+            provenance: e.provenance || 'tree-sitter',
+            metadata: e.metadata,
           });
-
-          if (result.nodes.length === 0 && result.unresolvedRefs.length === 0) {
-            filesSkipped++;
-            processed++;
-            continue;
-          }
-
-          // Add nodes to buffer, remapping temp indices
-          const idMap = new Map<number, number>();
-          for (let i = 0; i < result.nodes.length; i++) {
-            const n = result.nodes[i];
-            const realId = graphBuffer.upsertNode(
-              n.kind || n.label,
-              n.name,
-              n.qualifiedName,
-              n.filePath,
-              n.startLine,
-              n.endLine,
-              n.properties || {},
-              {
-                language: file.language,
-                signature: n.signature,
-                visibility: n.visibility,
-                isExported: n.isExported,
-                isAsync: n.isAsync,
-                isStatic: n.isStatic,
-                isAbstract: n.isAbstract,
-                decorators: n.decorators,
-                docstring: n.docstring,
-              }
-            );
-            idMap.set(i, realId);
-          }
-
-          // Add structural edges (CONTAINS, IMPORTS) with remapped IDs
-          for (const e of result.edges) {
-            // Edges from extractor use temp array indices
-            const srcId = idMap.get(e.sourceId as unknown as number);
-            const tgtId = idMap.get(e.targetId as unknown as number);
-            if (srcId != null && tgtId != null) {
-              graphBuffer.insertEdge(srcId, tgtId, e.kind || e.type, e.properties || {}, {
-                line: e.line,
-                column: e.column,
-                provenance: e.provenance || 'tree-sitter',
-                metadata: e.metadata,
-              });
-            }
-          }
-
-          // Collect unresolved refs (remap fromNodeId through idMap)
-          for (const ref of result.unresolvedRefs) {
-            const realFromId = idMap.get(ref.fromNodeId);
-            if (realFromId != null) {
-              allUnresolvedRefs.push({
-                ...ref,
-                fromNodeId: realFromId,
-              });
-            }
-          }
-
-          filesIndexed++;
-          totalNodes += result.nodes.length;
-        } catch (err: any) {
-          filesErrored++;
-          errors.push(`${file.relativePath}: ${err.message}`);
         }
+      }
 
-        processed++;
-        if (processed % 100 === 0) {
-          options.onProgress?.({ phase: 'parsing', current: processed, total, currentFile: file.relativePath });
-          await new Promise<void>(r => setImmediate(r));
+      for (const ref of result.unresolvedRefs) {
+        const realFromId = idMap.get(ref.fromNodeId);
+        if (realFromId != null) {
+          allUnresolvedRefs.push({ ...ref, fromNodeId: realFromId });
         }
+      }
+
+      filesIndexed++;
+      totalNodes += result.nodes.length;
+    };
+
+    // tree-sitter parsing is synchronous CPU work, so `await`-ing it on the main
+    // thread parallelises nothing however the file list is chunked — the whole
+    // parse phase used one core while the rest idled. Real parallelism needs
+    // worker threads, each with its own extractor and grammar heap.
+    const poolSize = resolveParsePoolSize(
+      options.workerCount !== undefined
+        ? String(options.workerCount)
+        : process.env.CODEGRAPH_PARSE_WORKERS,
+      os.availableParallelism(),
+    );
+    let pool: ParseWorkerPool | null = null;
+    if (poolSize > 1 && total >= PARSE_POOL_MIN_FILES) {
+      try {
+        pool = new ParseWorkerPool({
+          // Only grammars this repo actually contains, so a pure-Python repo
+          // doesn't pay for the C++ grammar in every worker.
+          languages: [...new Set(files.map(f => f.language))],
+          size: poolSize,
+          workerScriptPath: path.join(__dirname, 'parse-worker-v2.js'),
+          parseTimeoutMs: resolveParseTimeoutMs(process.env.CODEGRAPH_PARSE_TIMEOUT_MS),
+        });
+        // A full index knows every worker will be needed; the default
+        // demand-driven growth would ramp up one file at a time.
+        pool.prewarm();
+      } catch (err: any) {
+        // Worker threads unavailable (restricted runtime, missing dist file):
+        // indexing must still work, just single-threaded.
+        console.warn(`[GraphIndexer] parse pool unavailable, parsing in-process: ${err.message}`);
+        pool = null;
+      }
+    }
+
+    /** Read + parse one file. `null` = nothing to merge (missing or errored). */
+    const parseOne = async (file: FileToIndex): Promise<ExtractionResult | null> => {
+      try {
+        if (!fs.existsSync(file.absolutePath)) return null;
+        const content = await fsp.readFile(file.absolutePath, 'utf-8');
+        const ctx = {
+          project: this.project,
+          filePath: file.relativePath,
+          language: file.language,
+        };
+
+        if (pool?.healthy) {
+          try {
+            return (await pool.requestParse({
+              filePath: file.relativePath,
+              content,
+              language: file.language,
+              project: this.project,
+            })) as unknown as ExtractionResult;
+          } catch {
+            // requestParse rejects on parse timeout or worker crash. The file is
+            // still ours to index — re-parse it in process rather than lose it,
+            // and let the pool respawn on its own.
+            return this.extractor.extract(content, ctx);
+          }
+        }
+        return this.extractor.extract(content, ctx);
+      } catch (err: any) {
+        filesErrored++;
+        errors.push(`${file.relativePath}: ${err.message}`);
+        return null;
       }
     };
 
-    // Process chunks in parallel batches
-    for (let i = 0; i < chunks.length; i += workerCount) {
-      const batch = chunks.slice(i, i + workerCount);
-      await Promise.all(batch.map(c => parseChunk(c)));
+    try {
+      // Parse a window concurrently, then merge it in FILE order. Merging as
+      // results land would be marginally faster, but buffer ids would then
+      // depend on which worker finished first — and reference resolution breaks
+      // ambiguous name ties by id, so the same commit would produce slightly
+      // different graphs run to run (measured: ±8 of 8850 cross-file edges).
+      // Two files in flight per worker keeps the pool fed across the window
+      // boundary; without the pool a window of 1 is the same sequential path.
+      const window = pool ? Math.min(poolSize * 2, total) : 1;
+      for (let i = 0; i < files.length; i += window) {
+        if (options.signal?.aborted) break;
+        const batch = files.slice(i, i + window);
+        const parsed = await Promise.all(batch.map(parseOne));
+
+        for (let j = 0; j < batch.length; j++) {
+          const result = parsed[j];
+          if (result) mergeResult(batch[j], result);
+        }
+
+        processed += batch.length;
+        options.onProgress?.({
+          phase: 'parsing', current: Math.min(processed, total), total,
+          currentFile: batch[batch.length - 1].relativePath,
+        });
+        // Yield so a long index doesn't starve the MCP event loop.
+        await new Promise<void>(r => setImmediate(r));
+      }
+    } finally {
+      await pool?.destroy();
     }
 
     options.onProgress?.({ phase: 'parsing', current: total, total });

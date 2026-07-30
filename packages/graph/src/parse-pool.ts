@@ -163,6 +163,12 @@ export interface ParseTask {
     filePath: string;
     content: string;
     language: string;
+    /**
+     * Repo identity. Node `qualifiedName`s are built as
+     * `<project>.<path>.<name>`, so a worker that doesn't know the project
+     * produces keys the resolver and the store can't match against.
+     */
+    project?: string;
 }
 
 /**
@@ -478,6 +484,7 @@ export class ParseWorkerPool {
             filePath: job.task.filePath,
             content: job.task.content,
             language: job.task.language,
+            project: job.task.project,
         });
     }
 

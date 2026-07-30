@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS nodes (
     project TEXT NOT NULL,
     kind TEXT NOT NULL,
     name TEXT NOT NULL,
+    /*
+     * Last dotted segment of the name (Foo.bar -> bar; no dot -> the name).
+     *
+     * Reference resolution asks "which nodes are called bar, whatever they hang
+     * off" thousands of times per index, and the only way to express that in SQL
+     * was  name LIKE '%.' || ?  — a leading wildcard, so a full table scan per
+     * lookup. It was 4.8s of an 8.7s index of a 353-file repo (55%), more than
+     * parsing and storing combined. Denormalised here so the lookup is an index
+     * seek. Filled by upsertNode; there is no other writer.
+     */
+    suffix_name TEXT,
     qualified_name TEXT NOT NULL,
     file_path TEXT NOT NULL,
     language TEXT,
@@ -67,6 +78,8 @@ CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(project, file_path);
 CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(project, name);
 CREATE INDEX IF NOT EXISTS idx_nodes_lower_name ON nodes(project, LOWER(name));
+-- idx_nodes_suffix is created by _ensureSuffixName: on a pre-existing graph the
+-- column is added by ALTER TABLE, which has to happen before the index.
 
 CREATE TABLE IF NOT EXISTS edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +159,12 @@ CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
     VALUES (new.id, new.name, new.qualified_name, new.file_path);
 END;
 `;
+
+/** `Foo.bar` → `bar`; a name with no dot is its own last segment. */
+function lastNameSegment(name: string): string {
+  const dot = name.lastIndexOf('.');
+  return dot < 0 ? name : name.slice(dot + 1);
+}
 
 /**
  * Kinds never worth returning as a search hit: import pseudo-nodes, data,
@@ -240,6 +259,43 @@ export class SqliteGraphStore implements GraphStore {
     return this._stmts[sql];
   }
 
+  private _roStmts = new Map<string, any>();
+  /** Connection the cached read statements belong to. */
+  private _roStmtConn: Database | null = null;
+
+  /**
+   * Every call site is a fixed template with `?` placeholders, so the real
+   * population is a few dozen — a few hundred only if some future caller starts
+   * building SQL per query. Dropping the whole cache at that point costs one
+   * re-prepare each and keeps an MCP process that lives for days from growing a
+   * statement per query it ever answered.
+   */
+  private static readonly RO_STMT_CACHE_MAX = 256;
+
+  /**
+   * Cached prepared statement on the read connection.
+   *
+   * The read path used to call prepare() per query, which a bulk index does tens
+   * of thousands of times (~120ms of a 3.5s index, all of it re-parsing the same
+   * dozen statements). Cache is tied to the connection object: readDB falls back
+   * to the write handle if the RO open fails, and close() drops the RO one, so a
+   * statement must never outlive the connection it was prepared on.
+   */
+  private roStmt(sql: string): any {
+    const conn = this.readDB;
+    if (this._roStmtConn !== conn) {
+      this._roStmts.clear();
+      this._roStmtConn = conn;
+    }
+    let st = this._roStmts.get(sql);
+    if (!st) {
+      if (this._roStmts.size >= SqliteGraphStore.RO_STMT_CACHE_MAX) this._roStmts.clear();
+      st = conn.prepare(sql);
+      this._roStmts.set(sql, st);
+    }
+    return st;
+  }
+
   /**
    * @param projectDirOrPath — if a directory, DB goes to `<dir>/.context/graph/`.
    *   If it ends with `.db`, treated as a direct DB path (for tests / backward compat).
@@ -294,7 +350,35 @@ export class SqliteGraphStore implements GraphStore {
     this.db.pragma('page_size = 4096');
     this.db.pragma('cache_size = -64000'); // 64MB
     this.db.exec(SCHEMA_SQL);
+    this._ensureSuffixName();
     this.db.exec(FTS_TRIGGERS_SQL);
+  }
+
+  /**
+   * Guarantee `nodes.suffix_name` exists, is indexed, and is filled.
+   *
+   * CREATE TABLE IF NOT EXISTS leaves a pre-existing table alone, so a graph
+   * built before this column would keep answering suffix lookups against a
+   * column that isn't there. Backfilling is cheaper than the full rebuild the
+   * version stamp would otherwise force, and only dotted names need a row visit.
+   */
+  private _ensureSuffixName(): void {
+    const cols = this.db.pragma('table_info(nodes)') as Array<{ name: string }>;
+    if (!cols.some(c => c.name === 'suffix_name')) {
+      this.db.exec('ALTER TABLE nodes ADD COLUMN suffix_name TEXT');
+      // Undotted names are their own suffix — one set-based UPDATE covers them.
+      this.db.exec("UPDATE nodes SET suffix_name = name WHERE instr(name, '.') = 0");
+      const dotted = this.db
+        .prepare("SELECT id, name FROM nodes WHERE instr(name, '.') > 0")
+        .all() as Array<{ id: number; name: string }>;
+      if (dotted.length > 0) {
+        const upd = this.db.prepare('UPDATE nodes SET suffix_name = ? WHERE id = ?');
+        this.db.transaction(() => {
+          for (const row of dotted) upd.run(lastNameSegment(row.name), row.id);
+        })();
+      }
+    }
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_nodes_suffix ON nodes(project, suffix_name)');
   }
 
   initialize(): void {
@@ -305,6 +389,11 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   close(): void {
+    // Drop the statement caches first: a cached statement holds its connection
+    // alive, and reusing one after close() is a hard crash rather than an error.
+    this._stmts = {};
+    this._roStmts.clear();
+    this._roStmtConn = null;
     if (this.db) {
       try { this.db.close(); } catch { /* ignore */ }
     }
@@ -351,14 +440,15 @@ export class SqliteGraphStore implements GraphStore {
 
   upsertNode(node: Omit<GraphNode, 'id'>): number {
     const result = this.stmt(`
-      INSERT INTO nodes (project, kind, name, qualified_name, file_path,
+      INSERT INTO nodes (project, kind, name, suffix_name, qualified_name, file_path,
         language, start_line, end_line,
         signature, visibility, is_exported, is_async, is_static, is_abstract,
         decorators_json, type_parameters_json, return_type, docstring,
         properties_json, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project, qualified_name) DO UPDATE SET
         kind = excluded.kind, name = excluded.name,
+        suffix_name = excluded.suffix_name,
         file_path = excluded.file_path, language = excluded.language,
         start_line = excluded.start_line, end_line = excluded.end_line,
         signature = excluded.signature, visibility = excluded.visibility,
@@ -372,6 +462,7 @@ export class SqliteGraphStore implements GraphStore {
       node.project,
       node.kind || node.label,
       node.name,
+      lastNameSegment(node.name),
       node.qualifiedName,
       node.filePath,
       node.language || null,
@@ -394,7 +485,7 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   getNodeById(id: number): GraphNode | null {
-    const row = this.readDB.prepare('SELECT * FROM nodes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const row = this.roStmt('SELECT * FROM nodes WHERE id = ?').get(id) as Record<string, unknown> | undefined;
     return row ? this.rowToNode(row) : null;
   }
 
@@ -402,7 +493,7 @@ export class SqliteGraphStore implements GraphStore {
     const result = new Map<number, GraphNode>();
     if (ids.length === 0) return result;
     const placeholders = ids.map(() => '?').join(',');
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       `SELECT * FROM nodes WHERE id IN (${placeholders})`
     ).all(...ids) as Array<Record<string, unknown>>;
     for (const row of rows) {
@@ -413,21 +504,21 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   getNodeByQN(project: string, qualifiedName: string): GraphNode | null {
-    const row = this.readDB.prepare(
+    const row = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND qualified_name = ?'
     ).get(project, qualifiedName) as Record<string, unknown> | undefined;
     return row ? this.rowToNode(row) : null;
   }
 
   getNodesByFile(project: string, filePath: string): GraphNode[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND file_path = ?'
     ).all(project, filePath) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
   }
 
   getNodesByName(project: string, name: string): GraphNode[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND name = ?'
     ).all(project, name) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
@@ -438,31 +529,37 @@ export class SqliteGraphStore implements GraphStore {
    * with `.<name>` (e.g. "getNodesById" matches "SqliteGraphStore.getNodesById").
    * Uses a UNION of two indexed lookups — no full-table scan.
    */
+  /**
+   * Nodes named `name`, plus nodes whose name ends in `.name` (`Widget.render`
+   * for a `render` call). Index seek on suffix_name — see the column comment
+   * for why the obvious `LIKE '%.' || ?` had to go.
+   */
   getNodesBySuffix(project: string, name: string): GraphNode[] {
-    const rows = this.readDB.prepare(`
+    const rows = this.roStmt(`
       SELECT * FROM nodes WHERE project = ? AND name = ?
       UNION ALL
-      SELECT * FROM nodes WHERE project = ? AND name LIKE ('%.' || ?)
-    `).all(project, name, project, name) as Array<Record<string, unknown>>;
+      SELECT * FROM nodes
+        WHERE project = ? AND suffix_name = ? AND name <> ?
+    `).all(project, name, project, name, name) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
   }
 
   getNodesByLowerName(project: string, lowerName: string): GraphNode[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND LOWER(name) = ?'
     ).all(project, lowerName) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
   }
 
   getNodesByQualifiedNameExact(project: string, qn: string): GraphNode[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND qualified_name = ?'
     ).all(project, qn) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
   }
 
   getNodesByKind(project: string, kind: GraphNodeKind): GraphNode[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT * FROM nodes WHERE project = ? AND kind = ?'
     ).all(project, kind) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToNode(r));
@@ -470,7 +567,7 @@ export class SqliteGraphStore implements GraphStore {
 
   /** Streaming iterator — avoids materializing a giant array for whole-kind scans. */
   iterateNodesByKind(project: string, kind: GraphNodeKind): Iterable<GraphNode> {
-    const stmt = this.readDB.prepare('SELECT * FROM nodes WHERE project = ? AND kind = ?');
+    const stmt = this.roStmt('SELECT * FROM nodes WHERE project = ? AND kind = ?');
     return {
       [Symbol.iterator]: () => {
         const iter = stmt.iterate(project, kind);
@@ -788,8 +885,8 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   getNodeDegree(nodeId: number): { inDegree: number; outDegree: number } {
-    const inRow = this.readDB.prepare('SELECT COUNT(*) as cnt FROM edges WHERE target_id = ?').get(nodeId) as { cnt: number };
-    const outRow = this.readDB.prepare('SELECT COUNT(*) as cnt FROM edges WHERE source_id = ?').get(nodeId) as { cnt: number };
+    const inRow = this.roStmt('SELECT COUNT(*) as cnt FROM edges WHERE target_id = ?').get(nodeId) as { cnt: number };
+    const outRow = this.roStmt('SELECT COUNT(*) as cnt FROM edges WHERE source_id = ?').get(nodeId) as { cnt: number };
     return { inDegree: inRow.cnt, outDegree: outRow.cnt };
   }
 
@@ -800,7 +897,7 @@ export class SqliteGraphStore implements GraphStore {
     for (const id of nodeIds) degreeMap.set(id, { inDegree: 0, outDegree: 0 });
 
     const placeholders = nodeIds.map(() => '?').join(',');
-    const rows = this.readDB.prepare(`
+    const rows = this.roStmt(`
       SELECT target_id as id, COUNT(*) as in_deg, 0 as out_deg FROM edges
       WHERE target_id IN (${placeholders})
       GROUP BY target_id
@@ -842,7 +939,7 @@ export class SqliteGraphStore implements GraphStore {
     );
     if (result.changes > 0) return Number(result.lastInsertRowid);
     // On conflict, return existing ID (line/col now have -1 defaults)
-    const existing = this.readDB.prepare(
+    const existing = this.roStmt(
       'SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND kind = ? AND line = ? AND col = ?'
     ).get(edge.sourceId, edge.targetId, kind, line, col) as { id: number } | undefined;
     return existing ? existing.id : 0;
@@ -852,7 +949,7 @@ export class SqliteGraphStore implements GraphStore {
     let sql = 'SELECT * FROM edges WHERE source_id = ?';
     const params: unknown[] = [sourceId];
     if (kind) { sql += ' AND kind = ?'; params.push(kind); }
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToEdge(r));
   }
 
@@ -862,7 +959,7 @@ export class SqliteGraphStore implements GraphStore {
     }
     const placeholders = kinds.map(() => '?').join(',');
     const sql = `SELECT * FROM edges WHERE source_id = ? AND kind IN (${placeholders})`;
-    const rows = this.readDB.prepare(sql).all(sourceId, ...kinds) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(sourceId, ...kinds) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToEdge(r));
   }
 
@@ -872,7 +969,7 @@ export class SqliteGraphStore implements GraphStore {
     }
     const placeholders = kinds.map(() => '?').join(',');
     const sql = `SELECT * FROM edges WHERE target_id = ? AND kind IN (${placeholders})`;
-    const rows = this.readDB.prepare(sql).all(targetId, ...kinds) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(targetId, ...kinds) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToEdge(r));
   }
 
@@ -885,7 +982,7 @@ export class SqliteGraphStore implements GraphStore {
     let sql = `SELECT * FROM edges WHERE source_id IN (${placeholders})`;
     const params: unknown[] = [...sourceIds];
     if (kind) { sql += ' AND kind = ?'; params.push(kind); }
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     for (const row of rows) {
       const edge = this.rowToEdge(row);
       resultMap.get(edge.sourceId)?.push(edge);
@@ -897,7 +994,7 @@ export class SqliteGraphStore implements GraphStore {
     let sql = 'SELECT * FROM edges WHERE target_id = ?';
     const params: unknown[] = [targetId];
     if (kind) { sql += ' AND kind = ?'; params.push(kind); }
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToEdge(r));
   }
 
@@ -910,7 +1007,7 @@ export class SqliteGraphStore implements GraphStore {
     let sql = `SELECT * FROM edges WHERE target_id IN (${placeholders})`;
     const params: unknown[] = [...targetIds];
     if (kind) { sql += ' AND kind = ?'; params.push(kind); }
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     for (const row of rows) {
       const edge = this.rowToEdge(row);
       resultMap.get(edge.targetId)?.push(edge);
@@ -927,7 +1024,7 @@ export class SqliteGraphStore implements GraphStore {
     }
     const sql = `SELECT * FROM edges e WHERE ${conditions.join(' AND ')} LIMIT ?`;
     params.push(limit ?? 1000);
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     return rows.map(r => this.rowToEdge(r));
   }
 
@@ -954,7 +1051,7 @@ export class SqliteGraphStore implements GraphStore {
   // ── Unresolved reference operations ────────────────────────────────
 
   getUnresolvedRefsCount(project: string): number {
-    const row = this.readDB.prepare(
+    const row = this.roStmt(
       "SELECT COUNT(*) as cnt FROM unresolved_refs WHERE project = ? AND status = 'pending'"
     ).get(project) as { cnt: number };
     return row.cnt;
@@ -969,7 +1066,7 @@ export class SqliteGraphStore implements GraphStore {
     }
     sql += ' ORDER BY id LIMIT ?';
     params.push(limit);
-    const rows = this.readDB.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    const rows = this.roStmt(sql).all(...params) as Array<Record<string, unknown>>;
     return rows.map(r => ({
       fromNodeId: r.from_node_id as number,
       referenceName: r.reference_name as string,
@@ -1095,13 +1192,13 @@ export class SqliteGraphStore implements GraphStore {
   // ── Project operations ────────────────────────────────────────────
 
   listProjects(): string[] {
-    const rows = this.readDB.prepare('SELECT DISTINCT project FROM nodes ORDER BY project').all() as Array<{ project: string }>;
+    const rows = this.roStmt('SELECT DISTINCT project FROM nodes ORDER BY project').all() as Array<{ project: string }>;
     return rows.map(r => r.project);
   }
 
   getProjectStats(project: string): { nodes: number; edges: number } {
-    const nodeRow = this.readDB.prepare('SELECT COUNT(*) as cnt FROM nodes WHERE project = ?').get(project) as { cnt: number };
-    const edgeRow = this.readDB.prepare('SELECT COUNT(*) as cnt FROM edges WHERE project = ?').get(project) as { cnt: number };
+    const nodeRow = this.roStmt('SELECT COUNT(*) as cnt FROM nodes WHERE project = ?').get(project) as { cnt: number };
+    const edgeRow = this.roStmt('SELECT COUNT(*) as cnt FROM edges WHERE project = ?').get(project) as { cnt: number };
     return { nodes: nodeRow.cnt, edges: edgeRow.cnt };
   }
 
@@ -1140,8 +1237,8 @@ export class SqliteGraphStore implements GraphStore {
   // ── Schema ─────────────────────────────────────────────────────────
 
   getSchema(): { nodeKinds: string[]; edgeKinds: string[] } {
-    const kinds = this.readDB.prepare('SELECT DISTINCT kind FROM nodes ORDER BY kind').all() as Array<{ kind: string }>;
-    const types = this.readDB.prepare('SELECT DISTINCT kind FROM edges ORDER BY kind').all() as Array<{ kind: string }>;
+    const kinds = this.roStmt('SELECT DISTINCT kind FROM nodes ORDER BY kind').all() as Array<{ kind: string }>;
+    const types = this.roStmt('SELECT DISTINCT kind FROM edges ORDER BY kind').all() as Array<{ kind: string }>;
     return {
       nodeKinds: kinds.map(r => r.kind),
       edgeKinds: types.map(r => r.kind),
@@ -1149,7 +1246,7 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   getNodeKindCounts(project: string): Record<string, number> {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT kind, COUNT(*) as cnt FROM nodes WHERE project = ? GROUP BY kind'
     ).all(project) as Array<{ kind: string; cnt: number }>;
     const result: Record<string, number> = {};
@@ -1158,7 +1255,7 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   getEdgeKindCounts(project: string): Record<string, number> {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT kind, COUNT(*) as cnt FROM edges WHERE project = ? GROUP BY kind'
     ).all(project) as Array<{ kind: string; cnt: number }>;
     const result: Record<string, number> = {};
@@ -1199,7 +1296,7 @@ export class SqliteGraphStore implements GraphStore {
 
       const whereSQL = conditions.join(' AND ');
       if (returnClause.includes('*') || returnClause.includes(matchMatch[1])) {
-        const rows = this.readDB.prepare(`SELECT * FROM nodes n WHERE ${whereSQL}`).all(...params) as Array<Record<string, unknown>>;
+        const rows = this.roStmt(`SELECT * FROM nodes n WHERE ${whereSQL}`).all(...params) as Array<Record<string, unknown>>;
         return { rows };
       }
     }
@@ -1250,21 +1347,21 @@ export class SqliteGraphStore implements GraphStore {
   // ── File path helpers ──────────────────────────────────────────────
 
   getAllFilePaths(project: string): string[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT DISTINCT file_path FROM nodes WHERE project = ?'
     ).all(project) as Array<{ file_path: string }>;
     return rows.map(r => r.file_path);
   }
 
   getAllNodeNames(project: string): string[] {
-    const rows = this.readDB.prepare(
+    const rows = this.roStmt(
       'SELECT DISTINCT name FROM nodes WHERE project = ?'
     ).all(project) as Array<{ name: string }>;
     return rows.map(r => r.name);
   }
 
   iterateNodeNames(project: string): Iterable<string> {
-    const stmt = this.readDB.prepare('SELECT DISTINCT name FROM nodes WHERE project = ?');
+    const stmt = this.roStmt('SELECT DISTINCT name FROM nodes WHERE project = ?');
     return {
       [Symbol.iterator]: () => {
         const iter = stmt.iterate(project);
