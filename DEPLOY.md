@@ -47,25 +47,46 @@ docker build \
   -t claude-phigent:latest .
 ```
 
-导出（文件名必须与 `deploy.sh` 的 `load_image` 对齐）：
+导出到 local-stack 的 `images/`（文件名必须与 `deploy.sh` 的 `load_image` 对齐）。
+覆盖前先把上一版留成 `.bak-<日期>`——回滚时不必重新构建：
 
 ```bash
-docker save claude-context-git-index:latest | gzip > /tmp/claude-git-index.tar.gz
-docker save claude-phigent:latest          | gzip > /tmp/claude-phigent.tar.gz
-ls -lh /tmp/claude-*.tar.gz
+cd /home/zt/claude-context-local-stack/images
+mv claude-git-index.tar.gz claude-git-index.tar.gz.bak-$(date +%Y%m%d)
+mv claude-phigent.tar.gz   claude-phigent.tar.gz.bak-$(date +%Y%m%d)
+
+docker save claude-context-git-index:latest | gzip -1 > claude-git-index.tar.gz
+docker save claude-phigent:latest           | gzip -1 > claude-phigent.tar.gz
+
+# 校验 tar 完整（gzip 截断/写坏时 docker load 会在服务器上才失败）
+gunzip -c claude-git-index.tar.gz | tar -tf - manifest.json
+gunzip -c claude-phigent.tar.gz   | tar -tf - manifest.json
+ls -lh
 ```
+
+> `images/` 已 gitignore，tar 不进仓库。`gzip -1` 比默认级别快得多，
+> 体积只差几个百分点（171M vs 168M），传输时间的差远小于压缩时间的差。
+
+**当前产物**（2026-07-30 21:00 已就绪）：`claude-git-index.tar.gz` 171M、
+`claude-phigent.tar.gz` 293M，上一版留底为 `.bak-20260717` / `.bak-20260720`。
 
 ## 二、上传（sftp）
 
 镜像放 `images/`；编排文件与 `assets/` 只在有改动时才传。
 
 ```
-put /tmp/claude-git-index.tar.gz  /data1/users/haoming.ju/claude-context/stack/images/claude-git-index.tar.gz
-put /tmp/claude-phigent.tar.gz    /data1/users/haoming.ju/claude-context/stack/images/claude-phigent.tar.gz
-put /home/zt/claude-context-local-stack/docker-compose.yml        .../stack/docker-compose.yml
-put /home/zt/claude-context-local-stack/assets/milvus-user.yaml   .../stack/assets/milvus-user.yaml
-put /home/zt/claude-context-local-stack/deploy.sh                 .../stack/deploy.sh
+lcd /home/zt/claude-context-local-stack/images
+put claude-git-index.tar.gz  /data1/users/haoming.ju/claude-context/stack/images/claude-git-index.tar.gz
+put claude-phigent.tar.gz    /data1/users/haoming.ju/claude-context/stack/images/claude-phigent.tar.gz
+
+lcd /home/zt/claude-context-local-stack
+put docker-compose.yml        /data1/users/haoming.ju/claude-context/stack/docker-compose.yml
+put assets/milvus-user.yaml   /data1/users/haoming.ju/claude-context/stack/assets/milvus-user.yaml
+put deploy.sh                 /data1/users/haoming.ju/claude-context/stack/deploy.sh
 ```
+
+> 服务器上 `assets/` 目录此前不存在（旧栈没有 `milvus-user.yaml`），
+> 传之前先 `mkdir assets`，否则 `put` 会失败。
 
 > `assets/milvus-user.yaml` 缺失时 Docker 会在挂载点建**空目录**，Milvus 把
 > `/milvus/configs/user.yaml` 当目录读会直接起不来。`deploy.sh` 已在启动前显式检查这一点。
