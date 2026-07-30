@@ -91,7 +91,7 @@ Unbind this repo from its cloud vector index. Local graph is kept; re-run link t
 Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. It is a first-hop LOCATOR, not a replacement for Read/Grep. The output header shows a repo size tier (small/medium/large) — use it to decide.
 
 DEFAULT = Grep/Read. Reach for search ONLY in these cases:
-1. RELATIONSHIP questions grep CANNOT answer — "who calls X", "callers of Y", "impact of changing Z", dead code, entry points → mode "graph" (cheapest, ~200 tok, returns the call chain). Works at ANY repo size. The query MUST name the symbol ("who calls CreateProxy", or just "CreateProxy"): graph mode matches identifiers, so a prose question with no symbol in it ("how is a proxy created") ranks by incidental word overlap and returns unrelated code. Ask that as "both" instead.
+1. RELATIONSHIP questions grep CANNOT answer — "who calls X", "callers of Y", "impact of changing Z", dead code, entry points → mode "graph". Works at ANY repo size.
 2. LARGE/UNFAMILIAR repo (> ~2000 files) AND you don't know where something lives — "how does auth work", "where is request handled" → mode "both". Grep would drown in hits here.
 3. You know the CONCEPT but not the exact identifier (semantic recall beats keyword grep) → mode "vector".
 
@@ -100,7 +100,12 @@ Do NOT use it when:
 - Exact string/symbol/file path already known → Grep/Read directly (instant, zero cost).
 - Need a verbatim whole file or config/YAML/markdown → Grep / Read a located line range.
 
-After search locates a spot, Read that exact line range to understand/edit. Phrase the query to match the mode: "vector"/"both" take natural language (intent, no identifier needed); "graph" takes a symbol name. Cost control: mode "graph" (~200 tok) << "vector"/"both"; add style:"compact" for file:line only (~10x fewer tokens), limit:5 to cap snippets, enrich:false to skip the call-graph. Needs link for vector; without link returns graph-only.
+Picking a mode — measured on 36 expected symbols across two real C++ repos:
+- "graph" — 86% of them found, ~300 tok, 60-105ms, no link needed. Prose is fine, not just symbol names: identifiers are indexed word-by-word and stemmed, so "initialize logging and create the log manager" finds InitLogging/LogManager and "supervised entity recovery action" finds both classes. Returns locations + call chains, no code — start here when that is what you need.
+- "both" — 93%, ~2200 tok (7x graph). Pays for itself when you need the code snippets themselves, or when the thing you are describing is NOT spelled out in any identifier (an underlying library, a concept like zero-copy shared memory) — that is where the vector side earns its cost.
+- "vector" — 83%, ~1700 tok. Same semantic reach as "both" without call graphs. Requires link.
+
+After search locates a spot, Read that exact line range to understand/edit. Cost control: style:"compact" for file:line only (~10x fewer tokens), limit:5 to cap snippets, enrich:false to skip the call-graph. Snippets share a whole-response budget, so a large limit shortens each one — ask for fewer hits when you want them complete. Needs link for vector; without link returns graph-only.
 `;
 
         const clear_description = `
@@ -177,7 +182,7 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                 mode: {
                                     type: "string",
                                     enum: ["vector", "graph", "both"],
-                                    description: "Search mode: 'vector' (semantic — natural-language intent), 'graph' (symbol/relationship — query must name a symbol), 'both' (default).",
+                                    description: "Search mode: 'graph' (symbols, call relationships and locations — cheapest, takes symbol names or prose), 'vector' (semantic, needs link), 'both' (default — vector snippets + graph context).",
                                     default: "both",
                                 },
                                 enrich: {
