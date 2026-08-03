@@ -12,7 +12,8 @@
         "dev": "pnpm -r dev",
         "dev:core": "pnpm --filter @seeway/claude-context-core dev",
         "dev:mcp": "pnpm --filter @seeway/claude-context-mcp dev",
-        "clean": "pnpm --recursive clean",
+        "test": "pnpm --filter @seeway/claude-context-graph test",
+    "clean": "pnpm --recursive clean",
         "lint": "pnpm -r lint",
         "lint:fix": "pnpm -r run lint:fix",
         "typecheck": "pnpm -r run typecheck"

@@ -133,7 +133,7 @@ export class GitIndexer {
      * checkout directory (RepoManager.dirFor keys on the repo, not the branch), so
      * this must not run concurrently for two branches of the same repo.
      */
-    private async indexBranch(ctx: Context, repo: RepoSpec, requestedBranch: string): Promise<RepoIndexResult> {
+    private async indexBranch(ctx: Context, repo: RepoSpec, requestedBranch: string, force = false): Promise<RepoIndexResult> {
         const startedAt = this.now();
         const spec: RepoSpec = { ...repo, branch: requestedBranch };
         try {
@@ -153,14 +153,32 @@ export class GitIndexer {
             if (branch !== spec.branch && requestedBranch === repo.branch) {
                 this.store?.setRepoBranch(repo.name, branch);
             }
-            const stats = await ctx.syncIndexByGit(localPath, p => {
+            const onProgress = (p: { phase: string; percentage: number }) => {
                 this.inFlight.set(repo.name, {
                     repo: repo.name,
                     branch,
                     phase: p.phase,
                     percentage: Math.round(p.percentage),
                 });
-            });
+            };
+            // force：丢掉 collection 从零重建，而不是按 commit 增量。
+            // 需要它是因为增量**修不了已经写错的内容**：diff 只比较两个 commit，
+            // 一个"本不该在这个分支的 collection 里"的文件不会出现在任何 diff 的
+            // deleted 里，于是永远留在那儿。ff2d851 之前的 identity 缓存只按路径，
+            // 一个仓库的所有保护分支共用同一个 checkout 目录 → 后续分支全部写进了
+            // main 的 collection；那批污染只能靠一次全量重建清掉。
+            const stats = force
+                ? await (async () => {
+                    const full = await ctx.indexCodebase(localPath, onProgress, true);
+                    return {
+                        mode: 'full' as const,
+                        indexedFiles: full.indexedFiles,
+                        added: full.indexedFiles,
+                        modified: 0,
+                        removed: 0,
+                    };
+                })()
+                : await ctx.syncIndexByGit(localPath, onProgress);
             const collectionName = ctx.getCollectionName(localPath);
             const vdb = ctx.getVectorDatabase();
             // 刚写入的行还在 growing segment 里，getCollectionStatistics 读不到，
@@ -194,12 +212,12 @@ export class GitIndexer {
     }
 
     /** Index main + every configured protected branch for one repo, sequentially. */
-    private async indexRepo(ctx: Context, repo: RepoSpec): Promise<RepoIndexResult[]> {
+    private async indexRepo(ctx: Context, repo: RepoSpec, force = false): Promise<RepoIndexResult[]> {
         const branches: string[] = [repo.branch, ...(repo.protectedBranches || [])];
         const results: RepoIndexResult[] = [];
         try {
             for (const b of branches) {
-                results.push(await this.indexBranch(ctx, repo, b));
+                results.push(await this.indexBranch(ctx, repo, b, force));
             }
         } finally {
             this.inFlight.delete(repo.name);
@@ -208,19 +226,19 @@ export class GitIndexer {
     }
 
     /** Index main + every configured protected branch for one repo (single-repo entry point). */
-    async indexOne(repo: RepoSpec): Promise<RepoIndexResult[]> {
-        return this.indexRepo(this.contexts[0], repo);
+    async indexOne(repo: RepoSpec, force = false): Promise<RepoIndexResult[]> {
+        return this.indexRepo(this.contexts[0], repo, force);
     }
 
     /** Index a single repo by name (management "index now" for one repo). */
-    async indexOneByName(name: string): Promise<RepoIndexResult[] | null> {
+    async indexOneByName(name: string, force = false): Promise<RepoIndexResult[] | null> {
         const repos = await this.repoProvider.listRepos();
         const repo = repos.find(r => r.name === name);
         if (!repo) return null;
         if (this.running) return [{ repo: name, ok: false, error: 'a pass is already running' }];
         this.running = true;
         try {
-            return await this.indexOne(repo);
+            return await this.indexOne(repo, force);
         } finally {
             this.running = false;
             this.runStore?.flush();
@@ -228,14 +246,14 @@ export class GitIndexer {
     }
 
     /** Index a single (repo, branch) pair on demand (management API). */
-    async indexOneBranch(name: string, branch: string): Promise<RepoIndexResult | null> {
+    async indexOneBranch(name: string, branch: string, force = false): Promise<RepoIndexResult | null> {
         const repos = await this.repoProvider.listRepos();
         const repo = repos.find(r => r.name === name);
         if (!repo) return null;
         if (this.running) return { repo: name, branch, ok: false, error: 'a pass is already running' };
         this.running = true;
         try {
-            return await this.indexBranch(this.contexts[0], repo, branch);
+            return await this.indexBranch(this.contexts[0], repo, branch, force);
         } finally {
             this.running = false;
             this.inFlight.delete(name);

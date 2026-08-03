@@ -9,6 +9,7 @@ import {
     HybridSearchResult,
 } from './types';
 import { ClusterManager } from './cluster-utils';
+import { buildSearchText } from './sparse-text';
 
 export interface MilvusConfig {
     address?: string;
@@ -98,6 +99,8 @@ export class MilvusVectorDatabase implements VectorDatabase {
      */
     /** Cache of already-loaded collections to avoid redundant getLoadState calls. */
     private loadedCollections: Set<string> = new Set();
+    /** collection → BM25 是否建在 search_text 上（老 collection 建在 content 上）。 */
+    private searchTextSupport: Map<string, boolean> = new Map();
 
     protected async ensureLoaded(collectionName: string): Promise<void> {
         if (!this.client) {
@@ -338,6 +341,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
         });
         this.loadedCollections.delete(collectionName);
+        this.searchTextSupport.delete(collectionName);
     }
 
     async hasCollection(collectionName: string): Promise<boolean> {
@@ -396,6 +400,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
     /** Clear the load-state cache for a collection (called on transient failures). */
     invalidateLoadCache(collectionName: string): void {
         this.loadedCollections.delete(collectionName);
+        this.searchTextSupport.delete(collectionName);
     }
 
     /**
@@ -421,6 +426,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
             if (isLoadError && this.loadedCollections.has(collectionName)) {
                 console.warn(`[MilvusDB] ⚠️  Load-state error for '${collectionName}', clearing cache and retrying: ${msg}`);
                 this.loadedCollections.delete(collectionName);
+        this.searchTextSupport.delete(collectionName);
                 await this.ensureLoaded(collectionName);
                 return await operation();
             }
@@ -566,6 +572,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
         try {
             await this.client.releaseCollection({ collection_name: collectionName });
             this.loadedCollections.delete(collectionName);
+        this.searchTextSupport.delete(collectionName);
         } catch (error: any) {
             console.warn(`[MilvusDB] release failed for '${collectionName}' (stays resident): ${error?.message || error}`);
         }
@@ -644,7 +651,17 @@ export class MilvusVectorDatabase implements VectorDatabase {
             },
             {
                 name: 'content',
-                description: 'Full text content for BM25 and storage',
+                description: 'Full text content for storage and display',
+                data_type: DataType.VarChar,
+                max_length: 65535,
+            },
+            {
+                // BM25 的输入换成这个字段：内容 + 标识符按驼峰/下划线切开的 token。
+                // standard tokenizer 不拆驼峰，`SyncToStorage` 只有一个 token，
+                // 查询 "sync to storage" 对不上任何词（见 sparse-text.ts）。
+                // 不复用 content 是因为它同时是要返回给模型看的片段，不能掺扩展 token。
+                name: 'search_text',
+                description: 'Content plus split identifiers, BM25 input only',
                 data_type: DataType.VarChar,
                 max_length: 65535,
                 enable_analyzer: true,
@@ -696,7 +713,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
                 name: "content_bm25_emb",
                 description: "content bm25 function",
                 type: FunctionType.BM25,
-                input_field_names: ["content"],
+                input_field_names: ["search_text"],
                 output_field_names: ["sparse_vector"],
                 params: {},
             },
@@ -753,6 +770,7 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
         });
         this.loadedCollections.add(collectionName);
+        this.searchTextSupport.set(collectionName, true);
     }
 
     async insertHybrid(collectionName: string, documents: VectorDocument[]): Promise<void> {
@@ -763,9 +781,15 @@ export class MilvusVectorDatabase implements VectorDatabase {
             throw new Error('MilvusClient is not initialized after ensureInitialized().');
         }
 
+        // 老 collection 的 BM25 建在 content 上、没有 search_text 字段，往里塞未知字段
+        // 整批 insert 会失败。探测一次而不是假设：部署新代码和重建 collection 不可能
+        // 同时发生，中间那段时间的每日增量必须照常跑完。
+        const hasSearchText = await this.hasSearchTextField(collectionName);
+
         const data = documents.map(doc => ({
             id: doc.id,
             content: doc.content,
+            ...(hasSearchText ? { search_text: buildSearchText(doc.content) } : {}),
             vector: doc.vector,
             relativePath: doc.relativePath,
             startLine: doc.startLine,
@@ -778,6 +802,20 @@ export class MilvusVectorDatabase implements VectorDatabase {
             collection_name: collectionName,
             data: data,
         });
+    }
+
+    private async hasSearchTextField(collectionName: string): Promise<boolean> {
+        const cached = this.searchTextSupport.get(collectionName);
+        if (cached !== undefined) return cached;
+        let supported = false;
+        try {
+            const desc = await this.client!.describeCollection({ collection_name: collectionName });
+            supported = (desc.schema?.fields || []).some((f: any) => f.name === 'search_text');
+        } catch (error) {
+            console.warn(`[MilvusDB] describeCollection failed for '${collectionName}', assuming legacy schema:`, error);
+        }
+        this.searchTextSupport.set(collectionName, supported);
+        return supported;
     }
 
     async hybridSearch(collectionName: string, searchRequests: HybridSearchRequest[], options?: HybridSearchOptions): Promise<HybridSearchResult[]> {

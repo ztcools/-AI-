@@ -14,13 +14,16 @@
 
 > 没有 `index` 工具：本地向量写入按设计禁用，`link` 会在后台自动建/更新本地图索引。
 
-**search 工具 3 种模式**（2026-07-30 双 C++ 真实仓库实测，36 个期望符号）：
+**search 工具 3 种模式**（2026-08-03 双 C++ 真实仓库端到端实测，76 条 mode×场景期望）：
 
 | mode | 召回 | token | 延迟 | 需要 link | 适用场景 |
 |------|------|-------|------|-----------|---------|
-| `graph` | 86% | ~300 | 60–105ms | 否 | 关系/影响面/死代码/入口；只要位置+调用链时的首选 |
-| `both` (默认) | 93% | ~2200 | 128–220ms | 是（向量部分） | 需要代码片段本身；或目标概念未被任何标识符拼出 |
-| `vector` | 83% | ~1700 | ~50ms | 是 | 语义找实现，不需要调用图 |
+| `graph` | 23/23（对口问题） | ~500 | 70–110ms | 否 | 关系/影响面/死代码/入口；只要位置+调用链时的首选 |
+| `both` (默认) | 97% | ~2800 | 150–270ms | 是（向量部分） | 需要代码片段本身；或目标概念未被任何标识符拼出 |
+| `vector` | 91% | ~2400 | 65–110ms | 是 | 语义找实现，不需要调用图 |
+
+> `graph` 那一栏是"问对口的关系/定位问题时"的成绩；把整套含纯语义场景的离线集也算进来是
+> 89%（32/36）—— 那些场景本来该走 `both`。
 
 `graph` 模式接受自然语言，不必点出符号名：标识符按词切分 + 词干化，
 "initialize logging and create the log manager" 可命中 `InitLogging`/`LogManager`。
@@ -204,7 +207,30 @@ BM25 列权重 `(name, search_text, qualified_name, file_path) = (3.0, 3.0, 0.5,
 超出的**下溢到尾部而非丢弃**（保证 `offset` 分页一致）。修的是 0.02 分的边界丢失：
 `RecoveryAction` 曾以 20.81 vs 20.83 落到第 11 名，被 10 条近重复的 `SupervisedEntity*` 挤出。
 
+**名字覆盖率加权**（`boostNameCoverage`）：BM25 只数"命中几个不同词"，于是一个整个名字都被
+问句拼出来的符号会被"名字长、蹭到更多词"的符号压掉 —— "monitor log directory for file changes"
+曾把 `log_dir_`/`DirectoryExists` 排在 `FileMonitor` 之上。分母取**符号自己的**词数（不是问句词数），
+长问句才不会稀释。只在 FTS 段内重排：四段量纲不同（exact=1000 / -bm25 / LIKE=0.1 / prefix=0.05），跨段重排会废掉分层。
+
+**同名折叠**（`capPerName`，上限 2）：C++ 的声明+定义成对出现是有用信息，所以留 2 条；
+再多就是刷屏 —— 实测第 5–9 名全是 `SyncToStorage`，把 `SetValue` 挤出了首页。超出同样下溢到尾部。
+
+**候选池深度**（`ftsCandidateLimit`，`limit×8` 上限 200）：只取 `limit*2` 时，噪声 kind 过滤 +
+同名折叠之后一页凑不满，空位由 LIKE 兜底段（0.1 分）的边角符号填掉。实测"键值存储读写"
+第 7–10 名曾全是 0.1 分的 `DeleteKvstype`/`DiscardPendingChanges`，加深后整页最低也是 12.76 分的真实命中。
+
+**降权行的首页配额**（`reserveDemotedSlots`，2 个槽）：`demoteRows` 是稳定分区，池子一深降权段就整段
+落到 40 名外 —— "降权"事实上变成"排除"。而有些查询的答案本来就在 vendored 子树里：PhiLog 自己的
+`pg_rotating_file_sink` 是按大小轮转，问"按天切分"只能是 spdlog 的 `daily_file_sink`。
+只换首页最后 2 个槽，且只在罚过系数后分数仍高于被换掉那行时才换（实测 33.73 换掉 8.96）。
+前排仍然属于本仓库代码 —— 这是分层要保的东西。**PhiLog 离线召回 71%→100% 全靠这一条。**
+
 **调用图遍历噪声过滤**：`GraphTraverser.isNoise` 排除同一批种类。
+
+> graph 模式下 `### Graph symbols` 块**不截断**（[handlers.ts:675](packages/mcp/src/handlers.ts#L675)）。
+> 原来固定只印 5 条 + "... and 5 more"：行已经算完、过滤完、去重完却扔掉后半页，
+> 端到端 graph 召回因此从 100% 掉到 65%（"daily file sink" 的答案排第 8、9 名）。
+> 补齐约 60 token，仍是 `both` 的 1/6。`both` 保留 5 条上限 —— 那里向量片段才是主体。
 
 ### 响应 token 预算
 
@@ -320,24 +346,30 @@ await ix.indexAll();
 
 ---
 
-## 搜索质量基准（2026-07-30 实测，ap-client-api + PhiLog 两个真实 C++ 仓库，36 个期望符号）
+## 搜索质量基准（2026-08-03 实测，ap-client-api + PhiLog 两个真实 C++ 仓库，36 个期望符号）
 
 **图检索召回（离线 graphbench，同一批场景）**：
 
 | 仓库 | 优化前 | 优化后 | 延迟 |
 |------|--------|--------|------|
-| ap-client-api（8.7K 节点） | 58% | **79%** | 3–16ms |
-| PhiLog | 76% | **88%** | 3–16ms |
-| 合计 | — | **83%**（30/36） | — |
+| ap-client-api（8.7K 节点） | 58% | **79%**（15/19） | 3–14ms |
+| PhiLog @ master | 71% | **100%**（17/17） | 3–8ms |
+| 合计 | — | **89%**（32/36） | — |
 
 **端到端实测（真实 Milvus + Ollama，warm）**：
 
 | 仓库 | both | vector | graph |
 |------|------|--------|-------|
-| ap-client-api | 94% / 219ms / 2216t | 81% / 55ms | 100% / 89ms / 442t |
-| PhiLog @ main | 93% / 128ms / 2123t | 86% / 49ms | 88% / 55ms / 212t |
+| ap-client-api @ main | 94% / 269ms / 2894t | 88% / 77ms / 2393t | 100% / 98ms / 643t |
+| PhiLog @ master | 100% / 180ms / 2697t | 100% / 72ms / 2399t | 100% / 87ms / 379t |
 
 > Milvus 冷 collection 首查约 900ms（load），warm 后 ~220ms —— 不是回归。
+
+> **基准必须打在有代码的分支上**。PhiLog 的 `main` 是 48 文件的骨架分支、一行 spdlog 都没有，
+> 真实代码全在 `master`（298 文件）和各开发分支。2026-08-03 之前所有 "PhiLog @ main" 的数字
+> 量的都是别的分支泄漏进 main collection 的内容（identity 只按路径缓存导致），已重建修正。
+> [benchmarks/scenarios/philog.json](benchmarks/scenarios/philog.json) 的期望符号按 `master` 编写，
+> 跑它时分支参数必须是 `master`。
 
 **其他指标**：
 
@@ -363,7 +395,7 @@ await ix.indexAll();
 内存侧不必跟着线性上调：单 worker 峰值 ~1 GiB 且绝大部分在堆外，约束是 cgroup 上限
 而非 V8 old-space（4.1 GiB），并发 6 最坏 ~6 GiB，`GIT_INDEX_MEM_LIMIT=16g` 留 2.5×。
 
-> 已知取舍：`vector` 单模式召回从 88% 降到 81%，因为 `SyncToStorage` 埋在一个很长的 chunk 深处，
+> 已知取舍（历史记录，2026-08-03 已被干净重建后的 88% 覆盖）：`vector` 单模式召回一度从 88% 降到 81%，因为 `SyncToStorage` 埋在一个很长的 chunk 深处，
 > 要捞回它需要 4000 字符片段（预算 40000）多花 ~2000 token —— 而 `both`/`graph` 本来就能正常给出该符号，
 > 不值得为它抬高全局预算。
 

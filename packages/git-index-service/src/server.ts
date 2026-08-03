@@ -24,6 +24,7 @@ import { normalizeGitUrl, collectionNameForIdentity, envManager } from '@seeway/
  *   POST /index                  index all now (main + protected branches)
  *   POST /index/:name            index one repo now (all its branches)
  *   POST /index/:name/:branch    index one branch of one repo now
+ *   both /index/:name and /index/:name/:branch accept ?full=1 (rebuild from scratch)
  */
 export function startHttpServer(
     port: number,
@@ -258,17 +259,22 @@ export function startHttpServer(
                 const firstSlash = rest.indexOf('/');
                 const name = decodeURIComponent(firstSlash === -1 ? rest : rest.slice(0, firstSlash));
                 const branch = firstSlash === -1 ? undefined : decodeURIComponent(rest.slice(firstSlash + 1));
+                // full=1 丢掉 collection 从零重建。增量只按 commit diff 走，改不了
+                // "内容本身写错了"的 collection —— 一个不该在这个分支里的文件不会出现在
+                // 任何 diff 的 deleted 里。修数据用它，日常索引不要用（一次全量重建
+                // 是几百个文件的重新 embedding）。
+                const full = ['1', 'true', 'yes'].includes((query.get('full') || '').toLowerCase());
                 if (indexer.isRunning()) return send(res, 409, { error: 'indexing already in progress' });
                 if (branch) {
-                    void indexer.indexOneBranch(name, branch).then(r => {
+                    void indexer.indexOneBranch(name, branch, full).then(r => {
                         if (r === null) console.warn(`[Server] index-now: repo '${name}' not found`);
                     });
-                    return send(res, 202, { status: 'started', repo: name, branch });
+                    return send(res, 202, { status: 'started', repo: name, branch, mode: full ? 'full' : 'incremental' });
                 }
-                void indexer.indexOneByName(name).then(r => {
+                void indexer.indexOneByName(name, full).then(r => {
                     if (r === null) console.warn(`[Server] index-now: repo '${name}' not found`);
                 });
-                return send(res, 202, { status: 'started', repo: name });
+                return send(res, 202, { status: 'started', repo: name, mode: full ? 'full' : 'incremental' });
             }
             return send(res, 404, { error: 'not found' });
         } catch (e: any) {
