@@ -242,20 +242,19 @@ export function matchReference(
 ): ResolvedRef | null {
   const language = ref.language || 'javascript';
 
-  // 内置黑名单挡的是"名字撞上标准库"的猜测式匹配，不该挡本仓库自己写下的定义。
-  // 同文件命中是最高置信度的一档，而且语义上就是对的：一个文件里定义了 `open`，
-  // 该文件里调 `open` 就是调它（遮蔽）。继承边同理 —— 基类名不可能是内置函数，
-  // 真正的标准库基类在提取层的 BASE_TYPE_BLACKLIST 已经过滤过。
+  // 内置黑名单挡的是"名字撞上标准库"的猜测式匹配。只对继承边放开：基类/接口名不可能
+  // 是内置函数，真正的标准库基类在提取层的 BASE_TYPE_BLACKLIST 已经过滤过。
   // 不放开的后果是通用性缺口而非 Go 特有：GO_BUILTINS 里有 Reader/Writer/File/Closer，
-  // 任何自己定义 `type Reader interface` 的 Go 仓库都因此拿不到嵌入继承边。
+  // 任何自己定义 `type Reader interface` 的 Go 仓库都拿不到嵌入继承边。
+  // 调用边不放开 —— 试过，是负收益：Python 的 `set(kwargs)` 会被同文件另一个测试里的
+  // `def set()` 接住，flask/requests 各多 3 条边，只有 1 条（`self.set`）是对的。
   const blacklisted = isBlacklistedBuiltin(ref.referenceName, language);
   const isHeritage = ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
+  if (blacklisted && !isHeritage) return null;
 
   // Strategy 1: Same-file match
   const sameFile = matchSameFile(ref, context);
   if (sameFile) return sameFile;
-
-  if (blacklisted && !isHeritage) return null;
 
   // Strategy 2: Unique name across project
   const uniqueName = matchUniqueName(ref, context);
