@@ -55,7 +55,7 @@ const PARSE_POOL_MIN_FILES = 120;
  * clears unresolved_refs; pre-v5 graphs carry refs pointing at deleted node ids,
  * which produced edges with a non-existent source and inflated in/out degrees.
  */
-export const INDEXER_VERSION = 5;
+export const INDEXER_VERSION = 7;
 
 /** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
@@ -184,10 +184,28 @@ export class GraphIndexer {
     return this.store.getGraphVersion() < INDEXER_VERSION;
   }
 
+  /**
+   * 清掉同一个 db 里属于别的 identity 的残留，并顺手清掉因此悬空的边。
+   *
+   * 换 remote 协议、link 到另一个分支、或从早期用目录名当 project 的版本升上来，
+   * 都会让 identity 变。而增量同步只看文件内容哈希：文件没动就不重建，新 identity
+   * 的节点整批插入、旧的一行不删。实测 flask 的图 4721 个节点里 2360 个是这种僵尸，
+   * 每个符号两份，跨 identity 的 CALLS 边还把调用者指到僵尸副本上。
+   */
+  pruneForeignProjects(): number {
+    const removed = this.store.pruneForeignProjects(this.project);
+    if (removed > 0) {
+      const dangling = this.store.deleteDanglingEdges(this.project);
+      console.error(`[GraphIndexer] pruned ${removed} nodes from stale identities (+${dangling} dangling edges)`);
+    }
+    return removed;
+  }
+
   // ── Full index ───────────────────────────────────────────────────
 
   async indexAll(options: GraphIndexerOptions = {}): Promise<IndexResult> {
     const startTime = Date.now();
+    this.pruneForeignProjects();
     const errors: string[] = [];
     let filesIndexed = 0;
     let filesSkipped = 0;
@@ -558,6 +576,14 @@ export class GraphIndexer {
       options.onProgress?.({ phase: 'resolving', current: 1, total: 1 });
     }
 
+    // 必须在 Phase 3 之后：继承边是跨文件解析的产物，这一步只是读它。
+    try {
+      const overrides = this.store.buildOverrideEdges(this.project);
+      if (overrides > 0) console.log(`[GraphIndexer] Phase 4 done: ${overrides} override edges derived`);
+    } catch (err: any) {
+      console.warn(`[GraphIndexer] Phase 4 error (non-fatal): ${err.message}`);
+    }
+
     // Stamp the indexer version that produced this graph so future opens can
     // detect an outdated graph (indexer upgraded) and rebuild.
     if (!incremental) {
@@ -587,6 +613,9 @@ export class GraphIndexer {
 
   async sync(options: GraphIndexerOptions = {}): Promise<SyncResult> {
     const startTime = Date.now();
+    // 必须在"无变更就早退"之前：identity 变更恰恰不伴随文件变更，
+    // 早退一次僵尸节点就再也没机会被清掉。
+    this.pruneForeignProjects();
     // 调用方点名的文件必须算进来：MCP 的文件变更监听把具体路径传进 options.files，
     // 而 git diff 看不到它们的场景是真实存在的（刚 commit 完、或 checkout 之后）——
     // 只用 detectChangedFiles 的话那种情况下会直接判定"无变更"、什么都不做。

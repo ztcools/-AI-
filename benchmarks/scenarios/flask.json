@@ -1,0 +1,38 @@
+[
+  {
+    "name": "路由注册: url rule 到 view function",
+    "query": "register url rule mapping to view function",
+    "modes": ["both", "vector", "graph"],
+    "expect": ["add_url_rule", "url_map"]
+  },
+  {
+    "name": "会话: cookie 序列化与签名",
+    "query": "secure cookie session serialization interface",
+    "modes": ["both", "vector"],
+    "expect": ["SecureCookieSessionInterface", "sessions.py"]
+  },
+  {
+    "name": "蓝图: 注册到应用",
+    "query": "blueprint register on application",
+    "modes": ["both", "graph"],
+    "expect": ["register_blueprint", "blueprints.py"]
+  },
+  {
+    "name": "错误处理: 异常到响应",
+    "query": "handle user exception and convert to http response",
+    "modes": ["both", "vector"],
+    "expect": ["handle_user_exception", "handle_http_exception"]
+  },
+  {
+    "name": "关系查询: 谁调用 add_url_rule",
+    "query": "who calls add_url_rule",
+    "modes": ["graph"],
+    "expect": ["add_url_rule", "sansio/app.py"]
+  },
+  {
+    "name": "模板渲染",
+    "query": "render template with jinja environment",
+    "modes": ["both", "graph"],
+    "expect": ["render_template", "templating.py"]
+  }
+]

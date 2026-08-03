@@ -12,7 +12,7 @@ import {
 } from "@seeway/claude-context-core";
 import { resolveCodebasePath, focusSnippet, trackCodebasePath } from "./utils.js";
 import type { GraphToolHandlers } from "./graph-handlers.js";
-import { INDEXER_VERSION, detectVendorSegments, isTestPath as isTestFilePath } from "@seeway/claude-context-graph";
+import { INDEXER_VERSION, detectVendorSegments, isTestPath as isTestFilePath, GENERATED_FILE_RE } from "@seeway/claude-context-graph";
 import { linkState, LinkInfo } from "./link-state.js";
 
 /**
@@ -34,6 +34,38 @@ function symbolLabel(s: { name: string; owner?: string }): string {
     return s.owner && s.owner !== s.name ? `${s.owner}::${s.name}` : s.name;
 }
 
+/**
+ * 关系型提问的形态。命中就走 `graph`：这类问题的答案是调用链和位置，
+ * 向量片段一条都用不上，却要占掉整次响应约 85% 的 token。
+ */
+const RELATION_QUERY_RE: RegExp[] = [
+    /\b(who|what|which)\s+\w*\s*(calls?|uses?|invokes?|references?|reads?|writes?|depends)/i,
+    /\bcallers?\s+(of|for)\b/i,
+    /\bcall(ed|ers|ees)?\s+(by|graph|chain|hierarchy|path|tree|site)/i,
+    /\bcall\s*(graph|chain|path|hierarchy)\b/i,
+    /\bimpact\s+(of|radius|analysis)\b/i,
+    /\b(affected|impacted|broken)\s+(by|if)\b/i,
+    /\bwhat\s+(breaks|else\s+changes)\b/i,
+    /\b(dead|unused|unreachable|orphan)\s+(code|functions?|symbols?)\b/i,
+    /\bentry\s*-?\s*points?\b/i,
+    /\b(implementations?|implementors?|subclasses|subtypes|overrides?)\s+of\b/i,
+    /\b(who|what)\s+(implements?|extends?|overrides?|subclasses)\b/i,
+    /\bdependen(ts|cies)\s+of\b/i,
+    /\bwhere\s+is\s+\w+\s+(defined|declared|implemented)\b/i,
+    /\bif\s+I\s+(change|rename|remove|delete)\b/i,
+    /谁(在)?(调用|使用|引用|实现|继承|覆盖)/,
+    /调用(链|图|者|方|路径|关系)/,
+    /影响(面|范围|了谁|哪些)/,
+    /(死|无用|未使用)代码/,
+    /入口(点|函数)/,
+    /(子类|实现类|派生类|基类)(有哪些|是谁|列表)?/,
+    /(改|修改|删除|重命名).{0,8}(影响|波及)/,
+    /在哪(里)?(定义|声明|实现)/,
+];
+
+/** 自适应选 graph 后，图命中少于这个数就在同一次调用里补向量段。 */
+const AUTO_UPGRADE_MIN_HITS = 3;
+
 const ARCH_INTENT = /(architect|overview|structure|module|layout|entry\s*-?\s*point|entrypoint|entry|startup|start\s*up|bootstrap|main\s*function|top\s*level|dead\s*code|call\s*flow|架构|结构|总览|概览|入口|启动|模块划分|死代码)/i;
 
 function wantsArchitecture(query: string): boolean {
@@ -52,29 +84,65 @@ export class ToolHandlers {
      */
     private autoGraphBuildTriggered: Set<string> = new Set();
     private lastGraphSyncCheck: Map<string, number> = new Map();
-    private repoSizeCache: Map<string, { files: number; at: number }> = new Map();
+    private repoSizeCache: Map<string, { files: number; own: number; at: number }> = new Map();
 
     /**
-     * 仓库规模分档（缓存 5min）：用 git ls-files 计数。
-     * <300 小库(grep/read 更省) / 300-2000 中库 / >2000 大库(search 明显占优)。
+     * 仓库规模分档（缓存 5min）：用 git ls-files 计数，但**按自有文件数**分档 ——
+     * 上游库和生成代码不构成"agent 要理解的代码量"。
+     *
+     * 分档同时给出噪声占比，因为噪声本身就是 search 的价值来源：PhiLog 223 个文件
+     * 里 111 个是拷进来的 spdlog，按总数它是"小库、grep 更省"，可实际上 grep 一个
+     * 概念词会被 spdlog 淹没 —— 实测 search 在这个仓库上 100% 召回。反过来 ap-client-api
+     * 1360 个文件里 881 个是 parasoft 生成的桩，规模看着大，自有代码只有 479。
+     * 两个方向的失真都会把 agent 引到错的第一跳上。
      */
     private getRepoSizeTier(codebasePath: string): string {
         const cached = this.repoSizeCache.get(codebasePath);
-        if (cached && Date.now() - cached.at < 300_000) return this.formatSizeTier(cached.files);
+        if (cached && Date.now() - cached.at < 300_000) return this.formatSizeTier(cached.files, cached.own);
         let files = 0;
+        let own = 0;
         try {
             const out = execSync('git ls-files', { cwd: codebasePath, encoding: 'utf-8', timeout: 8000 });
-            files = out.trim() ? out.trim().split('\n').length : 0;
+            const list = out.trim() ? out.trim().split('\n') : [];
+            files = list.length;
+            const segs = new Set(detectVendorSegments(codebasePath).map(s => s.toLowerCase()));
+            own = list.filter(p =>
+                !GENERATED_FILE_RE.test(p) && !p.split('/').some(s => segs.has(s.toLowerCase())),
+            ).length;
         } catch { /* non-git */ }
-        this.repoSizeCache.set(codebasePath, { files, at: Date.now() });
-        return this.formatSizeTier(files);
+        this.repoSizeCache.set(codebasePath, { files, own, at: Date.now() });
+        return this.formatSizeTier(files, own);
     }
 
-    private formatSizeTier(files: number): string {
+    private formatSizeTier(files: number, own: number): string {
         if (files <= 0) return '';
-        const tier = files < 300 ? 'small' : files < 2000 ? 'medium' : 'large';
-        const hint = files < 300 ? ' — grep/read likely cheaper' : files >= 2000 ? ' — search favored' : '';
-        return `[repo: ${files} files, ${tier}${hint}]`;
+        const tier = own < 300 ? 'small' : own < 2000 ? 'medium' : 'large';
+        const noiseRatio = 1 - own / files;
+        const hint = noiseRatio >= 0.3
+            ? ` — ${Math.round(noiseRatio * 100)}% vendored/generated, grep gets drowned here`
+            : own < 300 ? ' — grep/read likely cheaper'
+                : own >= 2000 ? ' — search favored' : '';
+        return `[repo: ${own}/${files} own files, ${tier}${hint}]`;
+    }
+
+    /**
+     * 调用方没点名 mode 时按查询形态选一个。
+     *
+     * 之前默认一律 `both`，于是关系型问题（"谁调用 X"、"改 Y 影响谁"）也要付向量段的
+     * ~2300 token —— 而实测那类问题 `graph` 单独就 23/23，向量片段一条都用不上。
+     * 反过来，纯语义描述走 graph 会拿到位置但没有代码，agent 还得再 Read 一次。
+     * 所以这里只做形态判别，不做"值不值得搜"的判断：后者是 agent 拿着规模提示自己定的事。
+     *
+     * 显式传了 mode 就一概不干预 —— 调用方点名要什么就给什么。
+     */
+    private pickMode(query: string): 'graph' | 'both' {
+        const q = query.trim();
+        if (RELATION_QUERY_RE.some(re => re.test(q))) return 'graph';
+        // 单个标识符（含 `A::b` / `a.b` 限定名）：要的是"它在哪"，不是语义近邻。
+        if (!/\s/.test(q) && q.length >= 3 && /^[A-Za-z_][A-Za-z0-9_]*([:.]{1,2}[A-Za-z_][A-Za-z0-9_]*)*$/.test(q)) {
+            return 'graph';
+        }
+        return 'both';
     }
     /**
      * 架构摘要已输出的项目集合（每会话每项目只输出一次，避免 token 浪费）。
@@ -109,7 +177,10 @@ export class ToolHandlers {
             defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
             threshold: num('SEARCH_THRESHOLD', 0.4),
             snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 4000)),
-            totalMaxChars: Math.max(2000, num('SEARCH_TOTAL_MAX_CHARS', 12000)),
+            // 8000 是实测的召回悬崖之上一档：ap-client-api + PhiLog 两个仓库 31 个期望符号，
+            // 20000→8000 召回一条不掉（both 94%/100%、vector 88%/100%）而 both 均值 3.1k→2.1k token
+            // （−33%）；6000 时 ap 开始掉（both 94%→88%，vector 88%→81%）。别再往下调。
+            totalMaxChars: Math.max(2000, num('SEARCH_TOTAL_MAX_CHARS', 8000)),
             scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
         };
     }
@@ -429,8 +500,11 @@ export class ToolHandlers {
     public async handleSearchCode(args: any) {
         const tuning = this.getSearchTuning();
         const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style, docs, tests, vendor } = args;
-        const searchMode: 'vector' | 'graph' | 'both' = (mode === 'graph') ? 'graph' : (mode === 'vector') ? 'vector' : 'both';
-        const doEnrich = searchMode === 'both' && enrich !== false;
+        const explicitMode: 'vector' | 'graph' | 'both' | null =
+            (mode === 'graph' || mode === 'vector' || mode === 'both') ? mode : null;
+        const autoPicked = explicitMode === null;
+        let searchMode: 'vector' | 'graph' | 'both' = explicitMode ?? this.pickMode(query || '');
+        let autoNote = '';
         const compactStyle = style === 'compact';
         const resultLimit = limit || tuning.defaultLimit;
 
@@ -529,8 +603,7 @@ export class ToolHandlers {
             let searchSourceNote = link ? ` (cloud: ${link.branch})` : ' (graph-only)';
 
             let vectorError: string | null = null;
-            const vectorPromise = (searchMode !== 'graph' && layers.length > 0)
-                ? (async () => {
+            const runVectorSearch = async () => {
                     try {
                         const searchResults = await this.context.searchWithLayers(
                             layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr, ranking,
@@ -549,7 +622,9 @@ export class ToolHandlers {
                         vectorError = e?.message || String(e);
                         console.warn(`[SEARCH] Vector search failed (falling back to graph-only): ${vectorError}`);
                     }
-                })()
+            };
+            const vectorPromise = (searchMode !== 'graph' && layers.length > 0)
+                ? runVectorSearch()
                 : Promise.resolve();
 
             const graphPromise = (searchMode !== 'vector' && this.graphToolHandlers)
@@ -602,6 +677,21 @@ export class ToolHandlers {
 
             await Promise.all([vectorPromise, graphPromise]);
 
+            // 自适应选了 graph 但图没给出足够答案 → 本次调用内补向量段，而不是让 agent
+            // 空手而归再问一遍。猜错的代价必须留在服务端：一次白跑的 search 比多花的
+            // 2000 token 更贵（agent 还要多一轮往返）。显式传 mode 的调用不做这件事。
+            if (autoPicked && searchMode === 'graph' && graphSymbols.length < AUTO_UPGRADE_MIN_HITS && layers.length > 0) {
+                await runVectorSearch();
+                if (vectorResults.length > 0) {
+                    searchMode = 'both';
+                    autoNote = ' [auto: graph→both, thin graph hits]';
+                }
+            } else if (autoPicked && searchMode === 'graph') {
+                autoNote = ' [auto: graph]';
+            }
+
+            const doEnrich = searchMode === 'both' && enrich !== false;
+
             // ── 无结果 ──
             if (vectorResults.length === 0 && graphSymbols.length === 0) {
                 let noMsg = `No results for "${query}" in '${absolutePath}'${searchSourceNote}`;
@@ -617,7 +707,7 @@ export class ToolHandlers {
                 : `[not linked — graph-only]`;
             // 仓库规模分档：让 agent 判断 search 是否划算（小库 grep/read 更省）。
             const sizeTier = this.getRepoSizeTier(absolutePath);
-            parts.push(`${linkHeader} ${sizeTier}`);
+            parts.push(`${linkHeader} ${sizeTier}${autoNote}`);
             if (vectorError) {
                 parts.push(`[vector search failed: ${vectorError} — showing graph-only results]`);
             }
@@ -656,11 +746,17 @@ export class ToolHandlers {
             if (unmatchedSymbols.length > 0 && searchMode !== 'vector') {
                 parts.push('');
                 parts.push('### Graph symbols');
-                for (const s of unmatchedSymbols.slice(0, 5)) {
+                // graph 模式下这一块就是全部答案，截到 5 条等于把已经算完、过滤完、
+                // 去重完的后半页扔掉：实测 "daily file sink filename calculator" 的
+                // 正确答案排在第 8、9 名，被 "... and 5 more" 吞了，端到端召回因此
+                // 从 100% 掉到 65%。补齐 5 行约 60 token，graph 仍是 both 的 1/6。
+                // both 模式保留 5 条上限 —— 那里向量片段才是主体，符号块是补充。
+                const symbolCap = searchMode === 'graph' ? unmatchedSymbols.length : 5;
+                for (const s of unmatchedSymbols.slice(0, symbolCap)) {
                     parts.push(`- ${s.kind} \`${symbolLabel(s)}\` (${s.filePath}:${s.line}) ↖${s.inDegree} ↗${s.outDegree}`);
                 }
-                if (unmatchedSymbols.length > 5) {
-                    parts.push(`- ... and ${unmatchedSymbols.length - 5} more`);
+                if (unmatchedSymbols.length > symbolCap) {
+                    parts.push(`- ... and ${unmatchedSymbols.length - symbolCap} more`);
                 }
             }
 
@@ -1063,6 +1159,15 @@ export class ToolHandlers {
 
         const nodeMap = store.getNodesById(Array.from(allNodeIds));
 
+        // 去噪：自指调用（`app ← app`）、同名互调、测试文件调用者；并按名去重。
+        const isTestP = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
+        // examples/ 里的调用者答的是"怎么用"，src/ 里的调用者答的才是"谁依赖你"。
+        // 只列 3 个时这个区别就是全部信息：flask 的 `add_url_rule ↖43` 原来列出的是
+        // examples/tutorial 的 `create_app` 和 `__init__`，而真正触发它的 route 装饰器
+        // 被挤进 `+N` —— 等于让边的插入顺序决定 agent 看到哪条依赖。排序而不是过滤：
+        // 一个只被示例调用的函数仍然要给出调用者，只是不许它挤掉真实调用方。
+        const isDemoP = (p: string) => /(^|\/)(examples?|samples?|demos?|benchmarks?|fixtures?)\//i.test(p);
+
         const directRelations: string[] = [];
         for (const { node } of fileNodes) {
             const key = node.qualifiedName;
@@ -1074,14 +1179,15 @@ export class ToolHandlers {
 
             if (callerEdges.length === 0 && calleeEdges.length === 0) continue;
 
-            // 去噪：自指调用（`app ← app`）、同名互调、测试文件调用者；并按名去重。
-            const isTestP = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
             // 截断必须出声：只列 3 个而 `↖11`，agent 会把这 3 个当成全部调用者去
             // 判影响面。`+N` 给出"还有多少个不同的名字被省了"。
             const pick = (edges: any[], getId: (e: any) => number, isCaller: boolean): { names: string[]; more: number } => {
                 const seen = new Set<string>();
                 const names: string[] = [];
-                for (const e of edges) {
+                const ordered = edges.slice().sort((a, b) =>
+                    (isDemoP(nodeMap.get(getId(a))?.filePath || '') ? 1 : 0) -
+                    (isDemoP(nodeMap.get(getId(b))?.filePath || '') ? 1 : 0));
+                for (const e of ordered) {
                     const c = nodeMap.get(getId(e));
                     if (!c || c.id === node.id || c.name === node.name) continue;
                     if (isCaller && isTestP(c.filePath)) continue;   // 测试调用者噪声大，隐藏
@@ -1126,8 +1232,14 @@ export class ToolHandlers {
             try {
                 const impact = traverser.getImpactRadius(node.id, 2);
                 if (impact.nodes.size > 1) {
+                    // 同一条理由：`add_url_rule impacts:` 原来是 3 个 test_* 加一个
+                    // examples 的 create_app。测试确实会被波及，但"改这个会影响谁"
+                    // 首先要答的是生产代码 —— 5 个名额被测试占满等于没答。
                     const impactedNames = Array.from(impact.nodes.values())
                         .filter(n => n.id !== node.id)
+                        .sort((a, b) =>
+                            ((isTestP(a.filePath) || isDemoP(a.filePath)) ? 1 : 0) -
+                            ((isTestP(b.filePath) || isDemoP(b.filePath)) ? 1 : 0))
                         .slice(0, 5)
                         .map(n => `\`${n.name}\``);
                     if (impactedNames.length > 0) {

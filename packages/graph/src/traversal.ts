@@ -212,6 +212,24 @@ export class GraphTraverser {
     return this.getAdjacentEdges(nodeId, direction, ['references', 'instantiates']);
   }
 
+  /**
+   * 通过基类声明发生的调用也算这个实现的调用者。
+   *
+   * 调用边落在**声明**处：flask 的 `route` 调 `self.add_url_rule`，边指向
+   * `Scaffold.add_url_rule`（体内只有 raise NotImplementedError）。不穿透的话
+   * "谁调用 App.add_url_rule" 是空的，而实际每个 @app.route 都会走到它。
+   *
+   * 只穿透一层直接基类：`overrides` 沿继承链逐层存在，逐层展开会把祖先接口的所有
+   * 调用点都算成这个实现的调用者 —— 深继承树上这是噪声而不是信息。
+   */
+  private virtualCallIncoming(nodeId: number): GraphEdge[] {
+    const bases = this.getAdjacentEdges(nodeId, 'outgoing', ['overrides']);
+    if (bases.length === 0) return [];
+    const out: GraphEdge[] = [];
+    for (const base of bases) out.push(...this.callLikeEdges(base.targetId, 'incoming'));
+    return out;
+  }
+
   getCallers(nodeId: number, maxDepth: number = 1): Array<{ node: GraphNode; edge: GraphEdge }> {
     const result: Array<{ node: GraphNode; edge: GraphEdge }> = [];
     const visited = new Set<number>();
@@ -230,7 +248,7 @@ export class GraphTraverser {
     visited.add(nodeId);
     if (currentDepth >= maxDepth) return;
 
-    const incoming = this.callLikeEdges(nodeId, 'incoming');
+    const incoming = [...this.callLikeEdges(nodeId, 'incoming'), ...this.virtualCallIncoming(nodeId)];
     if (incoming.length === 0) return;
 
     const sourceIds = incoming.map(e => e.sourceId);
@@ -450,7 +468,14 @@ export class GraphTraverser {
     // Impact = things that truly depend on this node. Use call-like edges
     // (calls, falling back to references/instantiates) — NOT imports, which are
     // static module deps and would inflate the impact radius with module noise.
-    const incoming = this.callLikeEdges(nodeId, 'incoming');
+    //
+    // 子类也算依赖，且这条依赖不是调用边：改 `ErrorDomain` 的构造签名，7 个
+    // `*ErrorDomain` 子类全要跟着改，而它们可能一次都没显式调用过基类。
+    // callLikeEdges 里加继承会污染 getCallers（继承不是调用），所以只在这里追加。
+    const incoming = [
+      ...this.callLikeEdges(nodeId, 'incoming'),
+      ...this.getAdjacentEdges(nodeId, 'incoming', ['extends', 'implements', 'overrides']),
+    ];
     if (incoming.length === 0) return;
 
     const sources = this.store.getNodesById(incoming.map(e => e.sourceId));

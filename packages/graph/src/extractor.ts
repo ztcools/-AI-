@@ -203,6 +203,111 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
 // unresolved cross-file references.  Skipping them at the extractor
 // level cuts >60 % of noise refs and keeps resolution fast.
 
+/**
+ * 类型系统里 `extends` / `implements` 边从一开始就定义了，提取层却从没产出过 ——
+ * 于是图里根本没有继承关系，"改这个基类会影响谁"只能答出显式调用它的地方，
+ * 所有子类看不见；"这个接口有哪些实现"直接无解。影响面查询在 OO 代码库上因此是漏的。
+ *
+ * 各语言的父类在 AST 里挂法不同：Python/Java/Rust 是命名 field，
+ * JS/TS/C++/C# 是特定子节点类型。两条都走，谁先命中算谁。
+ */
+const HERITAGE_FIELDS: Partial<Record<GraphLanguage, Array<{ field: string; kind: 'extends' | 'implements' }>>> = {
+  python: [{ field: 'superclasses', kind: 'extends' }],
+  java: [{ field: 'superclass', kind: 'extends' }, { field: 'interfaces', kind: 'implements' }],
+  rust: [{ field: 'trait', kind: 'implements' }],
+};
+
+const HERITAGE_TYPES: Partial<Record<GraphLanguage, Array<{ type: string; kind: 'extends' | 'implements' }>>> = {
+  javascript: [{ type: 'class_heritage', kind: 'extends' }],
+  typescript: [{ type: 'extends_clause', kind: 'extends' }, { type: 'implements_clause', kind: 'implements' }, { type: 'extends_type_clause', kind: 'extends' }],
+  cpp: [{ type: 'base_class_clause', kind: 'extends' }],
+  csharp: [{ type: 'base_list', kind: 'extends' }],
+  scala: [{ type: 'extends_clause', kind: 'extends' }],
+};
+
+const HERITAGE_DEF_KINDS = new Set<GraphNodeKind>(['class', 'struct', 'interface', 'trait', 'protocol']);
+
+/** 父类名叶子。`generic_type` 整体取文本后剥掉 `<...>`，所以 `Base<T>` 得到 `Base`。 */
+const BASE_TYPE_NODE_TYPES = new Set([
+  'identifier', 'type_identifier', 'qualified_identifier', 'scoped_type_identifier',
+  'qualified_type', 'generic_type', 'attribute', 'member_expression', 'dotted_name',
+  'template_type', 'constrained_type_parameter',
+]);
+
+/**
+ * heritage 子树里那些不是父类名的东西：C++ 的访问修饰符、Python 的
+ * `metaclass=` 关键字实参、以及各语言的通用根类型 —— 把 `object` 当基类记下来，
+ * 只会让每个 Python 类都连到同一个节点上，既没信息又污染影响面。
+ */
+const BASE_TYPE_BLACKLIST = new Set([
+  'public', 'private', 'protected', 'virtual', 'internal', 'sealed', 'abstract',
+  'object', 'Object', 'metaclass', 'ABC', 'ABCMeta', 'Enum', 'IntEnum', 'StrEnum',
+  'Exception', 'BaseException', 'RuntimeError', 'ValueError', 'TypeError',
+  'NamedTuple', 'TypedDict', 'Protocol', 'Generic', 'Any',
+  'std', 'System', 'T', 'K', 'V', 'E',
+]);
+
+function extractBaseTypes(
+  node: Parser.SyntaxNode,
+  source: string,
+  language: GraphLanguage,
+): Array<{ name: string; kind: 'extends' | 'implements' }> {
+  const out: Array<{ name: string; kind: 'extends' | 'implements' }> = [];
+  const seen = new Set<string>();
+
+  const push = (raw: string, kind: 'extends' | 'implements'): void => {
+    const bare = raw.replace(/<[\s\S]*$/, '').split(/::|\./).pop()?.trim();
+    if (!bare || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(bare)) return;
+    if (BASE_TYPE_BLACKLIST.has(bare)) return;
+    const key = `${bare}\0${kind}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ name: bare, kind });
+  };
+
+  const collect = (container: Parser.SyntaxNode, kind: 'extends' | 'implements', depth = 0): void => {
+    if (depth > 3) return;
+    for (let i = 0; i < container.namedChildCount; i++) {
+      const child = container.namedChild(i);
+      if (!child) continue;
+      // `class C(Base, metaclass=Meta)` —— 关键字实参不是父类。
+      if (child.type === 'keyword_argument' || child.type === 'type_arguments' || child.type === 'type_parameters') continue;
+      if (BASE_TYPE_NODE_TYPES.has(child.type)) {
+        push(source.slice(child.startIndex, child.endIndex), kind);
+        continue;
+      }
+      collect(child, kind, depth + 1);
+    }
+  };
+
+  for (const { field, kind } of HERITAGE_FIELDS[language] || []) {
+    const container = node.childForFieldName(field);
+    if (!container) continue;
+    if (BASE_TYPE_NODE_TYPES.has(container.type)) push(source.slice(container.startIndex, container.endIndex), kind);
+    else collect(container, kind);
+  }
+
+  const byType = HERITAGE_TYPES[language];
+  if (byType) {
+    // TS 把 extends_clause/implements_clause 包在 class_heritage 里，多下探一层。
+    const scopes = [node];
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const c = node.namedChild(i);
+      if (c && c.type === 'class_heritage') scopes.push(c);
+    }
+    for (const scope of scopes) {
+      for (let i = 0; i < scope.namedChildCount; i++) {
+        const child = scope.namedChild(i);
+        if (!child) continue;
+        const hit = byType.find(h => h.type === child.type);
+        if (hit) collect(child, hit.kind);
+      }
+    }
+  }
+
+  return out;
+}
+
 const METHOD_BLACKLIST = new Set([
   // String.prototype
   'substring', 'substr', 'trim', 'trimStart', 'trimEnd', 'trimLeft', 'trimRight',
@@ -278,6 +383,13 @@ interface NameEntry {
   nodeIndex: number;
   /** For imports: the resolved module qualified name */
   importModule?: string;
+  /**
+   * 同名的那个类/结构体定义。C++ 里构造函数与类同名且在类体内后遍历，
+   * `registry.set(name, …)` 后写覆盖，于是查 `ComErrorDomain` 拿到的是它的构造函数 ——
+   * 实测 65 条继承边里 49 条的起点因此错成 constructor 节点，反查"ErrorDomain
+   * 有哪些子类"得到的是一串构造函数。
+   */
+  typeNodeIndex?: number;
 }
 
 // ── Extractor class ────────────────────────────────────────────────
@@ -539,7 +651,11 @@ export class GraphExtractor {
         });
 
         // Register the name for call resolution
-        registry.set(name, { name, qualifiedName, nodeIndex });
+        const prevEntry = registry.get(name);
+        registry.set(name, {
+          name, qualifiedName, nodeIndex,
+          typeNodeIndex: HERITAGE_DEF_KINDS.has(nodeKind) ? nodeIndex : prevEntry?.typeNodeIndex,
+        });
 
         // Create CONTAINS edge: parent → this node
         if (parentNodeIndex !== undefined) {
@@ -771,6 +887,25 @@ export class GraphExtractor {
         if (entry && (isCallableKind(nodeKind) || nodeKind === 'class')) {
           currentDefIdx = entry.nodeIndex;
         }
+      }
+    }
+
+    // 继承/实现：父类名要跨文件解析，所以走 unresolvedRef 而不是直接建边。
+    // 起点取 typeNodeIndex 而不是 currentDefIdx —— 见 NameEntry.typeNodeIndex。
+    const heritageFrom = nodeKind && HERITAGE_DEF_KINDS.has(nodeKind)
+      ? (registry.get(this.extractName(node, source, config) || '')?.typeNodeIndex ?? currentDefIdx)
+      : undefined;
+    if (heritageFrom !== undefined) {
+      for (const base of extractBaseTypes(node, source, language)) {
+        unresolvedRefs.push({
+          fromNodeId: heritageFrom,
+          referenceName: base.name,
+          referenceKind: base.kind as GraphEdgeKind,
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column + 1,
+          filePath: ctx.filePath,
+          language,
+        });
       }
     }
 

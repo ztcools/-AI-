@@ -188,6 +188,14 @@ const CLASS_LIKE_KINDS = new Set([
 ]);
 
 /**
+ * 能当基类的 kind。比 CLASS_LIKE_KINDS 多一个 type_alias（`using Base = X;`
+ * 之后继承 Base 是常见写法），少一个 enum —— 枚举不能被继承。
+ */
+const HERITAGE_TARGET_KINDS = new Set([
+  'class', 'struct', 'interface', 'trait', 'protocol', 'type_alias',
+]);
+
+/**
  * Promote `calls` edges to `instantiates` when the target is a class/struct.
  * Also promote when the calling context looks like a constructor invocation.
  */
@@ -663,6 +671,15 @@ export class ReferenceResolver {
 
       let kind = r.original.referenceKind;
       kind = promoteEdgeKind(kind, targetNode);
+
+      // 递归调用是合法的自环，继承不是。`class Config(Config)`（子类从别处 import
+      // 同名基类）会让 name-matcher 优先匹配同文件的那个 —— 也就是它自己。留着这条边
+      // 会让影响面把自己算成自己的子类。
+      if (r.original.fromNodeId === r.targetNodeId && (kind === 'extends' || kind === 'implements')) continue;
+
+      // 基类只能是类型。撞名在 C++ 上很常见（`struct Foo : Base` 里的 Base 匹配到某个
+      // 同名变量），而一条指向 variable 的 extends 边会让"有哪些子类"多出一个不是类的东西。
+      if ((kind === 'extends' || kind === 'implements') && !HERITAGE_TARGET_KINDS.has(targetNode.kind)) continue;
 
       edges.push({
         id: 0, // placeholder — real id assigned by SQLite

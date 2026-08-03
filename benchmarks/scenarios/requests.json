@@ -1,0 +1,38 @@
+[
+  {
+    "name": "重定向: 跟随 3xx",
+    "query": "resolve redirects and follow location header",
+    "modes": ["both", "vector", "graph"],
+    "expect": ["resolve_redirects", "sessions.py"]
+  },
+  {
+    "name": "连接池: adapter 发送请求",
+    "query": "http adapter connection pool send request",
+    "modes": ["both", "vector"],
+    "expect": ["HTTPAdapter", "adapters.py"]
+  },
+  {
+    "name": "认证: basic auth 头",
+    "query": "basic authentication header encoding",
+    "modes": ["both", "graph"],
+    "expect": ["HTTPBasicAuth", "_basic_auth_str"]
+  },
+  {
+    "name": "准备请求: PreparedRequest",
+    "query": "prepare request body and headers before send",
+    "modes": ["both", "vector"],
+    "expect": ["PreparedRequest", "prepare_body"]
+  },
+  {
+    "name": "关系查询: 谁调用 send",
+    "query": "who calls send",
+    "modes": ["graph"],
+    "expect": ["send", "request"]
+  },
+  {
+    "name": "cookie 持久化",
+    "query": "cookie jar merge and persistence across requests",
+    "modes": ["both", "graph"],
+    "expect": ["CookieJar", "merge_cookies"]
+  }
+]

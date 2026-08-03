@@ -95,24 +95,30 @@ Unbind this repo from its cloud vector index. Local graph is kept; re-run link t
 `;
 
         const search_description = `
-Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. It is a first-hop LOCATOR, not a replacement for Read/Grep. The output header shows a repo size tier (small/medium/large) — use it to decide.
+Semantic + call-graph search over the linked codebase. Returns file:line + snippet + who-calls-it. It is a first-hop LOCATOR, not a replacement for Read/Grep.
 
-DEFAULT = Grep/Read. Reach for search ONLY in these cases:
-1. RELATIONSHIP questions grep CANNOT answer — "who calls X", "callers of Y", "impact of changing Z", dead code, entry points → mode "graph". Works at ANY repo size.
-2. LARGE/UNFAMILIAR repo (> ~2000 files) AND you don't know where something lives — "how does auth work", "where is request handled" → mode "both". Grep would drown in hits here.
-3. You know the CONCEPT but not the exact identifier (semantic recall beats keyword grep) → mode "vector".
+Two kinds of question, two different rules:
 
-Do NOT use it when:
-- SMALL repo (< ~300 files): Grep/Read is cheaper AND gives fuller answers. Measured: grep beat search in all 8 scenarios on flask/requests.
-- Exact string/symbol/file path already known → Grep/Read directly (instant, zero cost).
-- Need a verbatim whole file or config/YAML/markdown → Grep / Read a located line range.
+A. RELATIONSHIP questions — "who calls X", "callers of Y", "what breaks if I change Z", dead code, entry points, follow a bug from symptom to root cause across files. Grep cannot answer these at all: it finds the string, not the edges. Use mode "graph", at ANY repo size, including small ones. This is the highest-value case and the cheapest (~330 tok).
 
-Picking a mode — measured on 36 expected symbols across two real C++ repos:
-- "graph" — 86% of them found, ~300 tok, 60-105ms, no link needed. Prose is fine, not just symbol names: identifiers are indexed word-by-word and stemmed, so "initialize logging and create the log manager" finds InitLogging/LogManager and "supervised entity recovery action" finds both classes. Returns locations + call chains, no code — start here when that is what you need.
-- "both" — 93%, ~2200 tok (7x graph). Pays for itself when you need the code snippets themselves, or when the thing you are describing is NOT spelled out in any identifier (an underlying library, a concept like zero-copy shared memory) — that is where the vector side earns its cost.
-- "vector" — 83%, ~1700 tok. Same semantic reach as "both" without call graphs. Requires link.
+B. LOCATION questions — "how does auth work", "where is the request handled", "which class owns retries". Here grep is a real competitor and repo size decides:
+- The output header reads [repo: <own>/<total> own files, <tier>...]. Judge by OWN files (vendored + generated code is not code you have to understand) and by the noise ratio it reports. You only see this after the first call, so on an unfamiliar repo open with mode "graph" — it is the cheapest mode and its header tells you which rule applies from then on.
+- >= ~2000 own files, or the header says grep gets drowned here → search, mode "both". A concept word in a repo that is half vendored returns pages of upstream hits under grep; the ranking here demotes vendored/generated code instead.
+- ~300-2000 own files → either works. Prefer search when you cannot name a file or symbol to grep for; prefer grep once you can.
+- < ~300 own files with a low noise ratio → Grep/Read is cheaper and gives fuller answers. Measured: grep beat search in all 8 scenarios on flask/requests.
 
-After search locates a spot, Read that exact line range to understand/edit. Cost control: style:"compact" for file:line only (~10x fewer tokens), limit:5 to cap snippets, enrich:false to skip the call-graph. Snippets share a whole-response budget, so a large limit shortens each one — ask for fewer hits when you want them complete. Needs link for vector; without link returns graph-only.
+Never worth a search:
+- Exact string, symbol, or file path already known → Grep/Read directly (instant, zero cost).
+- A verbatim whole file, or config/YAML/markdown → Read a located line range.
+- Something not written down in this repo at all. Retrieval only surfaces what the code says; if no file mentions the concept, no mode will invent the link (a query about "zero copy shared memory" will not find the IPC library whose source never uses those words). One reformulation, then fall back to Grep.
+Ranking scores identifiers, so describe the ARTIFACT you expect to exist, not the outcome you want: "proxy factory create instance" finds ProxyFactory where "how is a proxy created for a service" ranks its four sibling Create* methods above it, and "set value kvs" finds SetValue where "persist key value pairs" does not.
+
+Picking a mode — measured on 76 expected symbols across two real C++ repos (warm):
+- "graph" — 23/23 on the questions it is meant for, ~500 tok, 70-110ms, no link needed (89% across a wider set that includes location questions better served by "both"). Prose is fine, not just symbol names: identifiers are indexed word-by-word and stemmed, so "initialize logging and create the log manager" finds InitLogging/LogManager. Returns locations + call chains, no code — start here whenever that is enough.
+- "both" — 97%, ~2800 tok (6x graph), 150-260ms. Buys the code snippets plus the call chains. Default when you need to read what the code does, not just where it is.
+- "vector" — 91%, ~2400 tok, 65-110ms. Semantic reach without call graphs; use when you want snippets and already know how the pieces connect. Requires link.
+
+After search locates a spot, Read that exact line range to understand/edit. Cost control: style:"compact" for file:line only (~10x fewer tokens), limit:5 to cap snippets, enrich:false to skip the call-graph. Snippets share a whole-response budget, so a large limit shortens each one — ask for fewer hits when you want them complete. Pass vendor:true only when the answer genuinely lives in an upstream library, tests:true / docs:true likewise for test or prose files — all three are demoted by default. Markdown is deliberately not indexed (prose embeds nearer an NL query than the code implementing it, so it crowds out the answer), so a README is a Read/Grep job, never a search. Needs link for vector; without link returns graph-only.
 `;
 
         const clear_description = `
@@ -189,8 +195,7 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                 mode: {
                                     type: "string",
                                     enum: ["vector", "graph", "both"],
-                                    description: "Search mode: 'graph' (symbols, call relationships and locations — cheapest, takes symbol names or prose), 'vector' (semantic, needs link), 'both' (default — vector snippets + graph context).",
-                                    default: "both",
+                                    description: "Search mode. OMIT THIS to let the server pick by query shape — relationship questions ('who calls X', 'impact of changing Y') and bare identifiers auto-route to 'graph' (~500 tok instead of ~2800), and if the graph comes back thin the server adds the vector pass in the same call. Set it explicitly only to override: 'graph' (symbols + call relationships, cheapest, no link needed), 'vector' (semantic snippets, needs link), 'both' (vector snippets + graph context).",
                                 },
                                 enrich: {
                                     type: "boolean",
@@ -199,7 +204,7 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                 },
                                 docs: {
                                     type: "boolean",
-                                    description: "Include documentation/markdown without score penalty (default false: docs are down-ranked so code wins). Set true when searching for guides/README/concepts.",
+                                    description: "Stop down-ranking prose files (default false: docs keep half score so code wins). Covers .rst/.adoc/.txt only — markdown is not indexed at all, so this will never surface a README.md. Set true for reStructuredText/AsciiDoc docs, e.g. Python projects' docs/ trees.",
                                     default: false,
                                 },
                                 tests: {

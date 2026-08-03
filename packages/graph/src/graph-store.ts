@@ -427,6 +427,48 @@ function wordVariants(word: string): string[] {
   return alt ? [word, ...alt] : [word];
 }
 
+/**
+ * 查询把一个符号的名字整个念了出来时，别让"只蹭到几个泛词"的行压过它。
+ *
+ * BM25 按**命中的不同词数**累加，所以查询越长越偏向"沾到更多词"的文档：
+ * "monitor log directory for file changes" 里 `FileMonitor` 只对上 2 个词 —— 却是
+ * 它名字的全部 —— 而 `log_dir_`（log+dir）、`DirectoryExists`（directory）各自沾到
+ * 别的词，把它挤出前十。短语臂也救不了：它按查询里的**相邻**词对构造，而
+ * "monitor…file" 在查询里既不相邻、顺序还是反的。
+ *
+ * 覆盖率 = 符号名切出来的词有多少落在查询词集合里（含缩写对，`dir`↔`directory`）。
+ * 分母是**符号的**词数而不是查询的词数：这衡量的是"这个名字有多大比例被念到"，
+ * 长查询不会因为多带了几个词就稀释它。单词名不参与 —— 名字只有一个词时覆盖率
+ * 必然是 0 或 1，全覆盖的那批已经被 exact-name 段接住了。
+ */
+const FULL_NAME_COVERAGE_BOOST = 1.8;
+const PARTIAL_NAME_COVERAGE_BOOST = 1.3;
+const PARTIAL_NAME_COVERAGE_MIN = 2 / 3;
+
+function boostNameCoverage(rows: Array<Record<string, unknown>>, query: string): void {
+  const qTokens = new Set<string>();
+  for (const t of meaningfulQueryTokens(query)) {
+    for (const v of wordVariants(t.toLowerCase())) qTokens.add(v.toLowerCase());
+  }
+  if (qTokens.size === 0) return;
+  for (const row of rows) {
+    const name = lastNameSegment(String(row.name || ''));
+    const split = splitIdentifier(name);
+    if (!split) continue;
+    const parts = split.split(' ').filter(w => w.length > 1);
+    if (parts.length < 2) continue;
+    let hit = 0;
+    for (const p of parts) {
+      if (wordVariants(p).some(v => qTokens.has(v.toLowerCase()))) hit++;
+    }
+    const coverage = hit / parts.length;
+    const factor = coverage >= 1
+      ? FULL_NAME_COVERAGE_BOOST
+      : coverage >= PARTIAL_NAME_COVERAGE_MIN ? PARTIAL_NAME_COVERAGE_BOOST : 0;
+    if (factor) row.score = (Number(row.score) || 0) * factor;
+  }
+}
+
 /** Bound on phrase arms per query, so a long sentence can't balloon the MATCH. */
 const MAX_QUERY_PHRASES = 8;
 
@@ -448,6 +490,56 @@ const MAX_FTS_ARMS = 28;
  * unkeyed and the order untouched. Rows past the per-concept cap are moved to the
  * back rather than dropped, which keeps paging with `offset` consistent.
  */
+/**
+ * 同一个符号名最多占几条。C++ 一个方法天然有 2 条（声明 + 定义），再加上
+ * consumer/impl 这种同接口多实现，一个名字就能吃掉半个结果页：问"键值存储读写"，
+ * 第 5 到第 9 名全是 `SyncToStorage`（header、impl、consumer 各一份），而查询真正
+ * 还问了的 `SetValue` 排在十名之外。声明+定义这一对是有用的（一个给签名、一个给
+ * 实现），所以留 2 条，多出来的下溢到尾部而不是丢掉 —— 和概念多样性同一套做法，
+ * `offset` 分页仍然一致。
+ */
+const MAX_ROWS_PER_NAME = 2;
+
+/**
+ * FTS 段要取多深。
+ *
+ * 只取 `limit * 2` 时，一页十条里能被真正拿去看的常常只有六条：噪声 kind 被过滤、
+ * 同名的声明/实现被 capPerName 下溢，剩下的空位由 LIKE 兜底段（score 0.1）的边角
+ * 符号填掉 —— 而 BM25 排在第 21 位的行明明比它们相关。实测"键值存储读写"那一页
+ * 第 7 到第 10 名全是 0.1 分的 `DeleteKvstype`/`DiscardPendingChanges`。
+ *
+ * 取深一点纯粹是拿 SQLite 的 top-N 换质量：bm25 排序在索引里做，多取 140 行的
+ * 代价在毫秒级（实测单查询 3–16ms 没有可测变化），而过滤和去重之后一页才是满的。
+ */
+const FTS_CANDIDATE_FACTOR = 8;
+const FTS_CANDIDATE_MAX = 200;
+
+function ftsCandidateLimit(limit: number): number {
+  return Math.min(FTS_CANDIDATE_MAX, Math.max(limit * 2, limit * FTS_CANDIDATE_FACTOR));
+}
+
+function capPerName(
+  rows: Array<Record<string, unknown>>,
+  limit: number,
+): Array<Record<string, unknown>> {
+  if (rows.length <= limit) return rows;
+  const counts = new Map<string, number>();
+  const kept: Array<Record<string, unknown>> = [];
+  const spilled: Array<Record<string, unknown>> = [];
+  for (const row of rows) {
+    const key = lastNameSegment(String(row.name || '')).toLowerCase();
+    if (!key) {
+      kept.push(row);
+      continue;
+    }
+    const n = (counts.get(key) ?? 0) + 1;
+    counts.set(key, n);
+    if (n <= MAX_ROWS_PER_NAME) kept.push(row);
+    else spilled.push(row);
+  }
+  return spilled.length === 0 ? rows : [...kept, ...spilled];
+}
+
 function diversifyByConcept(
   rows: Array<Record<string, unknown>>,
   query: string,
@@ -506,6 +598,110 @@ function diversifyByConcept(
  * penalty 不在 (0,1) 时该档不降权 —— 上层传 `vendor:true` / `tests:true` 就是这条
  * 路径（明确要看第三方库或测试用例时不该降权）。
  */
+const DEMOTED = Symbol('demoted');
+
+/**
+ * 给降权行在首页尾部留几个槽。
+ *
+ * `demoteRows` 是稳定分区，候选池一深，降权段就整段落到 40 名以后 —— "降权"事实上
+ * 变成了"排除"。而有些查询的正确答案本来就在 vendored 子树里：PhiLog 自己的
+ * `pg_rotating_file_sink` 是按大小轮转，问"按天切分日志文件"的答案只能是 spdlog 的
+ * `daily_file_sink`；一页十条全是本仓库的 sink，看着干净，其实答错了。
+ *
+ * 只换最后 `q` 个槽，且只在降权后的分数仍然高于被换掉的那一行时才换 —— 实测那一页
+ * 被换掉的是 8.96 分的 `rename_file_`，换上来的是罚过 0.35 之后仍有 33.73 分的
+ * `daily_filename_calculator`。前排仍然属于本仓库代码，这是分层要保的东西。
+ */
+const DEMOTED_PAGE_QUOTA = 2;
+
+function reserveDemotedSlots(
+  rows: Array<Record<string, unknown>>,
+  limit: number,
+): Array<Record<string, unknown>> {
+  const q = Math.min(DEMOTED_PAGE_QUOTA, Math.floor(limit / 4));
+  if (q < 1 || rows.length <= limit) return rows;
+  const head = rows.slice(0, limit);
+  if (head.some(r => (r as never)[DEMOTED])) return rows;
+
+  const tail = rows.slice(limit);
+  const cands = tail
+    .filter(r => (r as never)[DEMOTED])
+    .sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0))
+    .slice(0, q);
+  if (cands.length === 0) return rows;
+
+  const promoted = new Set<Record<string, unknown>>();
+  const displaced: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < cands.length; i++) {
+    const slot = limit - cands.length + i;
+    if ((Number(cands[i].score) || 0) <= (Number(head[slot].score) || 0)) continue;
+    promoted.add(cands[i]);
+    displaced.push(head[slot]);
+    head[slot] = cands[i];
+  }
+  if (promoted.size === 0) return rows;
+  return [...head, ...displaced, ...tail.filter(r => !promoted.has(r))];
+}
+
+/**
+ * 一页里挤满同一个类的成员时，把那个类本身带进来。
+ *
+ * BM25 数的是"命中了几个词"，所以查 "how is a proxy created for a service handle"
+ * 时 `CreateProxy`/`CreateEvent`/`CreateMethod`/`CreateField` 各自命中 create+proxy
+ * 稳占前排，而它们的宿主 `class ProxyFactory` 只命中 proxy —— 一页十条全是兄弟方法，
+ * 唯独缺了回答"这套东西属于谁"的那个符号。agent 拿到四个 Create* 还得再读一次文件
+ * 才知道它们同属一个工厂类，而那一次 Read 本来是可以省掉的。
+ *
+ * 判据是 contains 边而不是 qualified_name：qualified_name 存的是"路径点分 + 符号名"
+ * （`…proxy.proxy_factory.CreateProxy`），剥掉最后一段得到的是文件，不是类。
+ *
+ * 容器插在它第一个成员之前 —— 先说清是哪个类再列成员，这才是阅读顺序。被挤出首页的
+ * 行下溢到尾部而不是丢弃，`offset` 分页才不会跳行。
+ */
+const CONTAINER_HOIST_QUOTA = 2;
+const CONTAINER_HOIST_MIN_MEMBERS = 2;
+
+function hoistParentContainers(
+  rows: Array<Record<string, unknown>>,
+  limit: number,
+  lookupParents: (memberIds: number[]) => Map<number, Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const quota = Math.min(CONTAINER_HOIST_QUOTA, Math.floor(limit / 5));
+  if (quota < 1 || rows.length === 0) return rows;
+
+  const head = rows.slice(0, limit);
+  const ids = head.map(r => Number(r.id)).filter(Number.isFinite);
+  const parents = lookupParents(ids);
+  if (parents.size === 0) return rows;
+
+  const inHead = new Set(ids);
+  const groups = new Map<number, { node: Record<string, unknown>; count: number; first: number; score: number }>();
+  head.forEach((row, i) => {
+    const parent = parents.get(Number(row.id));
+    if (!parent) return;
+    const pid = Number(parent.id);
+    if (inHead.has(pid)) return;
+    const g = groups.get(pid);
+    const score = Number(row.score) || 0;
+    if (g) { g.count++; if (score > g.score) g.score = score; }
+    else groups.set(pid, { node: parent, count: 1, first: i, score });
+  });
+
+  const picked = Array.from(groups.values())
+    .filter(g => g.count >= CONTAINER_HOIST_MIN_MEMBERS)
+    .sort((a, b) => b.count - a.count || a.first - b.first)
+    .slice(0, quota);
+  if (picked.length === 0) return rows;
+
+  // 从后往前插：先插靠前的位置会把后面记下的下标推走。
+  const hoisted = new Set(picked.map(g => Number(g.node.id)));
+  for (const g of picked.slice().sort((a, b) => b.first - a.first)) {
+    head.splice(g.first, 0, { ...g.node, score: g.score });
+  }
+  const displaced = head.splice(limit);
+  return [...head, ...displaced, ...rows.slice(limit).filter(r => !hoisted.has(Number(r.id)))];
+}
+
 function demoteRows(
   rows: Array<Record<string, unknown>>,
   segments: string[] | undefined,
@@ -532,7 +728,7 @@ function demoteRows(
     }
     demotedCount++;
     const bucket = tiers.get(factor);
-    const scored = { ...row, score: (Number(row.score) || 0) * factor };
+    const scored = { ...row, score: (Number(row.score) || 0) * factor, [DEMOTED]: true };
     if (bucket) bucket.push(scored);
     else tiers.set(factor, [scored]);
   }
@@ -1051,6 +1247,30 @@ export class SqliteGraphStore implements GraphStore {
 
   // ── Node search ───────────────────────────────────────────────────
 
+  /**
+   * 成员 id → 它的类/结构体宿主。file 与 namespace 宿主不算：那是"在哪个文件里"，
+   * 不是"属于哪个东西"，而且 module 本身就在 RESULT_NOISE_KINDS 里。
+   */
+  private lookupContainerParents(memberIds: number[]): Map<number, Record<string, unknown>> {
+    const out = new Map<number, Record<string, unknown>>();
+    if (memberIds.length === 0) return out;
+    try {
+      const ph = memberIds.map(() => '?').join(',');
+      const rows = this.readDB.prepare(
+        `SELECT e.target_id AS member_ref, p.* FROM edges e JOIN nodes p ON p.id = e.source_id
+         WHERE e.kind = 'contains' AND e.target_id IN (${ph})
+           AND p.kind IN ('class', 'struct', 'interface', 'trait', 'object')`
+      ).all(...memberIds) as Array<Record<string, unknown>>;
+      for (const row of rows) {
+        const member = Number(row.member_ref);
+        if (out.has(member)) continue;
+        const { member_ref, ...node } = row;
+        out.set(member, node);
+      }
+    } catch { /* 没有 contains 边就不提升 */ }
+    return out;
+  }
+
   findNodes(options: GraphSearchOptions): GraphSearchResponse {
     const { conditions, params } = this.buildFindConditions(options);
     const whereClause = conditions.length > 0 ? conditions.join(' AND ') : '1=1';
@@ -1109,7 +1329,11 @@ export class SqliteGraphStore implements GraphStore {
           FROM nodes n JOIN nodes_fts fts ON n.id = fts.rowid
           WHERE nodes_fts MATCH ? AND ${whereClause}
           ORDER BY score DESC LIMIT ?
-        `).all(ftsQuery, ...params, limit * 2) as Array<Record<string, unknown>>;
+        `).all(ftsQuery, ...params, ftsCandidateLimit(limit)) as Array<Record<string, unknown>>;
+        // 名字覆盖率加权只在 FTS 段内重排：allRows 是按段拼起来的（exact=1000 →
+        // FTS → LIKE=0.1 → prefix=0.05），四段量纲不同，跨段重排会废掉分层。
+        boostNameCoverage(ftsRows, options.query);
+        ftsRows.sort((a, b) => (Number(b.score) || 0) - (Number(a.score) || 0));
         for (const row of ftsRows) {
           if (!seenIds.has(row.id as number)) {
             seenIds.add(row.id as number);
@@ -1213,10 +1437,15 @@ export class SqliteGraphStore implements GraphStore {
       );
       const demoted = demoteRows(filtered, options.vendorSegments, options.vendorPenalty, options.testPenalty);
       const start = offset || 0;
-      const sliced = diversifyByConcept(demoted, options.query || '', limit).slice(
-        start,
-        start + limit,
+      const ranked = reserveDemotedSlots(
+        hoistParentContainers(
+          capPerName(diversifyByConcept(demoted, options.query || '', limit), limit),
+          limit,
+          (memberIds) => this.lookupContainerParents(memberIds),
+        ),
+        limit,
       );
+      const sliced = ranked.slice(start, start + limit);
       const mergedCount = { total: filtered.length };
       return this.buildNodeResults(sliced, mergedCount, options, offset);
     } else {
@@ -1679,6 +1908,30 @@ export class SqliteGraphStore implements GraphStore {
     this.db.prepare('DELETE FROM nodes WHERE project = ?').run(project);
   }
 
+  /**
+   * 清掉不属于 `keep` 的 identity。
+   *
+   * 一个 db 文件绑一个仓库目录，同一时刻只服务一个 identity。但 identity 会变：
+   * remote 从 ssh 换成 https、link 到另一个分支、或早期版本用目录名当 project。
+   * 增量同步按**文件内容哈希**判断要不要重建，文件没变就不重建，于是新 identity
+   * 的节点整批插入、旧的一行不删 —— flask 的图因此有 4721 个节点，其中 2360 个是
+   * `flask:main` 的僵尸、2361 个是现 identity 的真节点，每个符号两份。
+   *
+   * 后果不止是体积翻倍：跨 identity 的 CALLS 边会把调用者指到僵尸副本上，
+   * `add_url_rule ↖43` 里数进了不存在的引用，而 Call Graph 只列 3 个调用者 ——
+   * agent 拿到的"谁依赖你"因此是错的。删完靠 deleteDanglingEdges 收尾。
+   */
+  pruneForeignProjects(keep: string): number {
+    const foreign = this.listProjects().filter(p => p !== keep);
+    let removed = 0;
+    const countStmt = this.db.prepare('SELECT COUNT(*) as cnt FROM nodes WHERE project = ?');
+    for (const p of foreign) {
+      removed += (countStmt.get(p) as { cnt: number }).cnt;
+      this.deleteProject(p);
+    }
+    return removed;
+  }
+
   deleteProjectEdgesChunk(project: string, limit: number): number {
     return this.db.prepare(
       'DELETE FROM edges WHERE id IN (SELECT id FROM edges WHERE project = ? LIMIT ?)'
@@ -1728,6 +1981,41 @@ export class SqliteGraphStore implements GraphStore {
         OR target_id NOT IN (SELECT id FROM nodes WHERE project = ?)
       )
     `).run(project, project, project).changes;
+  }
+
+  /**
+   * 由继承边推导 overrides 边：C extends P 且两边有同名方法 → C.m overrides P.m。
+   *
+   * 需要它是因为调用边落在声明处。flask 的 `route` 装饰器在 Scaffold 里调
+   * `self.add_url_rule`，而 Scaffold 那个方法体只有 `raise NotImplementedError`——
+   * 真实现在 App/Blueprint 里。于是问"谁调用 App.add_url_rule"答案是空的，
+   * 尽管每一个 @app.route 都会走到它。
+   *
+   * 纯图计算，不碰各语言 AST：extends 边已经有了，同名成员用 contains 边对齐即可。
+   * is_abstract 靠不住（提取层对 Python 的 NotImplementedError 一律给 0），
+   * 所以不筛"基类方法是否抽象"—— 普通的方法覆盖同样需要这条边。
+   *
+   * 同名成员在一侧出现多份就整组跳过（那个 HAVING）：光按名字配对是 N×M 笛卡尔积。
+   * flask 的 `@setupmethod` 装饰器在 App 里留下 21 个同名节点、Scaffold 里若干，
+   * 一条继承边就能生出 432 条边 —— 而这种情况下"哪个覆盖哪个"本来就无从判定。
+   * 代价是 C++ 重载方法不产出 overrides 边，那本来也不是名字能定的关系。
+   */
+  buildOverrideEdges(project: string): number {
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO edges (project, source_id, target_id, kind, provenance)
+      SELECT ?, MIN(cn.id), MIN(pn.id), 'overrides', 'inheritance'
+      FROM edges h
+      JOIN edges cm ON cm.project = h.project AND cm.kind = 'contains' AND cm.source_id = h.source_id
+      JOIN edges pm ON pm.project = h.project AND pm.kind = 'contains' AND pm.source_id = h.target_id
+      JOIN nodes cn ON cn.id = cm.target_id
+      JOIN nodes pn ON pn.id = pm.target_id
+      WHERE h.project = ? AND h.kind IN ('extends', 'implements')
+        AND cn.name = pn.name AND cn.id != pn.id
+        AND cn.kind IN ('method', 'function')
+        AND pn.kind IN ('method', 'function')
+      GROUP BY h.source_id, h.target_id, cn.name
+      HAVING COUNT(DISTINCT cn.id) = 1 AND COUNT(DISTINCT pn.id) = 1
+    `).run(project, project).changes;
   }
 
   // ── Transaction helpers ────────────────────────────────────────────
@@ -1963,6 +2251,19 @@ export class SqliteGraphStore implements GraphStore {
       for (const va of wordVariants(a)) {
         for (const vb of wordVariants(b)) push(`{name search_text} : "${esc(va)} ${esc(vb)}"`);
       }
+    }
+    // 泛词（file/data/type/get…）作为无限定前缀臂是灾难 —— "file"* 会命中每一条
+    // 路径里带 file 的行。但它们照样在**给符号起名**：FileMonitor、DataStore、
+    // TypeRegistry。所以给它们一条只打标识符列的前缀臂：能对上名字，碰不到
+    // file_path。补在短语臂之后，只用剩下的臂位，不挤掉已被证明有效的那些。
+    //
+    // 需要它是因为短语臂只覆盖查询里**相邻**的词对：问 "monitor log directory for
+    // file changes"，FileMonitor 的两个词在查询里既不相邻、顺序还是反的，
+    // 于是它连候选池都进不去（实测该查询前 200 个候选里没有它）。
+    const meaningful = new Set(meaningfulQueryTokens(query).map(t => t.toLowerCase()));
+    for (const word of queryWords(query).map(t => t.toLowerCase())) {
+      if (meaningful.has(word) || QUERY_STOP_WORDS.has(word)) continue;
+      push(`{name search_text} : "${esc(word)}"*`);
     }
     return arms.join(' OR ');
   }

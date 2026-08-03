@@ -16,12 +16,32 @@
 import { ToolHandlers } from '../packages/mcp/dist/handlers.js';
 import { GraphToolHandlers } from '../packages/mcp/dist/graph-handlers.js';
 import { Context, MilvusVectorDatabase, OllamaEmbedding, envManager } from '../packages/core/dist/index.js';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 
 const repoPath = process.argv[2];
 const branch = process.argv[3];
 const scenarioFile = process.argv[4];
 if (!repoPath || !branch) {
     console.error('usage: node benchmarks/harness.mjs <repoPath> <branch> [scenarioFile]');
+    process.exit(2);
+}
+
+// branch 只决定云端 collection 的寻址，图索引是按**工作树当前 checkout** 建的。
+// 两者不一致时这个脚本会安静地量两份不同的代码：PhiLog 的 main 是 48 文件的骨架分支，
+// 工作树停在 main、参数传 master，vector 侧读的是 298 文件的 master collection，
+// graph 侧只看得见骨架 —— graph 召回 17/17 变成 8/17，看起来像是刚才那次改动的回归。
+// 读 .git/HEAD 而不是 spawn git：这个脚本要能在禁止子进程的环境里跑。
+let headBranch = null;
+try {
+    const head = readFileSync(join(repoPath, '.git', 'HEAD'), 'utf8').trim();
+    const m = head.match(/^ref:\s*refs\/heads\/(.+)$/);
+    headBranch = m ? m[1] : null;   // detached HEAD 无分支名，放过
+} catch { }
+if (headBranch !== null && headBranch !== branch) {
+    console.error(`refuse: worktree HEAD is '${headBranch}' but branch arg is '${branch}'.`);
+    console.error(`graph side would measure '${headBranch}' while vector side measures '${branch}'.`);
+    console.error(`fix: git -C ${repoPath} checkout ${branch}`);
     process.exit(2);
 }
 
@@ -95,7 +115,10 @@ for (const s of scenarios) {
     }
 }
 
-console.log('\n=== summary ===');
+// 分支写进 summary：期望符号是按某个分支的代码编的，跑错分支时召回会整片塌掉，
+// 而不带分支的汇总看不出来是跑错了还是回归了（PhiLog 的 main 是 48 文件骨架分支，
+// 真实代码在 master —— 这个坑踩过一次）。
+console.log(`\n=== summary === ${repoPath} @ ${branch}${scenarioFile ? ` (${scenarioFile})` : ''}`);
 const byMode = {};
 for (const r of rows) {
     const m = (byMode[r.mode] ||= { n: 0, ms: 0, tokens: 0, hit: 0, expect: 0, empty: 0 });
