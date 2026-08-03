@@ -139,7 +139,8 @@ export class ToolHandlers {
         const q = query.trim();
         if (RELATION_QUERY_RE.some(re => re.test(q))) return 'graph';
         // 单个标识符（含 `A::b` / `a.b` 限定名）：要的是"它在哪"，不是语义近邻。
-        if (!/\s/.test(q) && q.length >= 3 && /^[A-Za-z_][A-Za-z0-9_]*([:.]{1,2}[A-Za-z_][A-Za-z0-9_]*)*$/.test(q)) {
+        // `$` 是 JS/TS 的合法标识符字符，不带上它 `$scope` 这类查询会白付向量段的钱。
+        if (!/\s/.test(q) && q.length >= 3 && /^[A-Za-z_$][A-Za-z0-9_$]*([:.]{1,2}[A-Za-z_$][A-Za-z0-9_$]*)*$/.test(q)) {
             return 'graph';
         }
         return 'both';

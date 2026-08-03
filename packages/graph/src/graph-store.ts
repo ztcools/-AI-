@@ -1984,6 +1984,58 @@ export class SqliteGraphStore implements GraphStore {
   }
 
   /**
+   * 把提取阶段没接上的方法接回接收者类型：`contains` 边 + 带类名的显示名。
+   *
+   * 只有 Go 会走到这里。别的语言方法词法嵌套在类体内，提取时就有父亲；Go 的
+   * `func (r *Router) Use(...)` 是顶层声明，而接收者类型常常在同一个包的另一个
+   * 文件里（gorilla/mux：`Router` 在 mux.go，`Use` 在 middleware.go），提取器的
+   * registry 是按文件的，接不上。没有这条 contains 边，"Router 有哪些方法"、
+   * 以及 buildOverrideEdges 的同名成员对齐都会漏掉这些方法。
+   *
+   * 同名类型有多个就跳过（那个 HAVING）：`receiverType` 只是个裸名字，撞名时
+   * 挂错类型比不挂更坏。改名走 UPDATE 是安全的 —— nodes_au 触发器会同步 FTS，
+   * 且 suffix_name 保持裸名，检索与 overrides 推导都按它来。
+   */
+  attachReceiverContains(project: string): number {
+    const rows = this.db.prepare(`
+      SELECT m.id AS mid, m.name AS mname, m.qualified_name AS mqn,
+             json_extract(m.properties_json, '$.receiverType') AS recv,
+             MIN(t.id) AS tid
+      FROM nodes m
+      JOIN nodes t ON t.project = m.project
+        AND t.name = json_extract(m.properties_json, '$.receiverType')
+        AND t.kind IN ('class', 'struct', 'interface', 'trait', 'type_alias')
+      WHERE m.project = ? AND m.kind = 'method'
+        AND json_extract(m.properties_json, '$.receiverType') IS NOT NULL
+        AND instr(m.name, '.') = 0
+      GROUP BY m.id
+      HAVING COUNT(DISTINCT t.id) = 1
+    `).all(project) as Array<{ mid: number; mname: string; mqn: string; recv: string; tid: number }>;
+    if (rows.length === 0) return 0;
+
+    const link = this.db.prepare(`
+      INSERT OR IGNORE INTO edges (project, source_id, target_id, kind, provenance)
+      VALUES (?, ?, ?, 'contains', 'receiver')
+    `);
+    const rename = this.db.prepare(
+      'UPDATE nodes SET name = ?, qualified_name = ? WHERE id = ?'
+    );
+    let n = 0;
+    this.db.transaction(() => {
+      for (const r of rows) {
+        link.run(project, r.tid, r.mid);
+        rename.run(
+          `${r.recv}.${r.mname}`,
+          r.mqn.replace(/[^.]+$/, `${r.recv}.${r.mname}`),
+          r.mid,
+        );
+        n++;
+      }
+    })();
+    return n;
+  }
+
+  /**
    * 由继承边推导 overrides 边：C extends P 且两边有同名方法 → C.m overrides P.m。
    *
    * 需要它是因为调用边落在声明处。flask 的 `route` 装饰器在 Scaffold 里调
@@ -1999,6 +2051,9 @@ export class SqliteGraphStore implements GraphStore {
    * flask 的 `@setupmethod` 装饰器在 App 里留下 21 个同名节点、Scaffold 里若干，
    * 一条继承边就能生出 432 条边 —— 而这种情况下"哪个覆盖哪个"本来就无从判定。
    * 代价是 C++ 重载方法不产出 overrides 边，那本来也不是名字能定的关系。
+   *
+   * 比的是 suffix_name 而不是 name：一部分语言的方法显示名带类名前缀
+   * （Go 的 `Service.Describe`），拿全名比永远不相等。
    */
   buildOverrideEdges(project: string): number {
     return this.db.prepare(`
@@ -2010,10 +2065,10 @@ export class SqliteGraphStore implements GraphStore {
       JOIN nodes cn ON cn.id = cm.target_id
       JOIN nodes pn ON pn.id = pm.target_id
       WHERE h.project = ? AND h.kind IN ('extends', 'implements')
-        AND cn.name = pn.name AND cn.id != pn.id
+        AND cn.suffix_name = pn.suffix_name AND cn.id != pn.id
         AND cn.kind IN ('method', 'function')
         AND pn.kind IN ('method', 'function')
-      GROUP BY h.source_id, h.target_id, cn.name
+      GROUP BY h.source_id, h.target_id, cn.suffix_name
       HAVING COUNT(DISTINCT cn.id) = 1 AND COUNT(DISTINCT pn.id) = 1
     `).run(project, project).changes;
   }

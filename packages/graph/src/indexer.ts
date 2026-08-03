@@ -55,7 +55,7 @@ const PARSE_POOL_MIN_FILES = 120;
  * clears unresolved_refs; pre-v5 graphs carry refs pointing at deleted node ids,
  * which produced edges with a non-existent source and inflated in/out degrees.
  */
-export const INDEXER_VERSION = 7;
+export const INDEXER_VERSION = 8;
 
 /** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
@@ -578,8 +578,12 @@ export class GraphIndexer {
 
     // 必须在 Phase 3 之后：继承边是跨文件解析的产物，这一步只是读它。
     try {
+      // 顺序有要求：先把方法接回接收者类型，overrides 推导才看得见它们。
+      const attached = this.store.attachReceiverContains(this.project);
       const overrides = this.store.buildOverrideEdges(this.project);
-      if (overrides > 0) console.log(`[GraphIndexer] Phase 4 done: ${overrides} override edges derived`);
+      if (attached > 0 || overrides > 0) {
+        console.log(`[GraphIndexer] Phase 4 done: ${attached} receivers attached, ${overrides} override edges derived`);
+      }
     } catch (err: any) {
       console.warn(`[GraphIndexer] Phase 4 error (non-fatal): ${err.message}`);
     }

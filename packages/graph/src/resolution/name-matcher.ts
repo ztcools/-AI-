@@ -242,18 +242,26 @@ export function matchReference(
 ): ResolvedRef | null {
   const language = ref.language || 'javascript';
 
-  // Pre-check: skip blacklisted builtins
-  if (isBlacklistedBuiltin(ref.referenceName, language)) {
-    return null;
-  }
+  // 内置黑名单挡的是"名字撞上标准库"的猜测式匹配，不该挡本仓库自己写下的定义。
+  // 同文件命中是最高置信度的一档，而且语义上就是对的：一个文件里定义了 `open`，
+  // 该文件里调 `open` 就是调它（遮蔽）。继承边同理 —— 基类名不可能是内置函数，
+  // 真正的标准库基类在提取层的 BASE_TYPE_BLACKLIST 已经过滤过。
+  // 不放开的后果是通用性缺口而非 Go 特有：GO_BUILTINS 里有 Reader/Writer/File/Closer，
+  // 任何自己定义 `type Reader interface` 的 Go 仓库都因此拿不到嵌入继承边。
+  const blacklisted = isBlacklistedBuiltin(ref.referenceName, language);
+  const isHeritage = ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
 
   // Strategy 1: Same-file match
   const sameFile = matchSameFile(ref, context);
   if (sameFile) return sameFile;
 
+  if (blacklisted && !isHeritage) return null;
+
   // Strategy 2: Unique name across project
   const uniqueName = matchUniqueName(ref, context);
   if (uniqueName) return uniqueName;
+
+  if (blacklisted) return null;
 
   // Strategy 2.5: Suffix name match — for intra-class calls like `this.calculateOrderTotal()`
   // The node is stored as "OrderService.calculateOrderTotal" but the ref has "calculateOrderTotal"

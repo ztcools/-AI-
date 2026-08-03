@@ -1,0 +1,32 @@
+[
+ {
+  "name": "全局 logger 装配",
+  "query": "global logger initialization",
+  "modes": ["graph"],
+  "expect": ["GlobalLogger", "set_logger"]
+ },
+ {
+  "name": "最大等级过滤",
+  "query": "max level filter check",
+  "modes": ["graph"],
+  "expect": ["LevelFilter", "max_level"]
+ },
+ {
+  "name": "Record 构造",
+  "query": "record builder metadata",
+  "modes": ["graph"],
+  "expect": ["RecordBuilder", "MetadataBuilder"]
+ },
+ {
+  "name": "kv 访问者",
+  "query": "key value visitor source",
+  "modes": ["graph"],
+  "expect": ["key_values", "to_key"]
+ },
+ {
+  "name": "Log trait 的实现",
+  "query": "logger implementation trait",
+  "modes": ["graph"],
+  "expect": ["set_logger", "Logger.enabled"]
+ }
+]

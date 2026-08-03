@@ -169,7 +169,12 @@ const LANGUAGE_CONFIGS: Record<string, LanguageConfig> = {
     parser: loadParser('rust'),
     nodeTypes: {
       function_item: 'function',
-      impl_item: 'class',
+      // impl_item 不是定义，是容器：`impl Person` 里的方法属于 struct Person，
+      // `impl Greeter for Person` 说的是 Person 实现 Greeter。当成 class 收会造出
+      // 一个跟 struct 重名的假节点（`impl Greeter for Person` 甚至按 trait 命名，
+      // 于是 Person 的方法挂到了 Greeter 上）。归属与 implements 边都在
+      // attachReceiverMethods 里按 impl 的 type/trait 字段还原。
+      function_signature_item: 'function',
       struct_item: 'struct',
       enum_item: 'enum',
       trait_item: 'interface',
@@ -247,6 +252,73 @@ const BASE_TYPE_BLACKLIST = new Set([
   'std', 'System', 'T', 'K', 'V', 'E',
 ]);
 
+/**
+ * Go 的继承是嵌入，形态跟其他八种语言都不一样，所以单走一条路径。
+ *
+ * `type Derived struct { Base; Name string }` —— 嵌入字段没有字段名，方法因此提升
+ * 到 Derived 上，这就是 Go 的继承。通用的 collect 在这里是错的：它见到类型节点就
+ * 收，会把 `Name string` 的 `string` 当成基类。判据是 field_declaration 里有没有
+ * field_identifier —— 没有就是嵌入。
+ *
+ * 接口侧同理：`type ReadWriter interface { Reader; Writer; Close() error }` 里
+ * 嵌入的接口是 type_elem，方法是 method_elem。
+ */
+function extractGoEmbedded(
+  node: Parser.SyntaxNode,
+  source: string,
+): Array<{ name: string; kind: 'extends' | 'implements' }> {
+  const out: Array<{ name: string; kind: 'extends' | 'implements' }> = [];
+  const seen = new Set<string>();
+
+  const push = (n: Parser.SyntaxNode | null): void => {
+    if (!n) return;
+    // `pkg.Remote` / `Generic[T]` → Remote / Generic。包名和类型实参都不是基类名。
+    const bare = source.slice(n.startIndex, n.endIndex)
+      .replace(/[[<][\s\S]*$/, '').split('.').pop()?.replace(/^\*/, '').trim();
+    if (!bare || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(bare)) return;
+    if (BASE_TYPE_BLACKLIST.has(bare) || seen.has(bare)) return;
+    seen.add(bare);
+    out.push({ name: bare, kind: 'extends' });
+  };
+
+  const typeNode = (parent: Parser.SyntaxNode): Parser.SyntaxNode | null => {
+    for (let i = 0; i < parent.namedChildCount; i++) {
+      const c = parent.namedChild(i);
+      if (c && (c.type === 'type_identifier' || c.type === 'qualified_type' || c.type === 'generic_type')) return c;
+    }
+    return null;
+  };
+
+  // `type ( A struct{…}; B interface{…} )` 一条声明里能有多个 type_spec。
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const spec = node.namedChild(i);
+    if (!spec || spec.type !== 'type_spec') continue;
+    const body = spec.childForFieldName('type');
+    if (!body) continue;
+
+    if (body.type === 'struct_type') {
+      const list = body.namedChild(0);
+      if (!list || list.type !== 'field_declaration_list') continue;
+      for (let f = 0; f < list.namedChildCount; f++) {
+        const fd = list.namedChild(f);
+        if (!fd || fd.type !== 'field_declaration') continue;
+        let named = false;
+        for (let c = 0; c < fd.namedChildCount; c++) {
+          if (fd.namedChild(c)?.type === 'field_identifier') { named = true; break; }
+        }
+        if (!named) push(typeNode(fd));
+      }
+    } else if (body.type === 'interface_type') {
+      for (let e = 0; e < body.namedChildCount; e++) {
+        const el = body.namedChild(e);
+        if (el && el.type === 'type_elem') push(typeNode(el));
+      }
+    }
+  }
+
+  return out;
+}
+
 function extractBaseTypes(
   node: Parser.SyntaxNode,
   source: string,
@@ -254,6 +326,8 @@ function extractBaseTypes(
 ): Array<{ name: string; kind: 'extends' | 'implements' }> {
   const out: Array<{ name: string; kind: 'extends' | 'implements' }> = [];
   const seen = new Set<string>();
+
+  if (language === 'go') return extractGoEmbedded(node, source);
 
   const push = (raw: string, kind: 'extends' | 'implements'): void => {
     const bare = raw.replace(/<[\s\S]*$/, '').split(/::|\./).pop()?.trim();
@@ -483,8 +557,15 @@ export class GraphExtractor {
         fileNodeIndex,
       );
 
-      // ── Pass 2: Resolve calls, produce unresolved refs ───────────
       const unresolvedRefs: UnresolvedReference[] = [];
+
+      if (lang === 'go' || lang === 'rust') {
+        this.attachReceiverMethods(
+          tree.rootNode, source, ctx, nodes, registry, edges, unresolvedRefs, lang,
+        );
+      }
+
+      // ── Pass 2: Resolve calls, produce unresolved refs ───────────
       this.resolveCalls(
         tree.rootNode,
         source,
@@ -562,6 +643,117 @@ export class GraphExtractor {
   static isDockerfile(filename: string): boolean {
     const base = filename.split('/').pop()?.toLowerCase() || '';
     return base === 'dockerfile' || base.startsWith('dockerfile.');
+  }
+
+  /**
+   * 把写在类型体外的方法挂回它的类型上（Go 的接收者、Rust 的 impl 块）。
+   *
+   * 另外七种语言的方法词法嵌套在类体里，`parentNodeIndex` 就够了。Go 的
+   * `func (s *Service) Describe()` 和 Rust 的 `impl Person { fn new() }` 不是：
+   * 方法节点的父亲成了文件，名字是裸的 `Describe`/`new`，同名方法的限定名彼此相同。
+   * 后果有两条：`Service.Describe` 这种查询问不出东西，以及 buildOverrideEdges 靠
+   * contains 对齐同名成员，这两种语言一条 overrides 边都推不出来。
+   *
+   * Rust 还多一件事：`impl Greeter for Person` 是 implements 关系的唯一出处。
+   *
+   * 放在 Pass 1 之后而不是收集时做：方法可以写在类型声明之前，那时 registry 里还没有
+   * 这个类型。
+   */
+  private attachReceiverMethods(
+    root: Parser.SyntaxNode,
+    source: string,
+    ctx: ExtractionContext,
+    nodes: Omit<GraphNode, 'id'>[],
+    registry: Map<string, NameEntry>,
+    edges: Omit<GraphEdge, 'id'>[],
+    unresolvedRefs: UnresolvedReference[],
+    language: GraphLanguage,
+  ): void {
+    const byLine = new Map<number, number>();
+    const wantKind = language === 'go' ? 'method' : 'function';
+    for (let i = 1; i < nodes.length; i++) {
+      if (nodes[i]!.kind === wantKind) byLine.set(nodes[i]!.startLine, i);
+    }
+    if (byLine.size === 0) return;
+
+    const bareName = (n: Parser.SyntaxNode | null | undefined): string | undefined => {
+      if (!n) return undefined;
+      const s = source.slice(n.startIndex, n.endIndex)
+        .replace(/^[&*]+/, '').replace(/[[<(][\s\S]*$/, '').split('::').pop()?.split('.').pop()?.trim();
+      return s && /^[A-Za-z_][A-Za-z0-9_]*$/.test(s) ? s : undefined;
+    };
+
+    const attach = (declLine: number, recvName: string): void => {
+      const methodIdx = byLine.get(declLine);
+      if (methodIdx === undefined) return;
+      const m = nodes[methodIdx]!;
+      if (m.name.includes('.')) return;
+      // 类型常常声明在同一个包/crate 的另一个文件里（gorilla/mux 的 `Router` 在
+      // mux.go、它的 Use 在 middleware.go），而 registry 是按文件的。记下名字，
+      // 让 Phase 4 拿全项目视野去接 —— 见 store.attachReceiverContains。
+      m.properties = { ...(m.properties || {}), receiverType: recvName };
+
+      const typeIdx = registry.get(recvName)?.typeNodeIndex;
+      if (typeIdx === undefined) return;
+
+      m.name = `${recvName}.${m.name}`;
+      m.qualifiedName = m.qualifiedName.replace(/[^.]+$/, m.name);
+
+      edges.push({
+        project: ctx.project,
+        sourceId: typeIdx,
+        targetId: methodIdx,
+        kind: 'contains',
+        type: 'contains' as GraphEdgeType,
+        line: m.startLine,
+        column: 1,
+        provenance: 'tree-sitter',
+        properties: {},
+      });
+    };
+
+    if (language === 'go') {
+      for (let i = 0; i < root.namedChildCount; i++) {
+        const decl = root.namedChild(i);
+        if (!decl || decl.type !== 'method_declaration') continue;
+        const recvName = bareName(decl.childForFieldName('receiver')?.namedChild(0)?.childForFieldName('type'));
+        if (recvName) attach(decl.startPosition.row + 1, recvName);
+      }
+      return;
+    }
+
+    // Rust：impl 块可以嵌在 mod 里，所以要走整棵树。
+    const walk = (n: Parser.SyntaxNode): void => {
+      if (n.type === 'impl_item') {
+        const typeName = bareName(n.childForFieldName('type'));
+        if (typeName) {
+          const body = n.childForFieldName('body');
+          if (body) {
+            for (let i = 0; i < body.namedChildCount; i++) {
+              const f = body.namedChild(i);
+              if (f && (f.type === 'function_item' || f.type === 'function_signature_item')) {
+                attach(f.startPosition.row + 1, typeName);
+              }
+            }
+          }
+          const traitName = bareName(n.childForFieldName('trait'));
+          const typeIdx = registry.get(typeName)?.typeNodeIndex;
+          if (traitName && typeIdx !== undefined && !BASE_TYPE_BLACKLIST.has(traitName)) {
+            unresolvedRefs.push({
+              fromNodeId: typeIdx,
+              referenceName: traitName,
+              referenceKind: 'implements',
+              line: n.startPosition.row + 1,
+              column: n.startPosition.column + 1,
+              filePath: ctx.filePath,
+              language,
+            } as UnresolvedReference);
+          }
+        }
+      }
+      for (let i = 0; i < n.namedChildCount; i++) walk(n.namedChild(i)!);
+    };
+    walk(root);
   }
 
   // ── Private: Pass 1 - Collect definitions + CONTAINS edges ───────

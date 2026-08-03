@@ -195,6 +195,11 @@ const HERITAGE_TARGET_KINDS = new Set([
   'class', 'struct', 'interface', 'trait', 'protocol', 'type_alias',
 ]);
 
+/** implements 能指向的 kind —— 比基类窄，实现的对象是接口而不是具体类型。 */
+const IMPLEMENTS_TARGET_KINDS = new Set([
+  'interface', 'trait', 'protocol', 'type_alias',
+]);
+
 /**
  * Promote `calls` edges to `instantiates` when the target is a class/struct.
  * Also promote when the calling context looks like a constructor invocation.
@@ -680,6 +685,13 @@ export class ReferenceResolver {
       // 基类只能是类型。撞名在 C++ 上很常见（`struct Foo : Base` 里的 Base 匹配到某个
       // 同名变量），而一条指向 variable 的 extends 边会让"有哪些子类"多出一个不是类的东西。
       if ((kind === 'extends' || kind === 'implements') && !HERITAGE_TARGET_KINDS.has(targetNode.kind)) continue;
+
+      // implements 的目标只能是接口式的类型。rust-lang/log 里 `impl sval::Value for Key`
+      // 的 `Value` 是外部 trait，而本仓库自己有个 struct 叫 Value —— 按名字解析就撞上了，
+      // 于是"Key 实现了 struct Value"。TS/JS 例外：`class A implements B` 里 B 可以是类。
+      if (kind === 'implements'
+        && !IMPLEMENTS_TARGET_KINDS.has(targetNode.kind)
+        && r.original.language !== 'typescript' && r.original.language !== 'javascript') continue;
 
       edges.push({
         id: 0, // placeholder — real id assigned by SQLite

@@ -1,0 +1,32 @@
+[
+ {
+  "name": "路由匹配: 路径变量",
+  "query": "route matching and path variables",
+  "modes": ["graph"],
+  "expect": ["Route.Match", "RouteMatch"]
+ },
+ {
+  "name": "中间件: 注册到 router",
+  "query": "register middleware on router",
+  "modes": ["graph"],
+  "expect": ["Router.Use", "MiddlewareFunc"]
+ },
+ {
+  "name": "反向构造 URL",
+  "query": "build url from route template",
+  "modes": ["graph"],
+  "expect": ["Route.buildVars", "BuildVarsFunc"]
+ },
+ {
+  "name": "请求分发入口",
+  "query": "serve http request dispatch",
+  "modes": ["graph"],
+  "expect": ["Router.ServeHTTP"]
+ },
+ {
+  "name": "子路由与前缀",
+  "query": "subrouter nested prefix",
+  "modes": ["graph"],
+  "expect": ["Route.Subrouter", "Router.PathPrefix"]
+ }
+]

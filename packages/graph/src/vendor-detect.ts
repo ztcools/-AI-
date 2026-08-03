@@ -20,10 +20,14 @@ import { defaultVendorSegments } from './graph-store';
 /** 根目录许可证文件名 → 被 vendored 的库名。 */
 function segmentsFromLicenseFiles(entries: string[]): string[] {
     const out: string[] = [];
-    for (const name of entries) {
+    for (const entry of entries) {
+        // 先剥文档后缀再匹配。否则 `LICENSE.txt`（最常见的许可证文件名）会被读成
+        // "vendored 了一个叫 txt 的库"，于是任何带 `txt/` 目录段的子树被无声降权 ——
+        // flask 就是这样多出一个 `txt` 段的。`LICENSE.fmt` 这种真库名不受影响。
+        const name = entry.replace(/\.(?:txt|md|rst|html?|text|asc)$/i, '');
         // LICENSE-spdlog / LICENSE.fmt / LICENSE_zlib / COPYING-openssl / spdlog-LICENSE
-        const m = /^(?:LICEN[CS]E|COPYING|NOTICE)[-_.]([A-Za-z0-9][\w.+-]*?)(?:\.(?:txt|md))?$/i.exec(name)
-            || /^([A-Za-z0-9][\w.+-]*?)[-_.](?:LICEN[CS]E|COPYING)(?:\.(?:txt|md))?$/i.exec(name);
+        const m = /^(?:LICEN[CS]E|COPYING|NOTICE)[-_.]([A-Za-z0-9][\w.+-]*)$/i.exec(name)
+            || /^([A-Za-z0-9][\w.+-]*)[-_.](?:LICEN[CS]E|COPYING)$/i.exec(name);
         if (!m) continue;
         const lib = m[1];
         // 排除 "LICENSE-APACHE" 这类**协议名**——它说的是本项目用什么协议，不是 vendoring。
