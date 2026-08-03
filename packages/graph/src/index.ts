@@ -17,6 +17,7 @@ export * from './searcher';
 export * from './architecture';
 export * from './resolution/index';
 export * from './utils';
+export * from './vendor-detect';
 
 // v2 new modules
 export { GraphTraverser, CallTracer } from './traversal';

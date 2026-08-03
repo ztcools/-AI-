@@ -10,9 +10,9 @@ import {
     getCurrentBranch,
     envManager,
 } from "@seeway/claude-context-core";
-import { resolveCodebasePath, truncateContent, trackCodebasePath } from "./utils.js";
+import { resolveCodebasePath, focusSnippet, trackCodebasePath } from "./utils.js";
 import type { GraphToolHandlers } from "./graph-handlers.js";
-import { INDEXER_VERSION } from "@seeway/claude-context-graph";
+import { INDEXER_VERSION, detectVendorSegments, isTestPath as isTestFilePath } from "@seeway/claude-context-graph";
 import { linkState, LinkInfo } from "./link-state.js";
 
 /**
@@ -32,6 +32,12 @@ import { linkState, LinkInfo } from "./link-state.js";
  */
 function symbolLabel(s: { name: string; owner?: string }): string {
     return s.owner && s.owner !== s.name ? `${s.owner}::${s.name}` : s.name;
+}
+
+const ARCH_INTENT = /(architect|overview|structure|module|layout|entry\s*-?\s*point|entrypoint|entry|startup|start\s*up|bootstrap|main\s*function|top\s*level|dead\s*code|call\s*flow|架构|结构|总览|概览|入口|启动|模块划分|死代码)/i;
+
+function wantsArchitecture(query: string): boolean {
+    return ARCH_INTENT.test(query || '');
 }
 
 export class ToolHandlers {
@@ -103,7 +109,7 @@ export class ToolHandlers {
             defaultLimit: Math.max(1, Math.min(50, num('SEARCH_DEFAULT_LIMIT', 10))),
             threshold: num('SEARCH_THRESHOLD', 0.4),
             snippetMaxChars: Math.max(200, num('SEARCH_SNIPPET_MAX_CHARS', 4000)),
-            totalMaxChars: Math.max(2000, num('SEARCH_TOTAL_MAX_CHARS', 20000)),
+            totalMaxChars: Math.max(2000, num('SEARCH_TOTAL_MAX_CHARS', 12000)),
             scoreRatio: Math.max(0, Math.min(1, num('SEARCH_SCORE_RATIO', 0))),
         };
     }
@@ -287,9 +293,30 @@ export class ToolHandlers {
             const identity = `${normalizeGitUrl(remoteUrl)}:${branch}`;
             const collectionName = this.context.getCollectionNameForIdentity(identity);
 
-            // 验证云端 collection 存在
+            // 验证云端 collection 存在。
+            // 连不上 Milvus 与"这个分支没被索引过"是两种完全不同的故障，处置手段也不同
+            // （查网络/服务 vs 换分支或去控制台加索引）。以前 catch(() => false) 把前者
+            // 报成后者，用户会照着提示去挨个换分支试，而问题其实在连不上。
             const vdb = this.context.getVectorDatabase();
-            const exists = await vdb.hasCollection(collectionName).catch(() => false);
+            let exists = false;
+            let probeError: string | null = null;
+            try {
+                exists = await vdb.hasCollection(collectionName);
+            } catch (e: any) {
+                probeError = e?.message || String(e);
+            }
+            if (probeError) {
+                return {
+                    content: [{
+                        type: 'text',
+                        text: `Error: Could not reach the cloud vector database to verify '${identity}'.\n` +
+                            `  Collection: ${collectionName}\n` +
+                            `  Reason: ${probeError}\n` +
+                            `Check MILVUS_ADDRESS / network connectivity, then re-run link.`,
+                    }],
+                    isError: true,
+                };
+            }
             if (!exists) {
                 return {
                     content: [{
@@ -320,7 +347,7 @@ export class ToolHandlers {
             if (this.graphToolHandlers) {
                 const graphProject = (() => { try { return getRepoIdentity(absolutePath); } catch { return identity; } })();
                 this.graphToolHandlers.setProject(absolutePath);
-                const stats = this.graphToolHandlers.getStore().getProjectStats(graphProject);
+                const stats = this.graphToolHandlers.getStore(absolutePath).getProjectStats(graphProject);
                 const alreadyGraphIndexed = stats.nodes > 0;
 
                 // 与 maybeAutoBuildGraphIndex 共用一个去重 Set，避免 link + 后续 search
@@ -333,7 +360,7 @@ export class ToolHandlers {
                                 // 增量更新
                                 let changedFiles: string[] = [];
                                 try {
-                                    const detectResult = this.graphToolHandlers!.detectChangedFiles({ project: graphProject });
+                                    const detectResult = this.graphToolHandlers!.detectChangedFiles({ project: graphProject, repoPath: absolutePath });
                                     if (detectResult) changedFiles = detectResult.changedFiles;
                                 } catch { /* 忽略，走全量 */ }
 
@@ -401,15 +428,11 @@ export class ToolHandlers {
     // ── Tool: search ────────────────────────────────────────────────
     public async handleSearchCode(args: any) {
         const tuning = this.getSearchTuning();
-        const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style, docs, tests } = args;
+        const { path: codebasePath = ".", query, limit, extensionFilter, mode, enrich, style, docs, tests, vendor } = args;
         const searchMode: 'vector' | 'graph' | 'both' = (mode === 'graph') ? 'graph' : (mode === 'vector') ? 'vector' : 'both';
         const doEnrich = searchMode === 'both' && enrich !== false;
         const compactStyle = style === 'compact';
         const resultLimit = limit || tuning.defaultLimit;
-        // docs:true → 查文档/指南时不做文档降权（临时把 penalty 调 0）
-        if (docs === true) process.env.SEARCH_DOC_PENALTY = '0';
-        // tests:true → 查测试用例时不做测试降权
-        if (tests === true) process.env.SEARCH_TEST_PENALTY = '0';
 
         try {
             const absolutePath = resolveCodebasePath(codebasePath);
@@ -426,6 +449,20 @@ export class ToolHandlers {
             }
 
             trackCodebasePath(absolutePath);
+
+            // docs:true / tests:true / vendor:true → 本次查询不做对应降权。
+            // 显式入参而不是写 process.env：全局态传单次参数会让并发的两次 search 互相污染，
+            // 也会压掉用户 .env 里配的真实值。
+            // vendorSegments 得等 absolutePath 定下来才能探测（约定名 + submodule + 根许可证）。
+            const vendorSegments = vendor === true ? [] : detectVendorSegments(absolutePath);
+            const ranking = {
+                ...(docs === true ? { docPenalty: 0 } : {}),
+                ...(tests === true ? { testPenalty: 0 } : {}),
+                vendorSegments,
+            };
+            // 图侧要用同一套降权：vector 侧一直有测试降权、图侧之前没有，于是同一次 `both`
+            // 里向量结果干净、图符号块被测试刷屏（实测 flask+requests：top10 测试行 56%→21%）。
+            const graphRanking = { vendorSegments, ...(tests === true ? { testPenalty: 0 } : {}) };
 
             // 取链接信息（未链接 → 走 graph-only 路径）
             const link = linkState.getByPath(absolutePath);
@@ -447,7 +484,7 @@ export class ToolHandlers {
             if (this.graphToolHandlers) {
                 try {
                     this.graphToolHandlers.setProject(absolutePath);
-                    const stats = this.graphToolHandlers.getStore().getProjectStats(project);
+                    const stats = this.graphToolHandlers.getStore(absolutePath).getProjectStats(project);
                     graphHasNodes = stats.nodes > 0;
                 } catch { /* ignore */ }
             }
@@ -496,7 +533,7 @@ export class ToolHandlers {
                 ? (async () => {
                     try {
                         const searchResults = await this.context.searchWithLayers(
-                            layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr,
+                            layers, query, Math.min(resultLimit, 50), tuning.threshold, filterExpr, ranking,
                         );
                         let scored = searchResults;
                         if (tuning.scoreRatio > 0 && scored.length > 1) {
@@ -518,9 +555,11 @@ export class ToolHandlers {
             const graphPromise = (searchMode !== 'vector' && this.graphToolHandlers)
                 ? (async () => {
                     try {
-                        this.graphToolHandlers!.setProject(absolutePath);
-                        const store = this.graphToolHandlers!.getStore();
-                        const gr = store.findNodes({ project, query, limit: Math.min(resultLimit, 10) });
+                        // 显式按路径取 store：并发搜两个仓库时，"当前项目"指针会被对方改掉。
+                        const store = this.graphToolHandlers!.getStore(absolutePath);
+                        const gr = store.findNodes({
+                            project, query, limit: Math.min(resultLimit, 10), ...graphRanking,
+                        });
                         if (gr.results.length > 0) {
                             // Owning type, from the CONTAINS edge that already exists.
                             // Without it a hit reads `method CreateProxy` twice over
@@ -596,7 +635,7 @@ export class ToolHandlers {
                         const graphNote = graphMatch.length > 0 ? ` [graph: ${graphMatch.map(s => s.name).join(', ')}]` : '';
                         parts.push(`[${i + 1}] ${loc} ${r.language} s=${Number(r.score || 0).toFixed(5)}${graphNote}`);
                     } else {
-                        const code = truncateContent(r.content, perSnippetChars);
+                        const code = focusSnippet(r.content, perSnippetChars, query);
                         const graphMatch = graphSymbols.filter(s =>
                             s.filePath === r.relativePath &&
                             s.line >= r.startLine &&
@@ -620,6 +659,9 @@ export class ToolHandlers {
                 for (const s of unmatchedSymbols.slice(0, 5)) {
                     parts.push(`- ${s.kind} \`${symbolLabel(s)}\` (${s.filePath}:${s.line}) ↖${s.inDegree} ↗${s.outDegree}`);
                 }
+                if (unmatchedSymbols.length > 5) {
+                    parts.push(`- ... and ${unmatchedSymbols.length - 5} more`);
+                }
             }
 
             let resultMessage = parts.join('\n');
@@ -631,7 +673,7 @@ export class ToolHandlers {
             if (wantEnrich && this.graphToolHandlers) {
                 try {
                     const enrich = this.enrichWithGraphContextDeep(
-                        vectorResults.slice(0, 5), absolutePath, query,
+                        vectorResults.slice(0, 5), absolutePath, query, graphRanking,
                     );
                     if (enrich) resultMessage += enrich;
                 } catch (graphErr: any) {
@@ -673,6 +715,7 @@ export class ToolHandlers {
             }
 
             let cleared: string[] = [];
+            let graphError: string | null = null;
 
             // 清链接状态
             if (linkState.delete(absolutePath)) {
@@ -682,19 +725,35 @@ export class ToolHandlers {
             // 清本地图
             if (this.graphToolHandlers) {
                 const project = (() => { try { return getRepoIdentity(absolutePath); } catch { return absolutePath; } })();
-                const store = this.graphToolHandlers.getStore();
+                // 先切当前项目，再按同一路径取 store —— 顺序反了会拿到别的仓库（或已淘汰）的连接，
+                // 于是 deleteProject 在错误的库上执行，报"已清除"而目标图一行未动。
+                this.graphToolHandlers.setProject(absolutePath);
+                const store = this.graphToolHandlers.getStore(absolutePath);
                 try {
-                    this.graphToolHandlers.setProject(absolutePath);
                     store.beginTransaction();
                     store.deleteProject(project);
                     store.commitTransaction();
                     cleared.push('graph');
                     console.log(`[CLEAR] Cleared graph index for: ${project}`);
-                } catch (graphError: any) {
+                } catch (e: any) {
                     // 事务失败必须 rollback，否则连接一直处于打开事务状态被锁死
                     try { store.rollbackTransaction(); } catch { /* ignore */ }
-                    console.warn(`[CLEAR] Failed to clear graph index for '${project}': ${graphError.message}`);
+                    graphError = e?.message || String(e);
+                    console.warn(`[CLEAR] Failed to clear graph index for '${project}': ${graphError}`);
                 }
+            }
+
+            // 清图失败必须报错返回：以前失败被咽掉，用户看到的是"Nothing to clear"，
+            // 会以为图已经干净了，实际上脏图还在，重建也不会发生。
+            if (graphError) {
+                return {
+                    content: [{
+                        type: 'text',
+                        text: `Failed to clear graph index for '${absolutePath}': ${graphError}` +
+                            (cleared.length > 0 ? `\n(cleared: ${cleared.join(', ')})` : ''),
+                    }],
+                    isError: true,
+                };
             }
 
             const msg = cleared.length > 0
@@ -735,7 +794,7 @@ export class ToolHandlers {
             if (this.graphToolHandlers) {
                 try {
                     this.graphToolHandlers.setProject(absolutePath);
-                    const store = this.graphToolHandlers.getStore();
+                    const store = this.graphToolHandlers.getStore(absolutePath);
                     const stats = store.getProjectStats(project);
 
                     // 已链接但图为空 → 触发后台建图
@@ -782,7 +841,7 @@ export class ToolHandlers {
 
                     // 架构摘要
                     try {
-                        const archResult = this.graphToolHandlers.handleGetArchitecture({ project });
+                        const archResult = this.graphToolHandlers.handleGetArchitecture({ project, repo_path: absolutePath });
                         const archText = archResult.content[0]?.text || '';
                         lines.push('## Architecture');
                         lines.push(archText);
@@ -822,7 +881,9 @@ export class ToolHandlers {
 
         let stats: { nodes: number; edges: number };
         try {
-            stats = this.graphToolHandlers.getStore().getProjectStats(project);
+            // 显式按仓库路径取 store。以前这里用无参 getStore()，在 setProject 之前执行 ——
+            // 拿的是上一个仓库的库，本仓库的图被读成 0 节点，于是每次都判定"图为空"走全量重建。
+            stats = this.graphToolHandlers.getStore(codebasePath).getProjectStats(project);
         } catch {
             return;
         }
@@ -851,12 +912,12 @@ export class ToolHandlers {
     }
 
     /** 图是否由旧版索引器构建（需重建）。无版本戳或版本落后即视为过时。 */
-    private isGraphOutdated(_codebasePath: string): boolean {
+    private isGraphOutdated(codebasePath: string): boolean {
         try {
-            // 复用 getStore() 的现有 SQLite 连接（不为每次检查新开连接）。
+            // 复用该仓库已打开的 SQLite 连接（不为每次检查新开连接）。
             // 注意：mcp 是 ESM，不能用 require() —— 之前 require 写法在 ESM 下
             // 抛 ReferenceError 被 catch 吞掉，导致版本检测永远返回 false。
-            return this.graphToolHandlers!.getStore().getGraphVersion() < INDEXER_VERSION;
+            return this.graphToolHandlers!.getStore(codebasePath).getGraphVersion() < INDEXER_VERSION;
         } catch {
             return false;
         }
@@ -891,7 +952,7 @@ export class ToolHandlers {
         let stats: { nodes: number };
         try {
             this.graphToolHandlers.setProject(codebasePath);
-            stats = this.graphToolHandlers.getStore().getProjectStats(project);
+            stats = this.graphToolHandlers.getStore(codebasePath).getProjectStats(project);
         } catch {
             return;
         }
@@ -899,7 +960,7 @@ export class ToolHandlers {
 
         setImmediate(async () => {
             try {
-                const det = this.graphToolHandlers!.detectChangedFiles({ project });
+                const det = this.graphToolHandlers!.detectChangedFiles({ project, repoPath: codebasePath });
                 if (!det || det.changedFiles.length === 0) return;
                 console.log(`[GRAPH-SYNC] ${det.changedFiles.length} file(s) changed for '${project}', incremental re-index`);
                 await this.graphToolHandlers!.handleIndexRepository({
@@ -918,16 +979,22 @@ export class ToolHandlers {
         searchResults: any[],
         codebasePath: string,
         query: string,
+        graphRanking?: { vendorSegments?: string[]; testPenalty?: number },
     ): string {
-        const store = this.graphToolHandlers!.getStore();
-        const traverser = this.graphToolHandlers!.getTraverser();
+        // 调用链富化必须用【本次搜索仓库】的 store：无参取值会跟着"当前项目"跑，
+        // 并发搜两个仓库时后到者把指针改掉，前者查到 0 行 —— 整段 Call Graph 静默消失。
+        const store = this.graphToolHandlers!.getStore(codebasePath);
+        const traverser = this.graphToolHandlers!.getTraverser(codebasePath);
         const project = getRepoIdentity(codebasePath);
         const lines: string[] = [];
         const seenSymbols = new Set<string>();
 
         const queryWords = query.toLowerCase().split(/[\s_\-.,:;!?/\\()\[\]{}]+/).filter((w: string) => w.length > 1);
-        // 测试文件降权/排除（富化阶段）：tests/、test_*.py、*_test.go 等
-        const isTestPath = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
+        // 富化阶段对测试是**硬排除**（不是降权）：调用链要的是"业务代码怎么串起来"，
+        // 测试作为调用者只会告出一堆 `TestFoo → Foo`。但 `tests:true` 明确说要看测试，
+        // 那时不能还偷偷排除 —— 判定复用 graph 导出的那份，两侧对"什么算测试"必须一致。
+        const skipTests = graphRanking?.testPenalty !== 0;
+        const isTestPath = (p: string) => skipTests && isTestFilePath(p);
         // 相关性：词边界匹配（含驼峰/下划线切分），避免裸子串把 `get` 误判命中 `__getitem__`。
         const nameTokens = (name: string): string[] =>
             name.toLowerCase().split(/[^a-z0-9]+|(?<=[a-z0-9])(?=[A-Z])/).filter(Boolean);
@@ -945,7 +1012,7 @@ export class ToolHandlers {
         //    而不是只围绕向量 top5 文件。这正是此前 send/get_adapter 被富化丢弃的根因。
         const graphHitNodes: any[] = [];
         try {
-            const gr = store.findNodes({ project, query, limit: 12 });
+            const gr = store.findNodes({ project, query, limit: 12, ...graphRanking });
             for (const r of gr.results) {
                 const n = r.node;
                 if (n.kind !== 'function' && n.kind !== 'method' && n.kind !== 'class') continue;
@@ -1009,34 +1076,37 @@ export class ToolHandlers {
 
             // 去噪：自指调用（`app ← app`）、同名互调、测试文件调用者；并按名去重。
             const isTestP = (p: string) => /(^|\/)(tests?|__tests__|spec)\//i.test(p) || /(^|\/)(test_[^/]*|[^/]*_test|[^/]*\.(test|spec))\.[a-z]+$/i.test(p);
-            const pick = (edges: any[], getId: (e: any) => number, isCaller: boolean): string[] => {
+            // 截断必须出声：只列 3 个而 `↖11`，agent 会把这 3 个当成全部调用者去
+            // 判影响面。`+N` 给出"还有多少个不同的名字被省了"。
+            const pick = (edges: any[], getId: (e: any) => number, isCaller: boolean): { names: string[]; more: number } => {
                 const seen = new Set<string>();
-                const out: string[] = [];
+                const names: string[] = [];
                 for (const e of edges) {
                     const c = nodeMap.get(getId(e));
                     if (!c || c.id === node.id || c.name === node.name) continue;
                     if (isCaller && isTestP(c.filePath)) continue;   // 测试调用者噪声大，隐藏
                     if (seen.has(c.name)) continue;
                     seen.add(c.name);
-                    out.push(`\`${c.name}\``);
-                    if (out.length >= 3) break;
+                    if (names.length < 3) names.push(`\`${c.name}\``);
                 }
-                return out;
+                return { names, more: seen.size - names.length };
             };
+            const render = (r: { names: string[]; more: number }): string =>
+                r.names.join(', ') + (r.more > 0 ? ` +${r.more}` : '');
             const callerFiltered = pick(callerEdges, (e) => e.sourceId, true);
             const calleeFiltered = pick(calleeEdges, (e) => e.targetId, false);
 
             // 去噪后可能两头都空（自指、同名重载互调、调用者全在测试里）。
             // 那样的行在 "Call Graph" 里没有调用关系可言，只是把符号清单
             // 又抄了一遍：spdlog 的 `log` 重载让 6 行里有 3 行是这种空行。
-            if (callerFiltered.length === 0 && calleeFiltered.length === 0) continue;
+            if (callerFiltered.names.length === 0 && calleeFiltered.names.length === 0) continue;
 
             // 签名折叠为单行（多行签名会把调用链撑成几十行）。
             const sig = node.signature ? String(node.signature).replace(/\s+/g, ' ').trim() : '';
             let line = `\`${node.name}\``;
             if (sig) line += sig;
-            if (callerFiltered.length > 0) line += ` ← ${callerFiltered.join(', ')}`;
-            if (calleeFiltered.length > 0) line += ` → ${calleeFiltered.join(', ')}`;
+            if (callerFiltered.names.length > 0) line += ` ← ${render(callerFiltered)}`;
+            if (calleeFiltered.names.length > 0) line += ` → ${render(calleeFiltered)}`;
             line += `  (${node.filePath}:${node.startLine})`;
             directRelations.push(line);
         }
@@ -1072,7 +1142,9 @@ export class ToolHandlers {
             lines.push('');
         }
 
-        if (!this.architectureEmitted.has(project)) {
+        // 架构/入口点只在**查询确实在问结构**时给。它不随查询变化，跟具体问题无关时
+        // 就是每次固定 100–150 token 的噪声，还会让 agent 顺着无关入口点乱读。
+        if (!this.architectureEmitted.has(project) && wantsArchitecture(query)) {
             try {
                 const archResult = this.graphToolHandlers!.handleGetArchitecture({ project });
                 const archText = archResult.content[0]?.text || '';

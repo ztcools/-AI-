@@ -61,10 +61,17 @@ class ContextMcpServer {
         });
 
         // Initialize Claude Context
+        //
+        // readOnly: true —— 本地 MCP 只做查询向量化 + 云端只读检索，向量写入全部由
+        // 云端 git-index-service 负责。这不是"约定"而是硬闸门：core 把 VectorDatabase
+        // 换成只读视图（写方法抛错），indexCodebase/syncIndexByGit/clearIndex/
+        // getPreparedCollection 入口直接拒绝。否则本地一次误调就能往团队共享的 Milvus
+        // 写脏向量、甚至 drop 掉别人的 collection。
         this.context = new Context({
             embedding,
             vectorDatabase,
-            collectionNameOverride: config.collectionNameOverride
+            collectionNameOverride: config.collectionNameOverride,
+            readOnly: true
         });
 
         // Initialize graph handlers
@@ -198,6 +205,11 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                 tests: {
                                     type: "boolean",
                                     description: "Include test files without score penalty (default false: tests are down-ranked so production code wins). Set true when searching for test examples/usage in tests.",
+                                    default: false,
+                                },
+                                vendor: {
+                                    type: "boolean",
+                                    description: "Include vendored/third-party subtrees without score penalty (default false: code under third_party/, node_modules/, git submodules, or a subtree named by a root LICENSE-<lib> file is down-ranked so this repo's own code wins). Set true only when you deliberately want to read the upstream library.",
                                     default: false,
                                 },
                                 style: {

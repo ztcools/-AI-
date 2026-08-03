@@ -338,6 +338,18 @@ export interface GraphSearchOptions {
   maxDegree?: number;
   limit?: number;
   offset?: number;
+  /**
+   * 目录段列表，命中的行按 `vendorPenalty` 降权并排到本仓库代码之后。
+   * 省略/空数组 = 不降权（想直接搜第三方库时就这么传）。
+   */
+  vendorSegments?: string[];
+  /** vendored 降权系数，默认 0.35；<=0 或 >=1 视为关闭。 */
+  vendorPenalty?: number;
+  /**
+   * 测试/桩路径的降权系数，默认 0.55（与 core 的 SEARCH_TEST_PENALTY 一致）；
+   * <=0 或 >=1 视为关闭 —— search 传 `tests:true` 时上层传 0 走这条路径。
+   */
+  testPenalty?: number;
   // Legacy
   label?: GraphNodeLabel;
 }

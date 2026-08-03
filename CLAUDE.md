@@ -82,8 +82,22 @@ collection  = (hcc|cc)_<slug32>_<md5(identity)[:8]>
 ```
 
 - **link**：`/seeway-link` 把当前仓库绑定到云端某保护分支的 collection（会话级，进程内存不落盘）。
+  连不上 Milvus 与"云端没建这个索引"是两种不同的报错：前者带上 gRPC 的真实原因提示查
+  `MILVUS_ADDRESS`/网络，后者提示去控制台加保护分支 —— 别把网络故障说成"索引不存在"。
 - **搜索**：单层云端 collection 只读检索（dense + BM25 sparse，RRF 融合）。
 - **管理**：仓库/保护分支的增删与索引全在 PhiGent 控制台（云端）手动管理。
+
+**只读闸门**：本地 MCP 构造 core 时硬编码 `readOnly: true`
+（[mcp/src/index.ts:74](packages/mcp/src/index.ts#L74)），建/删 collection、insert/delete、
+索引编排一律拒绝 —— 本地"不做向量索引"是代码级保证，不靠约定。直接调 core 的脚本可另加
+`VECTOR_READONLY=true` 兜底；云端 git-index-service【不要】设它，它就是写入方。
+
+> **SDK 陷阱**：`@zilliz/milvus2-sdk-node` 在 `MilvusClient` **构造函数里**就发起 `connect()`，
+> 把 promise 挂在 client 上，没人 await。Milvus 连不上时它是一个 unhandledRejection——
+> Node 默认**直接终止进程**，把整个 MCP server（以及用同一个类的云端索引服务）打挂，而不是
+> 让那一次调用报错。`MilvusVectorDatabase` 现在把它接住并在 `ensureInitialized()` 里 await
+> （见 [milvus-vectordb.ts](packages/core/src/vectordb/milvus-vectordb.ts)）。换 SDK 版本后
+> 这个字段名若变了要跟着改，否则退化成静默的进程猝死。
 
 ### 图索引（SQLite, 随项目存储）
 
@@ -91,6 +105,15 @@ collection  = (hcc|cc)_<slug32>_<md5(identity)[:8]>
 - 每开发者本地构建，不与 git 耦合；`link` 后台自动建图，`search` 兜底触发
 - Merkle 内容哈希检测变更，对 git reset/rebase/stash 免疫
 - 解析走 worker 池（`CODEGRAPH_PARSE_WORKERS`，默认 cores-2），单文件超 `CODEGRAPH_PARSE_TIMEOUT_MS` 跳过
+
+**多仓库并发**：`GraphToolHandlers` 按仓库目录缓存 bundle（store/traverser/searcher/architecture），
+LRU 上限 `MAX_OPEN_GRAPHS = 8`（[graph-handlers.ts:68](packages/mcp/src/graph-handlers.ts#L68)）。
+所有 handler 用**显式路径**取 store（`getStore(projectDir)` / `bundleFromArgs(args)` 只认
+`repo_path`），不再依赖一个可变的"当前项目"指针 —— 旧实现里 `setProject(B)` 会 close 掉 A 的
+store，同一轮里并发搜 A、B 会互相踩踏（A 丢调用链富化，甚至读到空图后触发全量重建）。
+淘汰时跳过当前项目，但**继续往后找可淘汰项**而不是 break，否则当前项目一排到队首上限就形同虚设。
+`SqliteGraphStore.close()` 之后读路径直接抛错，不再懒重开连接 —— 悄悄开回来会同时废掉 fd 上限
+和"图是空的"判定。
 
 ### git 操作场景行为
 
@@ -132,7 +155,7 @@ v2 对标 CodeGraph，核心变化：项目内存储、跨文件引用解析、�
   → 解析 (ReferenceResolver → 跨文件 CALLS 边 + 边类型提升)
 ```
 
-`INDEXER_VERSION = 4`（[indexer.ts:56](packages/graph/src/indexer.ts#L56)）——
+`INDEXER_VERSION = 5`（[indexer.ts:58](packages/graph/src/indexer.ts#L58)）——
 提取/解析/遍历逻辑变更时必须 +1，旧图会被自动识别并重建。
 
 ### 核心文件
@@ -195,9 +218,16 @@ BM25 列权重 `(name, search_text, qualified_name, file_path) = (3.0, 3.0, 0.5,
 | 文件 | 职责 |
 |------|------|
 | [handlers.ts](packages/mcp/src/handlers.ts) | `handleLink`/`handleUnlink`, `handleSearchCode`(3 mode + token 预算), `handleClearIndex`, `handleStatus` |
-| [graph-handlers.ts](packages/mcp/src/graph-handlers.ts) | `GraphToolHandlers` — 图索引编排 + graph search/trace/architecture |
-| [index.ts](packages/mcp/src/index.ts) | MCP server 启动 + 工具注册 + 工具描述 |
-| [sync.ts](packages/mcp/src/sync.ts) | 后台自动同步（5min 间隔）+ 文件变更触发 |
+| [graph-handlers.ts](packages/mcp/src/graph-handlers.ts) | `GraphToolHandlers` — 按仓库的 bundle 缓存(LRU 8) + 图索引编排 + graph search/trace/architecture |
+| [index.ts](packages/mcp/src/index.ts) | MCP server 启动 + 工具注册 + 工具描述（core 构造处的 `readOnly: true` 在这里） |
+
+**改这一层时的两条硬约束**：
+1. **取 store 一定带路径**（`getStore(codebasePath)`），别依赖调用顺序。`maybeAutoBuildGraphIndex`
+   曾在 `setProject` 之前读 stats，读到别的仓库的空图 → 判定"图是空的" → 删光重建。
+2. **失败要出声**。`handleClearIndex` 原来吞掉异常后回一句"Nothing to clear"，现在返回
+   `isError: true` + 真实原因。静默失败在这条链路上的代价是"用户以为清了，其实没清"。
+
+`GraphIndexer` 按 project 复用并在 `close()` 里全部关闭 —— 每次 index 都 new 一个会漏 fd。
 
 ---
 
@@ -253,14 +283,20 @@ await ix.indexAll();
 | `SEARCH_SCORE_RATIO` | 0 | 尾部截断（0=禁用） |
 | `SEARCH_SNIPPET_MAX_CHARS` | 4000 | **单条**片段字符上限 |
 | `SEARCH_TOTAL_MAX_CHARS` | 20000 | **整个响应**的片段预算，按命中数均分（单条下限 600） |
-| `SEARCH_TEST_PENALTY` | 0.55 | 测试文件分数系数（`tests:true` 时置 0） |
-| `SEARCH_DOC_PENALTY` | 0.5 | 文档/markdown 分数系数（`docs:true` 时置 0） |
+| `SEARCH_TEST_PENALTY` | 0.55 | 测试文件分数系数**默认值**（见下） |
+| `SEARCH_DOC_PENALTY` | 0.5 | 文档/markdown 分数系数**默认值**（见下） |
 | `CODEGRAPH_PARSE_WORKERS` | cores-2 | 图解析 worker 池大小（< 120 文件不启池，起池成本 ~250ms/worker） |
 | `CODEGRAPH_PARSE_TIMEOUT_MS` | 10000 | 单文件解析超时，超时跳过该文件 |
 | `RRF_K` | 100 | RRF 融合 k 参数 |
 | `HYBRID_MODE` | true | dense + BM25 sparse 混合检索（团队索引均按 hybrid 建立） |
 | `GIT_ROOT_BRANCHES` | main,master | 视为根分支的分支名 |
 | `INDEX_CHUNK_LIMIT` | 450000 | 单次索引 chunk 上限（服务端） |
+
+> `docs:true` / `tests:true` 走的是 `searchWithLayers` 的 `SearchRankingOptions` 显式入参
+> （该次调用把对应系数当 0 用），**不改写 `process.env`**。旧实现是写
+> `process.env.SEARCH_DOC_PENALTY='0'` 再在末尾 `delete` —— 用进程级全局态传单次调用的参数：
+> 并发的两次 search 互相污染、任一提前 return/抛错就把覆盖永久留在进程里、`delete` 还会把
+> 用户 `.env` 里配的真实值一起抹掉。加新的按次排序开关时照 `SearchRankingOptions` 加字段。
 
 > 完整清单（含云端 git-index-service 的服务端变量）见 [.env.example](.env.example)。
 

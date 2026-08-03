@@ -10,9 +10,13 @@
  * (<repo>/.context/graph/knowledge-graph.db) — run `link` on it once first.
  *
  * Usage: node benchmarks/graphbench.mjs <repoPath> <scenarioFile> [limit]
- *        DUMP=1 node benchmarks/graphbench.mjs ...   # also print ranked lists
+ *        DUMP=1 node benchmarks/graphbench.mjs ...      # also print ranked lists
+ *        NO_VENDOR=1 node benchmarks/graphbench.mjs ... # 关掉 vendored 降权做 A/B
+ *
+ * 默认**带上** vendored 子树降权（和 MCP handler 一致）：不带的话这个离线循环量的就不是
+ * 产品实际排序 —— PhiLog 47% 的文件是拷进来的 spdlog，两条路径的排名会明显不同。
  */
-import { SqliteGraphStore } from '../packages/graph/dist/index.js';
+import { SqliteGraphStore, detectVendorSegments } from '../packages/graph/dist/index.js';
 import * as fs from 'fs';
 
 const repo = process.argv[2];
@@ -31,12 +35,16 @@ if (!project) {
   process.exit(1);
 }
 const scenarios = JSON.parse(fs.readFileSync(scenarioFile, 'utf-8')).filter(s => (s.expect || []).length);
+const vendorSegments = process.env.NO_VENDOR === '1' ? undefined : detectVendorSegments(repo);
+// NO_TEST=1 关掉测试降权（系数 0 = 关闭，和 search 的 tests:true 同一条路径）。
+const testPenalty = process.env.NO_TEST === '1' ? 0 : undefined;
+console.log(`[demote] vendor=${vendorSegments ? vendorSegments.length + ' segs' : 'off'} test=${testPenalty === 0 ? 'off' : 'on(0.55)'}`);
 
 let hit = 0, exp = 0;
 const misses = [];
 for (const s of scenarios) {
   const t0 = process.hrtime.bigint();
-  const r = store.findNodes({ project, query: s.query, limit });
+  const r = store.findNodes({ project, query: s.query, limit, vendorSegments, testPenalty });
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   const text = r.results
     .map(x => `${x.node.kind}: ${x.node.name} (${x.node.qualifiedName}) ${x.node.filePath}:${x.node.startLine}`)

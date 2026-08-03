@@ -51,12 +51,36 @@ function displayQualifiedName(node: { qualifiedName: string; project?: string })
     : qualifiedName;
 }
 
+/** 一个仓库的图访问器集合（同一个 store 上的四个视图）。 */
+interface GraphBundle {
+  store: SqliteGraphStore;
+  traverser: GraphTraverser;
+  searcher: GraphSearcher;
+  architecture: ArchitectureAnalyzer;
+}
+
+/**
+ * 同时打开的仓库图上限。超出后关掉最久未用的那个。
+ *
+ * 一个会话里通常只有 1–3 个仓库；给到 8 是为了 monorepo 里跨若干子仓库跳转的情形。
+ * 无上限的话长会话会一直累积 SQLite 连接（每个约 3 个 fd）。
+ */
+const MAX_OPEN_GRAPHS = 8;
+
 export class GraphToolHandlers {
-  private store: SqliteGraphStore;
-  private traverser: GraphTraverser;
-  private searcher: GraphSearcher;
-  private architecture: ArchitectureAnalyzer;
-  private indexer: GraphIndexer | null = null;
+  /**
+   * 按仓库目录缓存图访问器。
+   *
+   * 之前是单槽位 + setProject() 里 close-and-reopen，这在并发下会互相踩：两个仓库的
+   * search 同时在跑时，后到者的 setProject 把前者的 store 换掉（甚至 close 掉），
+   * 前者随后取 store 做调用链富化就查到 0 行 —— 响应里整段 Call Graph 静默消失，
+   * 没有任何报错。改成按目录缓存后，谁的查询用谁的 store。
+   */
+  private bundles = new Map<string, GraphBundle>();
+  /** LRU 顺序（末尾 = 最近使用）。 */
+  private lru: string[] = [];
+  /** 按 project 复用 GraphIndexer：每次 new 都带一套 SQLite 连接 + tree-sitter，从不 close 就是 fd 泄漏。 */
+  private indexers = new Map<string, GraphIndexer>();
   private projectDir: string | null = null;
   private project: string | null = null;
 
@@ -70,38 +94,82 @@ export class GraphToolHandlers {
    * Otherwise falls back to a global DB (backward compat for tests).
    */
   constructor(projectDir?: string) {
-    this.store = new SqliteGraphStore(projectDir || process.cwd());
-    this.store.initialize();
-    this.traverser = new GraphTraverser(this.store);
-    this.searcher = new GraphSearcher(this.store);
-    this.architecture = new ArchitectureAnalyzer(this.store);
-
+    const dir = projectDir || process.cwd();
+    this.bundleFor(dir);
     if (projectDir) {
       this.projectDir = projectDir;
       this.project = getRepoIdentity(projectDir);
+    } else {
+      // 兼容旧行为：没给目录时以 cwd 为"当前项目"，但不去算 identity（可能不是 git 仓库）。
+      this.projectDir = dir;
     }
   }
 
-  /** Set/update the active project directory. Re-opens the store at the new project. */
+  /** 取（必要时打开）某个仓库目录的图访问器。 */
+  private bundleFor(projectDir: string): GraphBundle {
+    let bundle = this.bundles.get(projectDir);
+    if (!bundle) {
+      const store = new SqliteGraphStore(projectDir);
+      store.initialize();
+      bundle = {
+        store,
+        traverser: new GraphTraverser(store),
+        searcher: new GraphSearcher(store),
+        architecture: new ArchitectureAnalyzer(store),
+      };
+      this.bundles.set(projectDir, bundle);
+    }
+    // LRU 触碰 + 淘汰
+    const i = this.lru.indexOf(projectDir);
+    if (i >= 0) this.lru.splice(i, 1);
+    this.lru.push(projectDir);
+    while (this.lru.length > MAX_OPEN_GRAPHS) {
+      // 跳过当前项目（它随时会被用到）。这里不能"遇到当前项目就 break" ——
+      // 当前项目一旦排到队首，后面所有该淘汰的都会被永久跳过，上限形同失效。
+      const idx = this.lru.findIndex(p => p !== this.projectDir);
+      if (idx < 0) break;   // 只剩当前项目
+      const evict = this.lru.splice(idx, 1)[0];
+      const b = this.bundles.get(evict);
+      this.bundles.delete(evict);
+      try { b?.store.close(); } catch { /* ignore */ }
+    }
+    return bundle;
+  }
+
+  /**
+   * 设置"当前项目"（未显式传路径的调用的默认值）。
+   *
+   * 不再 close 旧 store —— 那是并发踩踏的根源。这里只是移动默认值指针。
+   */
   setProject(projectDir: string): void {
+    this.bundleFor(projectDir);
     if (this.projectDir === projectDir) return;
-    // Close old store, open new one at project's .context/graph/
-    this.store.close();
-    this.store = new SqliteGraphStore(projectDir);
-    this.store.initialize();
-    this.traverser = new GraphTraverser(this.store);
-    this.searcher = new GraphSearcher(this.store);
-    this.architecture = new ArchitectureAnalyzer(this.store);
     this.projectDir = projectDir;
     this.project = getRepoIdentity(projectDir);
   }
 
-  getStore(): SqliteGraphStore {
-    return this.store;
+  /**
+   * 取图存储。**并发场景下务必显式传 projectDir** —— 不传就用"当前项目"，
+   * 而当前项目会被另一个仓库的 setProject 改掉。
+   */
+  getStore(projectDir?: string): SqliteGraphStore {
+    return this.bundleFor(projectDir || this.projectDir || process.cwd()).store;
   }
 
-  getTraverser(): GraphTraverser {
-    return this.traverser;
+  getTraverser(projectDir?: string): GraphTraverser {
+    return this.bundleFor(projectDir || this.projectDir || process.cwd()).traverser;
+  }
+
+  /**
+   * 从工具入参里解出该用哪个仓库的图。
+   *
+   * 优先 args.repo_path / args.path —— 这样并发的两个 tool call 各查各的库，
+   * 不受"当前项目"指针被对方改掉的影响。
+   */
+  private bundleFromArgs(args: Record<string, unknown>): GraphBundle {
+    // 只认 repo_path：有的工具把 args.path 当路径过滤器（get_architecture），不能拿来当仓库目录。
+    const dir = (args.repo_path as string) || this.projectDir || process.cwd();
+    return this.bundleFor(dir);
   }
 
   getIndexingProgress(project: string): { total: number; current: number; elapsed: number } | null {
@@ -115,8 +183,15 @@ export class GraphToolHandlers {
   }
 
   close(): void {
-    this.store.close();
-    this.indexer?.close();
+    for (const b of this.bundles.values()) {
+      try { b.store.close(); } catch { /* best effort */ }
+    }
+    this.bundles.clear();
+    this.lru = [];
+    for (const ix of this.indexers.values()) {
+      try { ix.close(); } catch { /* best effort */ }
+    }
+    this.indexers.clear();
   }
 
   // ── Tool: index_repository ───────────────────────────────────────
@@ -139,8 +214,13 @@ export class GraphToolHandlers {
     this.activeIndexing.add(project);
 
     try {
-      const indexer = new GraphIndexer(repoPath, project);
-      this.indexer = indexer;
+      // 复用同一 project 的 indexer：每个 GraphIndexer 自带 SQLite 连接 + tree-sitter parser，
+      // 之前每次索引都 new 一个且只有最后一个被 close()，一个长会话里反复触发增量就是稳定的 fd 泄漏。
+      let indexer = this.indexers.get(project);
+      if (!indexer) {
+        indexer = new GraphIndexer(repoPath, project);
+        this.indexers.set(project, indexer);
+      }
 
       const options: GraphIndexerOptions = {
         force: (args.force as boolean) || false,
@@ -235,7 +315,7 @@ export class GraphToolHandlers {
       offset,
     };
 
-    const result = this.searcher.searchGraph(options);
+    const result = this.bundleFromArgs(args).searcher.searchGraph(options);
 
     const lines: string[] = [];
     lines.push(`Found ${result.total} results${result.hasMore ? ' (more available)' : ''}:`);
@@ -266,8 +346,10 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" and "function_name" are required.' }] };
     }
 
+    const { store, traverser } = this.bundleFromArgs(args);
+
     // Find the node
-    const nodeResult = this.store.findNodes({
+    const nodeResult = store.findNodes({
       project,
       namePattern: functionName,
       limit: 1,
@@ -278,7 +360,7 @@ export class GraphToolHandlers {
       root = nodeResult.results[0].node;
     } else {
       // Try qualified name
-      const qnResult = this.store.findNodes({ project, qnPattern: functionName, limit: 1 });
+      const qnResult = store.findNodes({ project, qnPattern: functionName, limit: 1 });
       if (qnResult.results.length > 0) {
         root = qnResult.results[0].node;
       }
@@ -290,8 +372,8 @@ export class GraphToolHandlers {
 
     // Use GraphTraverser for richer output
     try {
-      const callers = direction !== 'outbound' ? this.traverser.getCallers(root.id, depth) : [];
-      const callees = direction !== 'inbound' ? this.traverser.getCallees(root.id, depth) : [];
+      const callers = direction !== 'outbound' ? traverser.getCallers(root.id, depth) : [];
+      const callees = direction !== 'inbound' ? traverser.getCallees(root.id, depth) : [];
 
       const lines: string[] = [];
       lines.push(`Trace for: ${root.name} (${displayQualifiedName(root)})`);
@@ -334,7 +416,7 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" and "qualified_name" are required.' }] };
     }
 
-    const result = this.searcher.getCodeSnippet(project, qualifiedName, includeNeighbors);
+    const result = this.bundleFromArgs(args).searcher.getCodeSnippet(project, qualifiedName, includeNeighbors);
     if (!result) {
       return { content: [{ type: 'text', text: `Node not found: ${qualifiedName}` }] };
     }
@@ -366,8 +448,9 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
     }
 
-    const schema = this.store.getSchema();
-    const stats = this.store.getProjectStats(project);
+    const { store } = this.bundleFromArgs(args);
+    const schema = store.getSchema();
+    const stats = store.getProjectStats(project);
 
     const lines: string[] = [];
     lines.push(`Graph Schema for project '${project}':`);
@@ -392,7 +475,7 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
     }
 
-    const arch = this.architecture.getArchitecture(project, pathFilter);
+    const arch = this.bundleFromArgs(args).architecture.getArchitecture(project, pathFilter);
 
     const lines: string[] = [];
     lines.push(`Architecture: ${arch.project}`);
@@ -425,16 +508,18 @@ export class GraphToolHandlers {
 
   // ── Tool: detect_changes ─────────────────────────────────────────
 
-  detectChangedFiles(args: { project: string; baseBranch?: string }): { changedFiles: string[]; diffBranch: string } | null {
+  detectChangedFiles(args: { project: string; baseBranch?: string; repoPath?: string }): { changedFiles: string[]; diffBranch: string } | null {
     const { project, baseBranch: baseBranchArg } = args;
     const baseBranch = baseBranchArg || 'main';
 
-    try {
-      const nodes = this.store.findNodes({ project, limit: 1 });
-      if (nodes.results.length === 0) return null;
+    // 仓库目录必须显式传（或退回当前项目）：并发时"当前项目"可能已经是别人的仓库，
+    // 那样就会拿 A 仓库的 git diff 去判断 B 仓库的变更文件。
+    const repoPath = args.repoPath || this.projectDir;
+    if (!repoPath) return null;
 
-      const repoPath = this.projectDir;
-      if (!repoPath) return null;
+    try {
+      const nodes = this.bundleFor(repoPath).store.findNodes({ project, limit: 1 });
+      if (nodes.results.length === 0) return null;
 
       let diffBranch = baseBranch;
       try {
@@ -507,8 +592,10 @@ export class GraphToolHandlers {
     lines.push(`Change detection for project '${project}':`);
     lines.push('');
 
+    const { store } = this.bundleFromArgs(args);
+
     try {
-      const detectResult = this.detectChangedFiles({ project, baseBranch });
+      const detectResult = this.detectChangedFiles({ project, baseBranch, repoPath: args.repo_path as string | undefined });
       if (!detectResult) {
         lines.push('Repository not found on disk. Use index_repository to re-index.');
         return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -534,7 +621,7 @@ export class GraphToolHandlers {
       const impactedNodes: GraphNode[] = [];
       const seenNodeIds = new Set<number>();
       for (const file of changedFiles) {
-        const fileResult = this.store.findNodes({ project, filePattern: file, limit: 100 });
+        const fileResult = store.findNodes({ project, filePattern: file, limit: 100 });
         for (const r of fileResult.results) {
           if (!seenNodeIds.has(r.node.id)) {
             seenNodeIds.add(r.node.id);
@@ -563,8 +650,9 @@ export class GraphToolHandlers {
 
   // ── Tool: list_projects ──────────────────────────────────────────
 
-  handleListProjects(): { content: Array<{ type: string; text: string }> } {
-    const projects = this.store.listProjects();
+  handleListProjects(args: Record<string, unknown> = {}): { content: Array<{ type: string; text: string }> } {
+    const { store } = this.bundleFromArgs(args);
+    const projects = store.listProjects();
     const lines: string[] = [];
 
     if (projects.length === 0) {
@@ -572,7 +660,7 @@ export class GraphToolHandlers {
     } else {
       lines.push(`Indexed projects (${projects.length}):`);
       for (const p of projects) {
-        const stats = this.store.getProjectStats(p);
+        const stats = store.getProjectStats(p);
         lines.push(`  - ${p}: ${stats.nodes} nodes, ${stats.edges} edges`);
       }
     }
@@ -588,13 +676,14 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
     }
 
+    const { store } = this.bundleFromArgs(args);
     try {
-      this.store.beginTransaction();
-      this.store.deleteProject(project);
-      this.store.commitTransaction();
+      store.beginTransaction();
+      store.deleteProject(project);
+      store.commitTransaction();
       return { content: [{ type: 'text', text: `Project '${project}' deleted.` }] };
     } catch (error: any) {
-      try { this.store.rollbackTransaction(); } catch { /* ignore */ }
+      try { store.rollbackTransaction(); } catch { /* ignore */ }
       return { content: [{ type: 'text', text: `Error deleting project '${project}': ${error.message}` }] };
     }
   }
@@ -607,8 +696,9 @@ export class GraphToolHandlers {
       return { content: [{ type: 'text', text: 'Error: "project" is required.' }] };
     }
 
-    const stats = this.store.getProjectStats(project);
-    const schema = this.store.getSchema();
+    const { store } = this.bundleFromArgs(args);
+    const stats = store.getProjectStats(project);
+    const schema = store.getSchema();
 
     const lines: string[] = [];
     lines.push(`Index status for '${project}':`);

@@ -90,10 +90,12 @@ Read(file, offset, limit)              # 只读需要的那几行，不要通读
     └────────────────┘                    └──────────────────┘
 ```
 
-- **向量**：本地不做任何写入。云端 `git-index-service` 按 `仓库:保护分支` 每日增量索引到 Milvus；
-  本地只做 ①query 向量化 ②直连云端只读检索。
+- **向量**：本地不做任何写入 —— MCP 构造引擎时硬编码 `readOnly: true`，建/删 collection、
+  insert/delete、索引编排一律拒绝，这是代码级保证不是约定。云端 `git-index-service` 按
+  `仓库:保护分支` 每日增量索引到 Milvus；本地只做 ①query 向量化 ②直连云端只读检索。
 - **图**：`<project>/.context/graph/knowledge-graph.db`，每开发者本地构建，与 git 不耦合。
   Merkle 内容哈希检测变更，对 `git reset/rebase/stash` 免疫。
+  一个 MCP 进程可同时持有多个仓库的图（LRU 上限 8），并发搜多个仓库互不干扰。
 
 详细模块划分与算法见 [CLAUDE.md](CLAUDE.md)。
 

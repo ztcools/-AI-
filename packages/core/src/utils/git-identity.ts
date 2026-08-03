@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import * as fs from 'fs';
 import * as path from 'path';
 
 /**
@@ -54,6 +55,27 @@ export function getCheckedOutBranch(cwd: string): string {
         return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : '';
     } catch {
         return ''; // detached HEAD, or not a git repo
+    }
+}
+
+/**
+ * HEAD 的原始内容（`ref: refs/heads/x` 或 detached 时的 sha），读不到返回 null。
+ * 纯文件读，没有 spawn —— 用来给按路径缓存的 identity 做失效判定：同一个 checkout
+ * 目录被 `git checkout` 换过分支后，缓存 key 必须跟着变。
+ */
+export function readHeadRef(codebasePath: string): string | null {
+    try {
+        const resolved = path.resolve(codebasePath);
+        let gitDir = path.join(resolved, '.git');
+        const st = fs.statSync(gitDir);
+        if (st.isFile()) {
+            const m = fs.readFileSync(gitDir, 'utf-8').match(/^gitdir:\s*(.+)$/m);
+            if (!m) return null;
+            gitDir = path.resolve(resolved, m[1].trim());
+        }
+        return fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf-8').trim() || null;
+    } catch {
+        return null;
     }
 }
 

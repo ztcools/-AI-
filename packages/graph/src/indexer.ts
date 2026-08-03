@@ -51,9 +51,11 @@ const PARSE_POOL_MIN_FILES = 120;
  * incremental sync can't see "the indexer itself changed"). v2 = call-edge import
  * denoise + true-incremental + awaited phase-3. v4 = C/C++ declarator naming
  * (every C++ definition used to be named after its return type) + constructor
- * kind — any pre-v4 C/C++ graph is wrong, not merely stale.
+ * kind — any pre-v4 C/C++ graph is wrong, not merely stale. v5 = full rebuild now
+ * clears unresolved_refs; pre-v5 graphs carry refs pointing at deleted node ids,
+ * which produced edges with a non-existent source and inflated in/out degrees.
  */
-export const INDEXER_VERSION = 4;
+export const INDEXER_VERSION = 5;
 
 /** Directory names excluded from file scanning. Keep in sync with core DEFAULT_IGNORE_PATTERNS. */
 const IGNORE_DIRS = new Set([
@@ -410,6 +412,12 @@ export class GraphIndexer {
         while (this.store.deleteProjectEdgesChunk(this.project, BATCH_SIZE) > 0) {
           await new Promise<void>(r => setImmediate(r));
         }
+        // unresolved_refs 必须一起清：重建后节点 id 是新序列，残留 ref 的
+        // from_node_id 指向已删除的旧 id，下一次增量会拿它们造出 source 不存在的
+        // 边，而出入度统计不 join nodes —— search 结果的调用者数量会凭空变多。
+        while (this.store.deleteProjectUnresolvedRefsChunk(this.project, BATCH_SIZE) > 0) {
+          await new Promise<void>(r => setImmediate(r));
+        }
         while (this.store.deleteProjectNodesChunk(this.project, BATCH_SIZE) > 0) {
           await new Promise<void>(r => setImmediate(r));
         }
@@ -519,6 +527,14 @@ export class GraphIndexer {
     options.onProgress?.({ phase: 'resolving', current: 0, total: 1 });
 
     if (incremental) {
+      // 先清掉源节点已不存在的陈旧 ref 和端点已失效的孤儿边（自愈：早期版本的
+      // 全量重建漏清 unresolved_refs，留下的 ref 每次增量都会被重新 arm，并造出
+      // 虚高的出入度）。放在 resetFailedRefs 之前，免得刚清完又被 arm 回来。
+      const staleRefs = this.store.deleteStaleUnresolvedRefs(this.project);
+      const dangling = this.store.deleteDanglingEdges(this.project);
+      if (staleRefs > 0 || dangling > 0) {
+        console.log(`[GraphIndexer] Purged ${staleRefs} stale refs, ${dangling} dangling edges`);
+      }
       // Re-arm refs that failed earlier (their target may live in a file we
       // just re-indexed, or one added since) so they get retried this pass.
       this.store.resetFailedRefs(this.project);
@@ -571,7 +587,15 @@ export class GraphIndexer {
 
   async sync(options: GraphIndexerOptions = {}): Promise<SyncResult> {
     const startTime = Date.now();
-    const changedFiles = this.detectChangedFiles();
+    // 调用方点名的文件必须算进来：MCP 的文件变更监听把具体路径传进 options.files，
+    // 而 git diff 看不到它们的场景是真实存在的（刚 commit 完、或 checkout 之后）——
+    // 只用 detectChangedFiles 的话那种情况下会直接判定"无变更"、什么都不做。
+    // 两者合并（而不是二选一），语义仍是"让图追上工作区现状"。
+    const requested = (options.files || []).map(f => f.replace(/\\/g, '/')).filter(Boolean);
+    const detected = this.detectChangedFiles();
+    const changedFiles = requested.length > 0
+      ? Array.from(new Set([...requested, ...detected]))
+      : detected;
 
     if (changedFiles.length === 0) {
       return {

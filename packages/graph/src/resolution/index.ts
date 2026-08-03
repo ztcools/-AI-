@@ -657,6 +657,9 @@ export class ReferenceResolver {
     for (const r of resolved) {
       const targetNode = this.getNodeById(r.targetNodeId);
       if (!targetNode) continue;
+      // 源节点也要校验：陈旧 ref（指向已删除节点的 from_node_id）会造出 source
+      // 不存在的边，而出入度统计不 join nodes，这种边会让 search 报出不存在的调用者。
+      if (!this.getNodeById(r.original.fromNodeId)) continue;
 
       let kind = r.original.referenceKind;
       kind = promoteEdgeKind(kind, targetNode);

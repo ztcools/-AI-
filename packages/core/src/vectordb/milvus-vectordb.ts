@@ -24,6 +24,8 @@ export class MilvusVectorDatabase implements VectorDatabase {
     protected config: MilvusConfig;
     private client: MilvusClient | null = null;
     protected initializationPromise: Promise<void>;
+    /** SDK 构造时自行发起的 connect()，已接住其 rejection（见 initializeClient）。 */
+    private connectPromise: Promise<unknown> | null = null;
 
     constructor(config: MilvusConfig) {
         this.config = config;
@@ -47,6 +49,17 @@ export class MilvusVectorDatabase implements VectorDatabase {
             token: milvusConfig.token,
             ssl: milvusConfig.ssl || false,
         });
+
+        // SDK 在构造函数里就发起 connect()，把 promise 挂在 client 上，谁也没 await 它。
+        // Milvus 连不上时它就是一个 unhandledRejection —— Node 默认直接终止进程，
+        // 把整个 MCP server（以及云端索引服务）打挂，而不是让那一次调用报错。
+        // 这里接住它：具体操作照旧会抛自己的错误，进程活着。
+        const connectPromise = (this.client as unknown as { connectPromise?: Promise<unknown> }).connectPromise;
+        if (connectPromise && typeof connectPromise.then === 'function') {
+            this.connectPromise = Promise.resolve(connectPromise).catch((error: any) => {
+                console.warn(`[MilvusDB] ⚠️  Initial connect to '${address}' failed: ${error?.message || error}`);
+            });
+        }
     }
 
     /**
@@ -73,6 +86,8 @@ export class MilvusVectorDatabase implements VectorDatabase {
      */
     protected async ensureInitialized(): Promise<void> {
         await this.initializationPromise;
+        // 等握手结束（失败已在上面被接住），避免每个调用都先撞一次"连接尚未建立"。
+        if (this.connectPromise) await this.connectPromise;
         if (!this.client) {
             throw new Error('Client not initialized');
         }

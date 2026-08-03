@@ -84,7 +84,11 @@ for (const s of scenarios) {
             tokens: approxTokens(text), files: files.size,
             expect: (s.expect || []).length, hit: hit.length,
             miss: (s.expect || []).filter(e => !text.includes(e)),
-            empty: /No results found|no matching|not indexed/i.test(text),
+            // 只认产品自己的"无结果/报错"标记，而且必须在行首。
+            // 别用 /no matching|not indexed/ 这种松匹配去测：这些词会出现在**返回的代码片段里**
+            // （某次 hit 2/2 的响应因为片段里有 "No matching service instance found" 被标成 [EMPTY]），
+            // 于是 summary 里的 empty=N 看着像产品故障，其实是这行正则在自欺。
+            empty: /^No results for /m.test(text) || /^Error: /m.test(text),
         });
         console.log(`  ${s.name.padEnd(34)} ${mode.padEnd(7)} ${String(Math.round(r.ms)).padStart(6)}ms  ${String(approxTokens(text)).padStart(5)}t  hit ${hit.length}/${(s.expect || []).length}${rows[rows.length - 1].empty ? '  [EMPTY]' : ''}`);
         if (process.env.DUMP === '1') console.log(text.slice(0, 3000), '\n---');

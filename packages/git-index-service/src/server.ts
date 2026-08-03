@@ -6,13 +6,14 @@ import { RepoSpec, normalizeProtectedBranches } from './config.js';
 import { SshKeyManager } from './ssh-key.js';
 import { RepoManager } from './repo-manager.js';
 import { detectGitHost } from './git-host.js';
+import { normalizeGitUrl, collectionNameForIdentity, envManager } from '@seeway/claude-context-core';
 
 /**
  * Management HTTP API for the git index service. Framework-free. Enables CORS so
  * the PhiGent web UI can call it directly. Endpoints:
  *   GET  /health
  *   GET  /status                 overall status (schedule, repos, per-branch last runs)
- *   GET  /repos                  list repos (tokens masked)
+ *   GET  /repos                  list repos (tokens masked) + per-branch collection names
  *   GET  /branches?name=<repo>   list remote branches of a repo (for /seeway-link pick-list)
  *   GET  /detect?url=<repoUrl>   detect hosting platform + expected token flavor
  *   GET  /ssh-key                the service SSH deploy public key
@@ -32,6 +33,47 @@ export function startHttpServer(
     sshKeys: SshKeyManager,
     repoManager: RepoManager,
 ): http.Server {
+    // Hybrid 决定 collection 名前缀（hcc/cc）。索引侧读的是同一个变量，所以这里
+    // 算出来的名字和实际写入的 collection 一致。
+    const hybrid = (envManager.get('HYBRID_MODE') || 'true').toLowerCase() === 'true';
+
+    // 但 collection 名的**覆盖**只有 Context 认（单机逃生舱，见 utils/collection-name.ts）。
+    // 服务端要是设了它，索引写进覆盖名的 collection，而这里报给控制台的仍是默认名 ——
+    // 症状是"控制台列着的 collection 在 Milvus 里不存在、link 上去搜出来是空"。
+    // 服务端本来就不该设这个变量，所以启动时喊一声，别让它成为一个静默的错位。
+    if ((envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE') || '').trim()) {
+        console.warn('[Server] ⚠️  CODE_CHUNKS_COLLECTION_NAME_OVERRIDE is set on the index service. '
+            + 'Indexing honors it but the management API reports default collection names — unset it.');
+    }
+
+    /**
+     * 一个仓库的全部分支，连同各自的 collection 名。
+     *
+     * 分支名不在 collection 名里（故意的），控制台此前只能去 Milvus 读每个
+     * collection 的 description 反推分支 —— description 缺失、或是旧架构留下的
+     * 三段 identity，分支列就空着。而分支本来是**在这里被添加的**：main 是
+     * `repo.branch`，其余是 `protectedBranches`，全都是已知量。直接把
+     * "分支 → collection" 的对应关系发给控制台，展示侧就不必再猜。
+     */
+    const branchesOf = (r: RepoSpec) => {
+        const norm = normalizeGitUrl(r.url);
+        const seen = new Set<string>();
+        const all = [r.branch, ...(r.protectedBranches || [])].filter(b => {
+            if (!b || seen.has(b)) return false;
+            seen.add(b);
+            return true;
+        });
+        return all.map(branch => {
+            const identity = `${norm}:${branch}`;
+            return {
+                branch,
+                isMain: branch === r.branch,
+                identity,
+                collection: collectionNameForIdentity(identity, hybrid),
+            };
+        });
+    };
+
     const maskRepo = (r: RepoSpec) => {
         const host = detectGitHost(r.url);
         return {
@@ -39,6 +81,9 @@ export function startHttpServer(
             url: r.url,
             branch: r.branch,
             protectedBranches: r.protectedBranches || [],
+            // 权威的「分支 → collection」对应关系（含 main）。控制台据此标注分支列，
+            // 不再依赖 Milvus description 的解析。
+            branches: branchesOf(r),
             hasToken: !!r.token,
             // token → https clone/pull; no token → ssh with the service deploy key
             auth: r.token ? 'https' : 'ssh',
