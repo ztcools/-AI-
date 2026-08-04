@@ -1,14 +1,31 @@
 ---
-description: Seeway · 链接云端向量索引 + 建立本地图索引（进入代码检索模式）
-argument-hint: "[保护分支名] [仓库路径] — 缺省则检测当前仓库并列出可链接分支"
+description: Seeway · 链接云端向量索引至当前仓库（会话级，重进需重 link）
+argument-hint: "[分支名] [路径] — 缺省则列出可链接分支供选"
 allowed-tools: mcp__claude-context__link
 ---
 
-调用 `mcp__claude-context__link` 工具，把当前仓库链接到云端的保护分支向量索引，并建立/增量更新本地图索引。这是使用 search 向量能力的前提（会话级，重新进入需重新 link）。
+调用 `link` 绑定当前仓库到云端保护分支的向量索引，link 后即可用 search 语义搜索。
 
-- 参数：$ARGUMENTS
-- **缺省（无参数）**：省略所有参数调用 link。它会检测当前 git 仓库，列出该仓库在云端的可链接保护分支。检测到后把分支清单交给用户选择，再用选定的分支调用一次 `link { branch: "<分支>" }` 完成链接。
-- **已带分支**：把第一个参数作为 branch 调用 `link { branch: "<分支>" }`；若还带第二个参数且是路径，作为 path。
-- **检测不出仓库**（非 git 目录/无 remote）：提示用户告知项目名称或路径（绝对/相对均可）。拿到后用 `link { path: "<解析出的路径>" }` 重试；若该目录仍无 git remote，请用户提供仓库的 git 地址，用 `link { path, repo: "<git地址>", branch }`。
-- 链接成功会返回：绑定的 repo@branch、云端 collection、本地图索引是首次全量还是增量更新。用一两句话汇报。
-- 若提示云端无该分支索引：说明该仓库的保护分支尚未在控制台配置/索引，引导用户先到 PhiGent 控制台为该仓库添加该保护分支并触发索引，再来 link。
+## 流程
+
+**有参数**：`/seeway-link main` → `link { branch: "main" }`。第二个参数若为路径则加 path。
+
+**无参数（默认）**：调用 `link {}` → 返回该仓库的云端保护分支列表（★ 为推荐分支）。
+用 **AskUserQuestion** 单选呈现让用户选择，用户确认后再 `link { branch: "<所选>" }`。
+**禁止自动替用户选分支**。除非用户明确说"随便帮我选个最优的"或"直接用推荐的"。
+
+**非 git 目录**：`link {}` 返回 "Not in a git repository" → 用 AskUserQuestion 让用户输入仓库名或 URL。
+- 仓库名（如 "flask"）：`link { repo: "flask" }`
+- 完整 URL：`link { repo: "https://github.com/org/repo.git" }`
+拿到后自动触发分支列表 → 回到无参数流程。
+
+**云端不可达**：告知用户 git-index-service 不可达，需手动指定分支。
+
+## 成功汇报
+
+一行：`已链接 <repo>@<branch> → <collection>（图: N 节点）`
+
+## 错误处理
+
+- "Cloud index not found" → 该分支未索引，引导到 PhiGent 控制台添加
+- "not loaded into Milvus memory" → 引导到 PhiGent Load

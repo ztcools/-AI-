@@ -85,9 +85,7 @@ class ContextMcpServer {
         // NOTE: descriptions are the primary lever for how often the model
         // reaches for each tool. Keep them compact and verifiable.
         const link_description = `
-Bind this repo to its cloud vector index (pre-built per protected branch) and build/incrementally update the local knowledge graph. Prerequisite for search to return vector results. Once per session per repo. Omit branch to list cloud candidates.
-
-link also builds the local call-graph index automatically in the background (no separate index step needed — users must NOT run any manual indexing; local vector indexing is disabled by design, only protected branches are indexed on the server daily). The graph then stays fresh automatically as you edit files.
+Bind this repo to its cloud vector index (pre-built per protected branch) and build/incrementally update the local knowledge graph. Prerequisite for search to return vector results. Once per session per repo. Omit branch to list cloud candidates. Omit path to use current workspace.
 `;
 
         const unlink_description = `
@@ -144,11 +142,11 @@ Show link state (cloud repo@branch + connectivity) and local graph index stats (
                                 },
                                 repo: {
                                     type: "string",
-                                    description: "Remote repo URL (e.g. git@github.com:org/repo.git). Defaults to git remote of path.",
+                                    description: "Remote repo URL (e.g. git@github.com:org/repo.git) or short name (e.g. \"flask\"). Defaults to git remote of path.",
                                 },
                                 branch: {
                                     type: "string",
-                                    description: "Protected branch name (e.g. main). Defaults to current branch; omit to list candidates from cloud.",
+                                    description: "Protected branch name (e.g. main). Omit to list available branches from cloud.",
                                 },
                             },
                         },

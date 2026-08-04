@@ -7,7 +7,6 @@ import {
     getRepoIdentity,
     normalizeGitUrl,
     getRemoteUrl,
-    getCurrentBranch,
     envManager,
 } from "@seeway/claude-context-core";
 import { resolveCodebasePath, focusSnippet, trackCodebasePath } from "./utils.js";
@@ -232,11 +231,15 @@ export class ToolHandlers {
                 clearTimeout(timer);
                 if (!resp.ok) continue;
                 const data: any = await resp.json();
-                // 期望结构: { branches: string[] } 或 { data: { branches: string[] } } 或数组
-                const branches: string[] = Array.isArray(data) ? data
+                // 期望结构: { branches: string[] } 或 { branches: {name:string}[] } 或 { data: { branches: ... } }
+                const raw: any[] = Array.isArray(data) ? data
                     : Array.isArray(data?.branches) ? data.branches
                     : Array.isArray(data?.data?.branches) ? data.data.branches
                     : [];
+                // 归一化：元素可能是字符串 "main" 或对象 { name: "main" }
+                const branches: string[] = raw.map((b: any) =>
+                    typeof b === 'string' ? b : (b?.name || '')
+                ).filter(Boolean);
                 if (branches.length > 0) return { branches, source };
             } catch (e: any) {
                 // 网络失败/超时 → 尝试下一个候选
@@ -244,6 +247,27 @@ export class ToolHandlers {
             }
         }
         return null;
+    }
+
+    /**
+     * 将仓库名解析为完整 URL（用户可能只记得名称如 "flask"）。
+     * 通过 git-index-service /repos 接口查找匹配的仓库。
+     */
+    private async resolveRepoName(name: string): Promise<string | null> {
+        const base = this.getGitIndexServiceUrl();
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5000);
+            const resp = await fetch(`${base}/repos`, { signal: controller.signal });
+            clearTimeout(timer);
+            if (!resp.ok) return null;
+            const data: any = await resp.json();
+            const repos: any[] = Array.isArray(data?.repos) ? data.repos : [];
+            const match = repos.find((r: any) => r.name === name);
+            return match?.url ? normalizeGitUrl(match.url) : null;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -270,14 +294,28 @@ export class ToolHandlers {
             return { absolutePath, remoteUrl: '', branch: null, error: `Path '${absolutePath}' is not a directory` };
         }
 
-        // 优先使用 args.repo 显式指定的远程 URL（支持非 git 目录）
+        // 优先使用 args.repo 指定的远程 URL 或仓库名
         let remoteUrl: string | null = null;
-        let currentBranch: string | null = null;
         if (typeof args.repo === 'string' && args.repo.trim().length > 0) {
-            remoteUrl = normalizeGitUrl(args.repo.trim());
+            const raw = args.repo.trim();
+            // 判断是完整 URL 还是仓库名
+            if (/^(https?:\/\/|git@|ssh:\/\/)/.test(raw)) {
+                remoteUrl = normalizeGitUrl(raw);
+            } else {
+                // 仓库名 → 通过 git-index-service 解析为完整 URL
+                remoteUrl = await this.resolveRepoName(raw);
+                if (!remoteUrl) {
+                    return {
+                        absolutePath,
+                        remoteUrl: '',
+                        branch: null,
+                        error: `Repository name '${raw}' not found in git-index-service.\n` +
+                            `Provide the full URL instead: link { repo: "https://github.com/org/${raw}.git" }`,
+                    };
+                }
+            }
         } else {
             remoteUrl = getRemoteUrl(absolutePath);
-            currentBranch = getCurrentBranch(absolutePath);
         }
 
         if (!remoteUrl) {
@@ -285,28 +323,37 @@ export class ToolHandlers {
                 absolutePath,
                 remoteUrl: '',
                 branch: null,
-                error: `Path '${absolutePath}' is not a git repository and no 'repo' argument was provided.\n` +
-                    `Please either run inside a git repo, or pass the repo URL explicitly, e.g.\n` +
-                    `  link { path: "${absolutePath}", repo: "git@github.com:org/repo.git", branch: "main" }`,
+                error: `Not in a git repository ('${absolutePath}') and no 'repo' argument was provided.\n` +
+                    `Provide a repo name or URL: link { repo: "org/repo-name" }`,
             };
         }
 
-        // 分支优先级：args.branch > 当前分支 > null（需要用户/上层 agent 选）
+        // 分支优先级：
+        //  1. args.branch 显式指定 → 直接用
+        //  2. 未指定则查询云端保护分支列表，返回候选让用户选 —— 不自动取当前分支。
+        //     当前分支大概率并非保护分支（用户通常从 feature 分支打开项目），
+        //     自动取它只会走到 hasCollection 失败 → "Cloud index not found"，
+        //     然后 LLM 替用户猜一个分支。应该在一开始就把候选列出来让用户选。
+        //  3. 云端不可达 → 返回连通性错误，不要静默回退到当前分支。
+        //     旧逻辑里 cloud 不可达时用 currentBranch 兜底，用户随后看到的是
+        //     "Cloud index not found for feature-xyz" —— 把连通性问题伪装成了
+        //     "这个分支没索引"，错误信息完全误导。
         let branch: string | null = null;
         let suggestedBranches: string[] | undefined;
         let cloudUnreachable = false;
 
         if (typeof args.branch === 'string' && args.branch.trim().length > 0) {
             branch = args.branch.trim();
-        } else if (currentBranch) {
-            // 优先用当前分支；若云端无该分支的索引，hasCollection 会失败并提示
-            branch = currentBranch;
         } else {
-            // 未指定且不在 git 仓库（例如 bare 调用） → 询问云端
+            // 未指定分支 → 优先查云端
             const cloud = await this.fetchCloudBranches(remoteUrl);
             if (cloud && cloud.branches.length > 0) {
                 suggestedBranches = cloud.branches;
+                // branch 保持 null —— handleLink 会返回候选列表让用户选
             } else {
+                // 云端不可达或无保护分支 → 让 handleLink 返回对应错误。
+                // 不用 currentBranch 兜底：它是 feature 分支，兜底只会得到
+                // "Cloud index not found"，把网络问题伪装成"分支没索引"。
                 cloudUnreachable = true;
             }
         }
@@ -331,12 +378,26 @@ export class ToolHandlers {
             // 未指定分支且云端有候选 → 列出候选让用户/上层 agent 选
             if (!target.branch) {
                 if (target.suggestedBranches && target.suggestedBranches.length > 0) {
+                    // 排序：main/master 排最前面，其余按字母序
+                    const branches = [...target.suggestedBranches];
+                    const topBranches = branches.filter(b => b === 'main' || b === 'master').sort();
+                    const restBranches = branches.filter(b => b !== 'main' && b !== 'master').sort();
+                    const ordered = [...topBranches, ...restBranches];
+                    // 标记推荐的默认分支（main > master > 第一个）
+                    const recommended = topBranches[0] || restBranches[0] || ordered[0];
+
                     return {
                         content: [{
                             type: 'text',
-                            text: `Multiple protected branches found for '${remoteUrl}'. Please pick one and re-run link with the branch parameter:\n` +
-                                target.suggestedBranches.map(b => `  - ${b}`).join('\n') +
-                                `\n\nExample: link { path: "${absolutePath}", branch: "${target.suggestedBranches[0]}" }`,
+                            text: `Repository: ${remoteUrl}\n` +
+                                `${ordered.length} protected branch(es) available. Select one and re-run link:\n\n` +
+                                ordered.map(b => {
+                                    const label = b === recommended ? `  ★ ${b}  ← recommended` : `    ${b}`;
+                                    return label;
+                                }).join('\n') +
+                                `\n\n---\n` +
+                                `To link: link { branch: "${recommended}" }\n` +
+                                `(or replace "${recommended}" with any branch from the list above)`,
                         }],
                     };
                 }
