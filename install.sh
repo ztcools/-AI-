@@ -26,7 +26,7 @@ REPO_URL="https://github.com/ztcools/context.git"
 # 向量后端地址(默认指向公司服务器,开箱即用;如需改用其它后端,先 export 覆盖再运行)
 # 本地只做"查询向量化 + 直连云端 Milvus 只读检索 + 本地图索引"，不做任何向量写入。
 OLLAMA_HOST="${OLLAMA_HOST:-http://10.50.4.149:11435}"
-MILVUS_ADDRESS="${MILVUS_ADDRESS:-http://10.50.4.149:19530}"
+MILVUS_ADDRESS="${MILVUS_ADDRESS:-10.50.4.149:19530}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-nomic-embed-text}"
 EMBEDDING_DIMENSION="${EMBEDDING_DIMENSION:-768}"
 # 云端索引服务（保护分支列表 / 索引进度），供 /seeway-link 列出可链接分支
