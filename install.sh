@@ -37,7 +37,7 @@ echo -e "${GREEN}  Seeway Claude Context 安装脚本${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
 
-echo -e "${YELLOW}[1/7] 检查 Node.js...${NC}"
+echo -e "${YELLOW}[1/8] 检查 Node.js...${NC}"
 if command -v node &> /dev/null; then
     NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
     if [ "$NODE_VERSION" -ge 18 ]; then
@@ -54,7 +54,7 @@ else
     exit 1
 fi
 
-echo -e "${YELLOW}[2/7] 检查 pnpm...${NC}"
+echo -e "${YELLOW}[2/8] 检查 pnpm...${NC}"
 if command -v pnpm &> /dev/null; then
     echo -e "${GREEN}  ✓ pnpm $(pnpm --version)${NC}"
 else
@@ -63,7 +63,7 @@ else
     echo -e "${GREEN}  ✓ pnpm 安装完成${NC}"
 fi
 
-echo -e "${YELLOW}[3/7] 克隆仓库...${NC}"
+echo -e "${YELLOW}[3/8] 克隆仓库...${NC}"
 if [ -d "$INSTALL_DIR" ]; then
     echo "  目录已存在，正在更新..."
     cd "$INSTALL_DIR"
@@ -79,7 +79,7 @@ if [ -n "$SUDO_USER" ]; then
 fi
 echo -e "${GREEN}  ✓ 仓库就绪 ($INSTALL_DIR)${NC}"
 
-echo -e "${YELLOW}[4/7] 安装依赖 (可能需要几分钟)...${NC}"
+echo -e "${YELLOW}[4/8] 安装依赖 (可能需要几分钟)...${NC}"
 cd "$INSTALL_DIR"
 # 只安装 MCP 子图(core + graph + mcp)的依赖,避开无关包的
 # keytar(需 libsecret)、faiss 等原生依赖在用户机上编译失败。
@@ -91,7 +91,7 @@ else
 fi
 echo -e "${GREEN}  ✓ 依赖安装完成${NC}"
 
-echo -e "${YELLOW}[5/7] 构建项目...${NC}"
+echo -e "${YELLOW}[5/8] 构建项目...${NC}"
 if [ -n "$SUDO_USER" ]; then
     sudo -u "$SUDO_USER" bash -c "pnpm build:core && pnpm build:graph && pnpm build:mcp"
 else
@@ -99,7 +99,7 @@ else
 fi
 echo -e "${GREEN}  ✓ 构建完成${NC}"
 
-echo -e "${YELLOW}[6/7] 配置 MCP...${NC}"
+echo -e "${YELLOW}[6/8] 配置 MCP...${NC}"
 MCP_ENTRY="$INSTALL_DIR/packages/mcp/dist/index.js"
 CLAUDE_JSON="$REAL_HOME/.claude.json"
 
@@ -185,7 +185,7 @@ if [ -n "$SUDO_USER" ]; then
     chown "$SUDO_USER":"$SUDO_USER" "$CLAUDE_JSON" 2>/dev/null || true
 fi
 
-echo -e "${YELLOW}[7/7] 安装上下文策略与 /seeway 命令到用户级...${NC}"
+echo -e "${YELLOW}[7/8] 安装上下文策略与 /seeway 命令到用户级...${NC}"
 RULES_SRC="$INSTALL_DIR/rules/code-context-policy.md"
 CLAUDE_MD="$REAL_HOME/.claude/CLAUDE.md"
 BEGIN_MARK="<!-- BEGIN claude-context policy (managed by install.sh — do not edit inside) -->"
@@ -235,6 +235,19 @@ if [ -d "$COMMANDS_SRC" ]; then
 else
     echo -e "${YELLOW}  未找到 $COMMANDS_SRC，跳过 /seeway 命令安装${NC}"
 fi
+
+echo -e "${YELLOW}[8/8] 全局忽略 .context/（Git 内置规则，不动用户配置）...${NC}"
+# Git 默认读取 $XDG_CONFIG_HOME/git/ignore（即 ~/.config/git/ignore），
+# 无需 core.excludesFile。只追加一行 .context/，不改任何 git config。
+GIT_IGNORE="$REAL_HOME/.config/git/ignore"
+mkdir -p "$(dirname "$GIT_IGNORE")"
+if [ -f "$GIT_IGNORE" ] && grep -qxF '.context/' "$GIT_IGNORE" 2>/dev/null; then
+    echo -e "${GREEN}  ✓ .context/ 已忽略${NC}"
+else
+    echo '.context/' >> "$GIT_IGNORE"
+    echo -e "${GREEN}  ✓ .context/ 已加入全局忽略${NC}"
+fi
+[ -n "$SUDO_USER" ] && chown "$SUDO_USER":"$SUDO_USER" "$GIT_IGNORE" 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}============================================${NC}"
