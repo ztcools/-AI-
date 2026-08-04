@@ -225,21 +225,38 @@ export class RepoManager {
     }
 
     /**
-     * Resolve the branch to actually fetch. If the configured branch exists on the
-     * remote, use it; otherwise fall back to the remote's default branch (HEAD).
-     * This makes "add repo, leave branch as main" work for repos whose default is
-     * master/dev/etc., instead of failing with "couldn't find remote ref".
+     * Resolve the branch to actually fetch. Tries in order:
+     *   1. The requested branch itself — if it exists on the remote, use it.
+     *   2. `main` — canonical default branch on modern repos.
+     *   3. `master` — legacy default.
+     *   4. The remote's HEAD (symref) — last-resort fallback.
+     *
+     * This means a repo configured with an unusual branch still gets sorted when the
+     * remote has main or master, keeping mature repos' branches at the top of the UI
+     * even when the operator hasn't set main explicitly.
      */
     private async resolveBranch(cwd: string, repo: RepoSpec, requested: string): Promise<string> {
         try {
             const heads = await this.gitRemote(cwd, u => `ls-remote --heads "${u}" "${requested}"`, repo);
             if (heads.trim()) return requested;
-        } catch { /* fall through to default */ }
+        } catch { /* fall through */ }
+        // Prefer main/master over whatever HEAD happens to point at — many real-world
+        // repos never had their default branch set and HEAD points at a random dev branch.
+        for (const canonical of ['main', 'master']) {
+            if (canonical === requested) continue; // already tried above
+            try {
+                const heads = await this.gitRemote(cwd, u => `ls-remote --heads "${u}" "${canonical}"`, repo);
+                if (heads.trim()) {
+                    console.warn(`[RepoManager] Branch '${requested}' not found on remote; using '${canonical}' instead.`);
+                    return canonical;
+                }
+            } catch { /* try next */ }
+        }
         try {
             const symref = await this.gitRemote(cwd, u => `ls-remote --symref "${u}" HEAD`, repo);
             const m = symref.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD/m);
             if (m && m[1]) {
-                console.warn(`[RepoManager] Branch '${requested}' not found on remote; using default '${m[1]}'.`);
+                console.warn(`[RepoManager] Branch '${requested}' not found on remote; using remote HEAD '${m[1]}'.`);
                 return m[1];
             }
         } catch { /* ignore — let the fetch fail with the original error */ }

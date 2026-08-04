@@ -76,6 +76,14 @@ export interface VectorDatabase {
     hasCollection(collectionName: string): Promise<boolean>;
 
     /**
+     * Check whether a collection is loaded into query-node memory.
+     * A collection must be loaded before it can be searched or queried.
+     *
+     * Optional: implementations without load/release semantics may omit it.
+     */
+    isCollectionLoaded?(collectionName: string): Promise<boolean>;
+
+    /**
      * List all collections
      */
     listCollections(): Promise<string[]>;

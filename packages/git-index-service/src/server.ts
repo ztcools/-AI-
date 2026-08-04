@@ -9,6 +9,38 @@ import { detectGitHost } from './git-host.js';
 import { normalizeGitUrl, collectionNameForIdentity, envManager } from '@seeway/claude-context-core';
 
 /**
+ * URL 凭据净化：检出嵌入在 URL 中的 username+password，拆成干净的 URL + token。
+ *
+ * 用户粘贴的 clone URL 可能携带凭据（如
+ * `https://private-token:glpat-abc@gitlab.com/group/repo.git`）—— 这是各家平台
+ * "复制 clone URL" 按钮的常见形态。直接存入 repo.url 会让凭据出现在 ConfigStore 磁盘、
+ * `.git/config` 以及 collection identity 里。这里把它分离：干净的 URL 归 url，凭据
+ * 归 token（显式传的 token 优先），两边的存储和脱敏策略各自独立。
+ */
+function sanitizeRepoUrl(
+    rawUrl: string,
+    explicitToken?: string,
+): { url: string; token?: string } {
+    let url = String(rawUrl).trim();
+    let embeddedToken: string | undefined;
+    try {
+        const u = new URL(url);
+        // 格式 https://<user>:<secret>@<host>/<path> 或 https://<token>@<host>/<path>
+        if (u.username || u.password) {
+            embeddedToken = u.password || u.username;
+            u.username = '';
+            u.password = '';
+            url = u.toString().replace(/^https?:\/\/@/, match => match.slice(0, -1));
+        }
+    } catch {
+        // scp 格式 (git@host:path) 不会有凭据泄漏 —— 原样返回。
+    }
+    // 显式传的 token 优先；嵌入的仅作为兜底。
+    const token = explicitToken || embeddedToken || undefined;
+    return { url, token };
+}
+
+/**
  * Management HTTP API for the git index service. Framework-free. Enables CORS so
  * the PhiGent web UI can call it directly. Endpoints:
  *   GET  /health
@@ -192,12 +224,13 @@ export function startHttpServer(
                     return send(res, 400, { error: 'name and url are required' });
                 }
                 const branch = body.branch ? String(body.branch) : 'main';
+                const sanitized = sanitizeRepoUrl(String(body.url), body.token ? String(body.token) : undefined);
                 const repo: RepoSpec = {
                     name: String(body.name),
-                    url: String(body.url),
+                    url: sanitized.url,
                     branch,
                     protectedBranches: normalizeProtectedBranches(body.protectedBranches, branch),
-                    token: body.token ? String(body.token) : undefined,
+                    token: sanitized.token,
                 };
                 store.upsertRepo(repo);
                 return send(res, 200, { ok: true, repo: maskRepo(repo) });
@@ -211,16 +244,26 @@ export function startHttpServer(
                     const body = await readBody(req);
                     if (!body) return send(res, 400, { error: 'invalid body' });
                     const newBranch = body.branch ? String(body.branch) : existing.branch;
+                    // Token: explicit (non-empty) > explicit-empty clears > embedded in
+                    // new URL > keep existing.
+                    const explicitToken = body.token !== undefined
+                        ? (body.token ? String(body.token) : undefined)
+                        : existing.token;
+                    // new URL 有凭据泄漏风险 —— 净化；同时抽取嵌入 token 作兜底依据。
+                    const sanitized = body.url
+                        ? sanitizeRepoUrl(String(body.url), explicitToken)
+                        : null;
+                    const resolvedToken = sanitized ? sanitized.token : explicitToken;
                     const updated: RepoSpec = {
                         name: existing.name,
-                        url: body.url ? String(body.url) : existing.url,
+                        url: sanitized ? sanitized.url : existing.url,
                         branch: newBranch,
                         // Omitted → keep; explicit (array or csv) → replace (may be empty).
                         protectedBranches: body.protectedBranches === undefined
                             ? (existing.protectedBranches || [])
                             : normalizeProtectedBranches(body.protectedBranches, newBranch),
-                        // Empty string clears the token; omitted keeps the old one.
-                        token: body.token === undefined ? existing.token : (body.token ? String(body.token) : undefined),
+                        // Empty string clears the token; omitted keeps old; embedded in new URL is fallback.
+                        token: resolvedToken,
                     };
                     store.upsertRepo(updated);
                     return send(res, 200, { ok: true, repo: maskRepo(updated) });

@@ -70,3 +70,4 @@ evaluation/retrieval_results*
 
 # Graph index data (per-developer, rebuilt locally)
 .context/
+测试数据.md

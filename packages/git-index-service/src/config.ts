@@ -24,7 +24,7 @@ export interface RepoSpec {
 export function normalizeProtectedBranches(input: unknown, mainBranch: string): string[] {
     let list: string[] = [];
     if (Array.isArray(input)) list = input.map(s => String(s));
-    else if (typeof input === 'string') list = input.split(',');
+    else if (typeof input === 'string') list = input.split(/[,，]+/);
     const main = String(mainBranch || '').trim();
     const seen = new Set<string>();
     for (const raw of list) {
@@ -201,7 +201,14 @@ export function indexConcurrency(): number {
     return Math.max(1, Math.min(16, num('GIT_INDEX_CONCURRENCY', 3)));
 }
 
-/** Release each collection from Milvus memory right after indexing it (see VectorDatabase.release). */
+/**
+ * Release each collection from Milvus memory right after indexing it.
+ *
+ * Defaults to false: collections stay loaded so the PhiGent console shows LOADED
+ * and `claude-context link` succeeds without a manual Load step. Set to true on
+ * large shared-Milvus deployments where the total resident set would exhaust
+ * query-node memory (hundreds of repos × branches).
+ */
 export function releaseAfterIndex(): boolean {
-    return bool('GIT_INDEX_RELEASE_AFTER', true);
+    return bool('GIT_INDEX_RELEASE_AFTER', false);
 }

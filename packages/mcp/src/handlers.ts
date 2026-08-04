@@ -400,6 +400,33 @@ export class ToolHandlers {
                 };
             }
 
+            // 验证 collection 已加载到内存（UNLOADED → 无法搜索，告知用户去 PhiGent Load）。
+            if (vdb.isCollectionLoaded) {
+                let loaded = false;
+                try {
+                    loaded = await vdb.isCollectionLoaded(collectionName);
+                } catch (e: any) {
+                    // getLoadState 偶发失败（网络瞬断等）不应阻断 link —— 搜索链路会
+                    // 在首次 search 时自动 load。这里只做友好提示。
+                    console.warn(`[LINK] Could not check load state for '${collectionName}': ${e?.message || e}`);
+                    loaded = true; // proceed
+                }
+                if (!loaded) {
+                    return {
+                        content: [{
+                            type: 'text',
+                            text: `Error: Collection '${collectionName}' for '${identity}' is not loaded into Milvus memory.\n` +
+                                `Please load it via the PhiGent console first:\n` +
+                                `  1. Open PhiGent → Collections\n` +
+                                `  2. Find "${collectionName}" (${identity})\n` +
+                                `  3. Click Load\n` +
+                                `Then re-run link.`,
+                        }],
+                        isError: true,
+                    };
+                }
+            }
+
             // 写入会话链接状态
             const linkInfo: LinkInfo = {
                 identity,

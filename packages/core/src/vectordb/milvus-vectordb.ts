@@ -358,6 +358,22 @@ export class MilvusVectorDatabase implements VectorDatabase {
         return Boolean(result.value);
     }
 
+    async isCollectionLoaded(collectionName: string): Promise<boolean> {
+        await this.ensureInitialized();
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+        try {
+            const result = await this.client.getLoadState({
+                collection_name: collectionName,
+            });
+            return result.state === LoadState.LoadStateLoaded;
+        } catch (error: any) {
+            console.warn(`[MilvusDB] getLoadState failed for '${collectionName}': ${error?.message || error}`);
+            return false;
+        }
+    }
+
     async listCollections(): Promise<string[]> {
         await this.ensureInitialized();
 
