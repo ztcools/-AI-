@@ -64,11 +64,6 @@ export class RepoManager {
         return { removed, freedBytes };
     }
 
-    /** A repo authenticates over SSH whenever no token is configured. */
-    private useSsh(repo: RepoSpec): boolean {
-        return !repo.token;
-    }
-
     /** Convert an https(s) URL to scp-style SSH form: git@host:group/repo.git */
     private toSshUrl(url: string): string {
         try {
@@ -108,13 +103,26 @@ export class RepoManager {
     }
 
     /**
-     * Candidate URLs git may fetch from, in order to try: token → https with basic
-     * auth (one entry per credential flavor still worth trying); no token → SSH
-     * with the service deploy key. `origin` always stays the canonical token-free
-     * URL so the index identity matches developer checkouts.
+     * Authentication candidates git may fetch from, tried in order.
+     *
+     * Each entry carries its own `useSsh` flag — no global "this repo is SSH or
+     * HTTPS" switch. The strategy per repo config:
+     *
+     *   token present → HTTPS basic auth only (one URL per credential flavor).
+     *   no token      → anonymous HTTPS first (public repos), then SSH deploy key.
+     *
+     * The canonical `origin` remote always holds the token-free URL so the index
+     * identity matches developer checkouts regardless of the auth path that won.
      */
-    private authUrls(repo: RepoSpec): string[] {
-        if (!repo.token) return [this.toSshUrl(repo.url)];
+    private authUrls(repo: RepoSpec): { url: string; useSsh: boolean }[] {
+        if (!repo.token) {
+            const out: { url: string; useSsh: boolean }[] = [];
+            if (/^https?:\/\//i.test(repo.url)) {
+                out.push({ url: repo.url, useSsh: false });
+            }
+            out.push({ url: this.toSshUrl(repo.url), useSsh: true });
+            return out;
+        }
 
         // A token only travels over https basic auth — normalize SSH forms first.
         const httpsUrl = this.toHttpsUrl(repo.url);
@@ -122,9 +130,11 @@ export class RepoManager {
         try {
             parsed = new URL(httpsUrl);
         } catch {
-            return [repo.url]; // unparseable — hand it to git as-is
+            return [{ url: repo.url, useSsh: false }];
         }
-        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return [repo.url];
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+            return [{ url: repo.url, useSsh: false }];
+        }
 
         const { user, secret } = this.splitToken(repo.token);
         const cached = this.hostTokenUser.get(parsed.host);
@@ -134,7 +144,7 @@ export class RepoManager {
             const withAuth = new URL(httpsUrl);
             withAuth.username = name;
             withAuth.password = secret;
-            return withAuth.toString();
+            return { url: withAuth.toString(), useSsh: false };
         });
     }
 
@@ -167,22 +177,27 @@ export class RepoManager {
         repo: RepoSpec,
         timeoutMs?: number,
     ): Promise<string> {
-        const urls = this.authUrls(repo);
-        const useSsh = this.useSsh(repo);
+        const candidates = this.authUrls(repo);
         let lastErr: any;
-        for (let i = 0; i < urls.length; i++) {
+        for (let i = 0; i < candidates.length; i++) {
+            const { url, useSsh } = candidates[i];
             try {
-                const args = build(urls[i]);
+                const args = build(url);
                 const out = timeoutMs === undefined
                     ? await this.git(dir, args, useSsh)
                     : await this.gitWithTimeout(dir, args, useSsh, timeoutMs);
-                this.rememberTokenUser(urls[i]);
+                this.rememberTokenUser(url);
                 return out;
             } catch (e: any) {
                 lastErr = e;
-                const more = i < urls.length - 1;
+                const more = i < candidates.length - 1;
                 if (!this.isAuthError(e) || !more) throw e;
-                console.warn(`[RepoManager] '${repo.name}': credentials rejected, retrying with a different token username.`);
+                if (useSsh) {
+                    // Anonymous HTTPS failed; fall back to SSH deploy key.
+                    console.warn(`[RepoManager] '${repo.name}': anonymous HTTPS failed, retrying with SSH deploy key.`);
+                } else {
+                    console.warn(`[RepoManager] '${repo.name}': credentials rejected, retrying with a different token username.`);
+                }
             }
         }
         throw lastErr;

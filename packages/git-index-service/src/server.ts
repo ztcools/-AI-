@@ -118,8 +118,9 @@ export function startHttpServer(
             // 不再依赖 Milvus description 的解析。
             branches: branchesOf(r),
             hasToken: !!r.token,
-            // token → https clone/pull; no token → ssh with the service deploy key
-            auth: r.token ? 'https' : 'ssh',
+            // token → https clone/pull; no token → anonymous HTTPS (public repos)
+            // with SSH deploy-key fallback when the repo is private.
+            auth: r.token ? 'https' : 'anonymous',
             // Detected hosting platform. The console displays it and uses it to
             // tell the operator which token flavor this host expects — the same
             // table the fetch path uses to pick a basic-auth username.
