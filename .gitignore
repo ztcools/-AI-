@@ -71,3 +71,7 @@ evaluation/retrieval_results*
 # Graph index data (per-developer, rebuilt locally)
 .context/
 测试数据.md
+
+# 大赛/周报模板等本地文档（不进版本库）
+template.md
+「2026四维图新X飞书AI先锋大赛」*.md
