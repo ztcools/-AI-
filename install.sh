@@ -40,15 +40,15 @@ echo ""
 echo -e "${YELLOW}[1/8] 检查 Node.js...${NC}"
 if command -v node &> /dev/null; then
     NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-    if [ "$NODE_VERSION" -ge 18 ]; then
+    if [ "$NODE_VERSION" -ge 20 ]; then
         echo -e "${GREEN}  ✓ Node.js $(node -v)${NC}"
     else
-        echo -e "${RED}  Node.js 版本过低 (需要 >= 18)${NC}"
+        echo -e "${RED}  Node.js 版本过低 (需要 >= 20)${NC}"
         exit 1
     fi
 else
     echo -e "${RED}  未检测到 Node.js${NC}"
-    echo "  请先执行教程前两步安装 Node.js 22:"
+    echo "  请先执行教程前两步安装 Node.js 22 LTS（或更高版本）:"
     echo "  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
     echo "  sudo apt-get install -y nodejs"
     exit 1
@@ -110,6 +110,9 @@ add_mcp_to_json() {
 
     if [ ! -f "$json_file" ]; then
         echo '{"mcpServers":{}}' > "$json_file"
+    else
+        # 写回前先备份，避免整体重写 ~/.claude.json 时丢失其它配置
+        cp -f "$json_file" "$json_file.bak" 2>/dev/null || true
     fi
 
     if command -v python3 &> /dev/null; then

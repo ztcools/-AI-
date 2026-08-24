@@ -156,32 +156,32 @@ importers:
         specifier: ^12.0.0
         version: 12.11.1
       tree-sitter:
-        specifier: ^0.25.0
-        version: 0.25.0
+        specifier: ^0.25.1
+        version: 0.25.1
       tree-sitter-c-sharp:
         specifier: ^0.21.0
-        version: 0.21.3(tree-sitter@0.25.0)
+        version: 0.21.3(tree-sitter@0.25.1)
       tree-sitter-cpp:
         specifier: ^0.22.0
-        version: 0.22.3(tree-sitter@0.25.0)
+        version: 0.22.3(tree-sitter@0.25.1)
       tree-sitter-go:
         specifier: ^0.21.0
-        version: 0.21.2(tree-sitter@0.25.0)
+        version: 0.21.2(tree-sitter@0.25.1)
       tree-sitter-java:
         specifier: ^0.21.0
-        version: 0.21.0(tree-sitter@0.25.0)
+        version: 0.21.0(tree-sitter@0.25.1)
       tree-sitter-javascript:
         specifier: ^0.21.0
-        version: 0.21.4(tree-sitter@0.25.0)
+        version: 0.21.4(tree-sitter@0.25.1)
       tree-sitter-python:
         specifier: ^0.21.0
-        version: 0.21.0(tree-sitter@0.25.0)
+        version: 0.21.0(tree-sitter@0.25.1)
       tree-sitter-rust:
         specifier: ^0.21.0
-        version: 0.21.0(tree-sitter@0.25.0)
+        version: 0.21.0(tree-sitter@0.25.1)
       tree-sitter-typescript:
         specifier: ^0.21.0
-        version: 0.21.2(tree-sitter@0.25.0)
+        version: 0.21.2(tree-sitter@0.25.1)
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^7.6.0
@@ -3243,8 +3243,8 @@ packages:
   tree-sitter@0.21.1:
     resolution: {integrity: sha512-7dxoA6kYvtgWw80265MyqJlkRl4yawIjO7S5MigytjELkX43fV2WsAXzsNfO7sBpPPCF5Gp0+XzHk0DwLCq3xQ==}
 
-  tree-sitter@0.25.0:
-    resolution: {integrity: sha512-PGZZzFW63eElZJDe/b/R/LbsjDDYJa5UEjLZJB59RQsMX+fo0j54fqBPn1MGKav/QNa0JR0zBiVaikYDWCj5KQ==}
+  tree-sitter@0.25.1:
+    resolution: {integrity: sha512-mrcEdkYtHfrK1A6fs3O6FxkBo0Qig5XUXqHhxUOQu0bmPo00QF4XaSx4edpazdHwxnSCjlGKGgIqWdaN4dvTLA==}
 
   triple-beam@1.4.1:
     resolution: {integrity: sha512-aZbgViZrg1QNcG+LULa7nhZpJTZSLm/mXnHXnbAbjmN5aSa0y7V+wvv6+4WaBtpISJzThKy+PIPxc1Nq1EJ9mg==}
@@ -6907,11 +6907,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-c-sharp@0.21.3(tree-sitter@0.25.0):
+  tree-sitter-c-sharp@0.21.3(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-cli@0.25.10: {}
 
@@ -6921,11 +6921,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-cpp@0.22.3(tree-sitter@0.25.0):
+  tree-sitter-cpp@0.22.3(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-go@0.21.2(tree-sitter@0.21.1):
     dependencies:
@@ -6933,11 +6933,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-go@0.21.2(tree-sitter@0.25.0):
+  tree-sitter-go@0.21.2(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-java@0.21.0(tree-sitter@0.21.1):
     dependencies:
@@ -6945,11 +6945,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-java@0.21.0(tree-sitter@0.25.0):
+  tree-sitter-java@0.21.0(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-javascript@0.21.4(tree-sitter@0.21.1):
     dependencies:
@@ -6957,11 +6957,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-javascript@0.21.4(tree-sitter@0.25.0):
+  tree-sitter-javascript@0.21.4(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-python@0.21.0(tree-sitter@0.21.1):
     dependencies:
@@ -6969,11 +6969,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-python@0.21.0(tree-sitter@0.25.0):
+  tree-sitter-python@0.21.0(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 7.1.1
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-rust@0.21.0(tree-sitter@0.21.1):
     dependencies:
@@ -6981,11 +6981,11 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-rust@0.21.0(tree-sitter@0.25.0):
+  tree-sitter-rust@0.21.0(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 7.1.1
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter-scala@0.24.0(tree-sitter@0.21.1):
     dependencies:
@@ -7000,18 +7000,18 @@ snapshots:
       node-gyp-build: 4.8.4
       tree-sitter: 0.21.1
 
-  tree-sitter-typescript@0.21.2(tree-sitter@0.25.0):
+  tree-sitter-typescript@0.21.2(tree-sitter@0.25.1):
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
-      tree-sitter: 0.25.0
+      tree-sitter: 0.25.1
 
   tree-sitter@0.21.1:
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
 
-  tree-sitter@0.25.0:
+  tree-sitter@0.25.1:
     dependencies:
       node-addon-api: 8.9.0
       node-gyp-build: 4.8.4
