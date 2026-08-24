@@ -11,7 +11,7 @@ assignees: ''
 Please describe your problem in **English**
 
 **Troubleshooting Guide**
-Try to follow the [Troubleshooting Guide](https://github.com/ztcools/-AI-/blob/main/docs/troubleshooting/troubleshooting-guide.md) to solve the problem. If you can not solve the problem, please open an issue.
+Try to follow the [Troubleshooting Guide](https://github.com/ztcools/context/blob/main/docs/troubleshooting/troubleshooting-guide.md) to solve the problem. If you can not solve the problem, please open an issue.
 
 ## For MCP Use Cases
 **Get your MCP logs first**
