@@ -20,16 +20,6 @@ else
     REAL_HOME="$HOME"
 fi
 
-# 以真实用户身份运行 git：sudo 场景下用 root 跑 git 会丢失用户的 git 代理/凭据配置，
-# 这里统一切回真实用户，与下面 pnpm/build 的处理保持一致。
-run_git() {
-    if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" git "$@"
-    else
-        git "$@"
-    fi
-}
-
 INSTALL_DIR="$REAL_HOME/.claude-context"
 REPO_URL="https://github.com/ztcools/context.git"
 
@@ -78,12 +68,10 @@ if [ -d "$INSTALL_DIR" ]; then
     echo "  目录已存在，正在更新..."
     cd "$INSTALL_DIR"
     rm -rf node_modules packages/*/node_modules
-    # 自愈：旧克隆若残留旧仓库名(如 -AI-.git)，统一改回当前 REPO_URL
-    run_git remote set-url origin "$REPO_URL" 2>/dev/null || true
-    run_git fetch origin
-    run_git reset --hard origin/main
+    git fetch origin
+    git reset --hard origin/main
 else
-    run_git clone "$REPO_URL" "$INSTALL_DIR"
+    git clone "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
 if [ -n "$SUDO_USER" ]; then
